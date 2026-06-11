@@ -1,7 +1,10 @@
 .cache/*
+
 *.h265
 *.pyc
 *.jpeg
 *.log
 *.mp4
 *.mjpeg
+*.json
+
