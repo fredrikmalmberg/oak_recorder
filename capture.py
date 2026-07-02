@@ -1,3 +1,4 @@
+import argparse
 import os
 import time
 import queue
@@ -100,8 +101,19 @@ def create_dual_stream_pipeline(device):
 # ==============================================================================
 # 4. MAIN CAPTURE AND RENDERING LOOP
 # ==============================================================================
-def main():
+def main(args=None):
     os.makedirs(RECORD_DIR, exist_ok=True)
+    # Apply CLI overrides to the module-level configuration when provided
+    if args is not None:
+        try:
+            # update globals so downstream functions use the requested values
+            global FORCED_ISO, FORCED_SHUTTER_US, FPS
+            FORCED_ISO = int(args.iso)
+            FORCED_SHUTTER_US = int(args.shutter)
+            FPS = int(args.fps)
+        except Exception:
+            # If conversion fails, continue with defaults
+            pass
     
     print("Initializing OAK Device...")
     
@@ -216,4 +228,11 @@ def main():
         print(f"  Session Profile Log: {log_path}")
 
 if __name__ == "__main__":
-    main()
+    # add command line argument parsing
+    parser = argparse.ArgumentParser(description="Sign Language Capture")
+    parser.add_argument("-i", "--iso", type=int, default=200, help="ISO value")
+    parser.add_argument("-s", "--shutter", type=int, default=10000, help="Shutter speed in microseconds")
+    parser.add_argument("-f", "--fps", type=int, default=30, help="Frames per second")
+    args = parser.parse_args()
+
+    main(args)
