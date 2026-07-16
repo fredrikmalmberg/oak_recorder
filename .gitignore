@@ -8,3 +8,6 @@
 *.mjpeg
 *.json
 
+*.h5
+recordings/*
+models/
