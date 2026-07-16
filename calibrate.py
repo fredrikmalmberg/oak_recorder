@@ -203,20 +203,30 @@ def R_to_wxyz(R):
 # viser's default up direction is +Z (like Blender/ROS/most robotics tooling --
 # not +Y as in some game engines/OpenGL-style conventions, which is a common
 # assumption to get wrong here). We align the board's own axes directly to the
-# world axes -- local Z (solvePnP's out-of-the-face normal, which points toward
-# the camera, i.e. upward, when the camera looks down at a floor-flat board) to
-# world +Z, local X/Y to world X/Y -- rather than calling viser's
-# set_up_direction, which only affects camera controls/lighting, not the actual
-# geometry of already-placed frustums/points.
+# world axes -- rather than calling viser's set_up_direction, which only affects
+# camera controls/lighting, not the actual geometry of already-placed
+# frustums/points.
+#
+# solvePnP's local Z axis for a planar target points *into* the board (the same
+# direction the camera is looking), not out of it toward the camera -- so for a
+# camera looking down at a floor-flat board, raw local Z points down, not up.
+# _BOARD_UP_CORRECTION flips local Z (and Y, to keep a proper rotation, det=+1)
+# so the corrected local Z is the board's true upward normal before aligning it
+# to world +Z. (Verified empirically: without this flip, "down" came out
+# reversed.)
 # ==============================================================================
+_BOARD_UP_CORRECTION = np.diag([1.0, -1.0, -1.0])
+
+
 def compute_board_world_alignment(T_cam_to_world, R_board_to_cam, t_board_to_cam):
-    """Returns the board's rotation in the current (pre-alignment) world frame --
-    see apply_world_alignment for how this re-bases every stored camera pose so
-    that rotation becomes the identity (board's own axes == world axes).
+    """Returns the corrected-up board rotation in the current (pre-alignment)
+    world frame -- see apply_world_alignment for how this re-bases every stored
+    camera pose so that rotation becomes the identity (board's own axes == world
+    axes, with the board's true upward normal as +Z).
     """
     T_board_to_world = T_cam_to_world @ rt_to_T(R_board_to_cam, t_board_to_cam)
     R_board_to_world, _ = T_to_rt(T_board_to_world)
-    return R_board_to_world
+    return R_board_to_world @ _BOARD_UP_CORRECTION
 
 
 def apply_world_alignment(pose_result, alignment_R):
