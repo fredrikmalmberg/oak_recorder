@@ -1,5 +1,6 @@
 import sys
 import os
+import copy
 import glob
 import json
 import time
@@ -74,6 +75,72 @@ def scale_intrinsics(K, from_size, to_size):
     K_scaled[1, 1] *= sy  # fy
     K_scaled[1, 2] *= sy  # cy
     return K_scaled
+
+
+def load_all_camera_calibration(cal, camera_ids):
+    """Per-camera intrinsics *and* ground-truth extrinsics, unlike
+    average_intrinsics (which discards individual cameras' extrinsics entirely --
+    that function exists for the cam0-cam3 recording rig, which has no matching
+    calibration of its own). Only valid for a h5 file whose own rig this `cal`
+    belongs to (e.g. tmp/Testdata.h5's cam00-cam06), where cal.cam_to_world[i] is
+    real, trustworthy ground truth and no pose estimation is needed at all.
+    """
+    result = {}
+    for i, cam_id in enumerate(camera_ids):
+        K, dist = build_camera_intrinsics(cal.intrinsics[i])
+        cam_to_world = np.asarray(cal.cam_to_world[i], dtype=np.float64)
+        T_wc = np.linalg.inv(cam_to_world)
+        width, height = cal.intrinsics[i][0], cal.intrinsics[i][1]
+        result[cam_id] = {
+            'K': K, 'dist': dist,
+            'R': T_wc[:3, :3], 't': T_wc[:3, 3],
+            'width': float(width), 'height': float(height),
+        }
+    return result
+
+
+def undistort_landmarks(landmarks, calib):
+    """Corrects each camera's 2D landmarks for lens distortion at the pixel
+    level (cv2.undistortPoints(..., P=K)), then re-normalizes back to [0,1]
+    image-fraction coordinates -- the same schema every function in this module
+    expects, so nothing downstream needs to change. This matters because
+    triangulate_dlt's projection matrices (P = K @ [R|t]) assume a pure pinhole
+    model with no distortion term, but MediaPipe/DWPose detect landmarks in the
+    ORIGINAL, distorted image's pixel space -- feeding those in directly is a
+    real geometric inconsistency, not just an approximation, and this rig's
+    distortion is non-trivial (rational model, k2/k4 up to ~70 on some cameras).
+
+    Only use the *output* of this function for triangulation-facing numeric work
+    (2D pixel-distance comparisons, DLT, etc). Skeleton overlays drawn onto the
+    actual (distorted) video frames should keep using the raw, un-undistorted
+    landmarks, or the drawing will no longer line up with the pixels on screen --
+    undistorting the landmarks doesn't undistort the image they're drawn on.
+
+    landmarks: dict[cam_id][frame_key] -> {lm_id: [x, y, z]}, normalized to that
+    camera's own (distorted) image. calib: dict[cam_id] -> {'K', 'dist', 'width',
+    'height', ...} (load_all_camera_calibration's schema). Cameras absent from
+    calib are skipped (e.g. a landmarks dict spanning a superset of cameras).
+    """
+    result = {}
+    for cam_id, by_frame in landmarks.items():
+        if cam_id not in calib:
+            continue
+        K, dist = calib[cam_id]['K'], calib[cam_id]['dist']
+        w, h = calib[cam_id]['width'], calib[cam_id]['height']
+        result[cam_id] = {}
+        for frame_key, lms in by_frame.items():
+            if not lms:
+                continue
+            lm_ids = sorted(lms.keys(), key=int)
+            pts = np.array(
+                [[lms[lm_id][0] * w, lms[lm_id][1] * h] for lm_id in lm_ids], dtype=np.float64,
+            ).reshape(-1, 1, 2)
+            undist = cv2.undistortPoints(pts, K, dist, P=K).reshape(-1, 2)
+            result[cam_id][frame_key] = {
+                lm_id: [float(undist[i, 0] / w), float(undist[i, 1] / h), lms[lm_id][2]]
+                for i, lm_id in enumerate(lm_ids)
+            }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -232,12 +299,18 @@ def sample_detected_frames(landmarks, cam_ids, n_samples=8, seed=None):
     return rng.sample(pool, min(n_samples, len(pool)))
 
 
-def draw_hand_skeleton(image, pixel_xy, color=(0, 255, 0), point_color=(255, 0, 0)):
-    for a, b in HAND_CONNECTIONS:
+def draw_hand_skeleton(image, pixel_xy, color=(0, 255, 0), point_color=(255, 0, 0), thickness=2,
+                        connections=None):
+    # HAND_CONNECTIONS is defined later in this file (viser section) -- resolved
+    # here at call time, not as a default-argument value, since default values
+    # are evaluated at `def` time and HAND_CONNECTIONS wouldn't exist yet then.
+    if connections is None:
+        connections = HAND_CONNECTIONS
+    for a, b in connections:
         if a in pixel_xy and b in pixel_xy:
             pa = tuple(np.round(pixel_xy[a]).astype(int))
             pb = tuple(np.round(pixel_xy[b]).astype(int))
-            cv2.line(image, pa, pb, color, 2)
+            cv2.line(image, pa, pb, color, thickness)
     for pt in pixel_xy.values():
         p = tuple(np.round(pt).astype(int))
         cv2.circle(image, p, 4, point_color, -1)
@@ -605,6 +678,74 @@ def load_camera_poses(path):
 
 
 # ---------------------------------------------------------------------------
+# Combining multiple 2D-landmark sources (e.g. MediaPipe + DWPose) before
+# triangulation. Treating both sources' output for the same camera/frame as if
+# they were two independent camera views would double-count a single ray and
+# isn't a valid DLT input -- combination has to happen at the pixel level.
+# ---------------------------------------------------------------------------
+
+def combine_landmark_sources(sources, mode='max_confidence'):
+    """`sources` is a list of (landmarks, confidence) pairs, same schema
+    throughout this module (landmarks[cam_id][frame] = {"lm_id": [x, y, z]},
+    confidence[cam_id][frame] = float). Returns a single (landmarks, confidence)
+    pair in the same schema, so every existing triangulation helper works on the
+    combined result unchanged.
+
+    - "max_confidence": per camera/frame, keep whichever source has the higher
+      frame-level confidence that frame (simple ensemble).
+    - "weighted_average": per camera/frame/landmark, confidence-weight-average
+      the sources' pixel positions. A source without a per-landmark confidence
+      of its own (e.g. MediaPipe) has its frame-level score broadcast to every
+      landmark for weighting purposes.
+    """
+    cam_ids = sorted({cam_id for landmarks, _confidence in sources for cam_id in landmarks})
+    combined_landmarks, combined_confidence = {}, {}
+
+    for cam_id in cam_ids:
+        combined_landmarks[cam_id] = {}
+        combined_confidence[cam_id] = {}
+        frames = sorted({
+            frame for landmarks, _confidence in sources for frame in landmarks.get(cam_id, {})
+        })
+        for frame in frames:
+            entries = []
+            for landmarks, confidence in sources:
+                lms = landmarks.get(cam_id, {}).get(frame)
+                if not lms:
+                    continue
+                conf = confidence.get(cam_id, {}).get(frame, 0.0)
+                entries.append((lms, conf))
+            if not entries:
+                continue
+
+            if mode == 'max_confidence':
+                lms, conf = max(entries, key=lambda e: e[1])
+                combined_landmarks[cam_id][frame] = lms
+                combined_confidence[cam_id][frame] = conf
+            elif mode == 'weighted_average':
+                lm_ids = sorted({lm_id for lms, _conf in entries for lm_id in lms})
+                merged = {}
+                for lm_id in lm_ids:
+                    xyzs, weights = [], []
+                    for lms, conf in entries:
+                        if lm_id not in lms:
+                            continue
+                        xyzs.append(lms[lm_id])
+                        weights.append(max(conf, 1e-6))
+                    if not xyzs:
+                        continue
+                    xyzs = np.array(xyzs, dtype=np.float64)
+                    weights = np.array(weights, dtype=np.float64)
+                    merged[lm_id] = np.average(xyzs, axis=0, weights=weights).tolist()
+                combined_landmarks[cam_id][frame] = merged
+                combined_confidence[cam_id][frame] = max(conf for _lms, conf in entries)
+            else:
+                raise ValueError(f"Unknown mode '{mode}'")
+
+    return combined_landmarks, combined_confidence
+
+
+# ---------------------------------------------------------------------------
 # N-view DLT triangulation over the full sequence (cameras fixed for all frames)
 # ---------------------------------------------------------------------------
 
@@ -623,14 +764,15 @@ def triangulate_dlt(points_2d, projection_matrices):
     return X[:3] / X[3]
 
 
-def triangulate_sequence(landmarks, projection_matrices, width, height, min_confidence=0.5, confidence=None):
+def triangulate_sequence(landmarks, projection_matrices, width, height, min_confidence=0.5,
+                          confidence=None, landmark_ids=range(21)):
     cam_ids = list(projection_matrices.keys())
     all_frames = sorted({frame for cam_id in cam_ids for frame in landmarks.get(cam_id, {})})
     reconstruction = {}
     for frame in all_frames:
         frame_key = os.path.splitext(frame)[0]
         frame_points = {}
-        for lm_id in range(21):
+        for lm_id in landmark_ids:
             points_2d = {}
             for cam_id in cam_ids:
                 if confidence is not None and confidence.get(cam_id, {}).get(frame, 0) < min_confidence:
@@ -648,6 +790,703 @@ def triangulate_sequence(landmarks, projection_matrices, width, height, min_conf
         if frame_points:
             reconstruction[frame_key] = frame_points
     return reconstruction
+
+
+def triangulate_dlt_weighted(points_2d, projection_matrices, weights):
+    """Same SVD-based DLT as triangulate_dlt, but each point's two equation rows
+    are scaled by its confidence weight first, so higher-confidence 2D
+    observations dominate the least-squares solve. weights: dict[cam_id -> float],
+    same keys as points_2d.
+    """
+    if len(points_2d) < 2:
+        return None
+    A = []
+    for cam_id, (x, y) in points_2d.items():
+        P = projection_matrices[cam_id]
+        w = max(weights.get(cam_id, 1.0), 1e-6)
+        A.append(w * (x * P[2, :] - P[0, :]))
+        A.append(w * (y * P[2, :] - P[1, :]))
+    _, _, Vt = np.linalg.svd(np.array(A))
+    X = Vt[-1]
+    if abs(X[3]) < 1e-12:
+        return None
+    return X[:3] / X[3]
+
+
+def triangulate_sequence_weighted(
+    landmarks, projection_matrices, width, height, landmark_confidence,
+    min_confidence=0.5, confidence=None, landmark_ids=range(21),
+):
+    """Like triangulate_sequence, but weights each camera's 2D observation of a
+    landmark by that landmark's own confidence (landmark_confidence[cam_id][frame]
+    = {"lm_id": score}) rather than treating every view as equally trustworthy.
+    A camera/frame missing from landmark_confidence falls back to 1.0 (e.g. a
+    source that only has a frame-level score, no per-landmark one).
+    """
+    cam_ids = list(projection_matrices.keys())
+    all_frames = sorted({frame for cam_id in cam_ids for frame in landmarks.get(cam_id, {})})
+    reconstruction = {}
+    for frame in all_frames:
+        frame_key = os.path.splitext(frame)[0]
+        frame_points = {}
+        for lm_id in landmark_ids:
+            points_2d, weights = {}, {}
+            for cam_id in cam_ids:
+                if confidence is not None and confidence.get(cam_id, {}).get(frame, 0) < min_confidence:
+                    continue
+                lms = landmarks.get(cam_id, {}).get(frame)
+                if not lms:
+                    continue
+                obs = lms.get(str(lm_id))
+                if obs is None:
+                    continue
+                points_2d[cam_id] = (obs[0] * width, obs[1] * height)
+                weights[cam_id] = landmark_confidence.get(cam_id, {}).get(frame, {}).get(str(lm_id), 1.0)
+            xyz = triangulate_dlt_weighted(points_2d, projection_matrices, weights)
+            if xyz is not None:
+                frame_points[str(lm_id)] = xyz.tolist()
+        if frame_points:
+            reconstruction[frame_key] = frame_points
+    return reconstruction
+
+
+# ---------------------------------------------------------------------------
+# RANSAC camera-set selection, Kalman/RTS smoothing, jitter flagging -- ported
+# and generalized from ransac_keypoint_reconstruction.ipynb (validated on a
+# different, uncalibrated rig) to this module's dict[cam_id][frame_key] schema.
+# Unlike that notebook's dense (N_FRAMES, N_HANDS) numpy arrays over integer
+# camera indices, everything here keys directly on cam_id/frame strings so it
+# composes with the rest of this module's functions unchanged.
+# ---------------------------------------------------------------------------
+
+def _reproj_error_px(X, P, pixel):
+    proj = P @ np.append(X, 1.0)
+    return float(np.linalg.norm(proj[:2] / proj[2] - np.asarray(pixel)))
+
+
+def ransac_select_cameras_sequence(
+    landmarks, confidence, projection_matrices, width, height,
+    reference_landmark_id=0, min_cameras=2, reproj_thresh_px=15.0,
+    hysteresis_inlier_margin=0, hysteresis_err_factor=1.5, min_confidence=0.5,
+):
+    """Per-frame RANSAC over camera pairs, using `reference_landmark_id` (wrist=0
+    for hands; a stable body joint for body) as the representative point -- once a
+    trusted camera SET is chosen this way, every other landmark for that frame can
+    be triangulated from it directly (see triangulate_sequence_ransac), rather than
+    re-running RANSAC per landmark.
+
+    For each frame: gate candidate cameras by presence + confidence >=
+    min_confidence (a low-confidence detection shouldn't be eligible to be
+    selected as an inlier by chance); try every gated camera pair, triangulate the
+    reference landmark, count reprojection-error inliers across ALL gated
+    cameras; keep the pair whose inlier set is largest (tie-break: lowest mean
+    inlier residual). Inlier counting is purely geometric (reprojection error
+    only) -- confidence already did its job at the gating step, so a
+    confident-but-wrong detection can't buy its way into the set by weight here.
+
+    Hysteresis: if the previous frame's winning camera set is still available
+    this frame and reprojects acceptably (inlier count within
+    hysteresis_inlier_margin of this frame's best, and mean error within
+    hysteresis_err_factor of it), keep it instead of switching -- damps
+    frame-to-frame flicker in which cameras are trusted when several camera-set
+    choices are similarly good.
+
+    Returns dict[frame_key] -> {'cameras': [cam_id, ...], 'mean_reproj_err': float,
+    'n_inliers': int}, omitting frames with fewer than min_cameras gated cameras or
+    where no pair reaches min_cameras inliers.
+    """
+    cam_ids = list(projection_matrices.keys())
+    all_frames = sorted({frame for cam_id in cam_ids for frame in landmarks.get(cam_id, {})})
+    lm_key = str(reference_landmark_id)
+    selection = {}
+    prev_cameras = None
+
+    for frame in all_frames:
+        gated = [
+            cam_id for cam_id in cam_ids
+            if (confidence is None or confidence.get(cam_id, {}).get(frame, 0) >= min_confidence)
+            and landmarks.get(cam_id, {}).get(frame, {}).get(lm_key) is not None
+        ]
+        if len(gated) < min_cameras:
+            prev_cameras = None
+            continue
+
+        def px(cam_id):
+            obs = landmarks[cam_id][frame][lm_key]
+            return (obs[0] * width, obs[1] * height)
+
+        pixel_by_cam = {cam_id: px(cam_id) for cam_id in gated}
+
+        best_inliers, best_err = None, None
+        for cam_a, cam_b in itertools.combinations(gated, 2):
+            X = triangulate_dlt({cam_a: pixel_by_cam[cam_a], cam_b: pixel_by_cam[cam_b]}, projection_matrices)
+            if X is None:
+                continue
+            errs = {c: _reproj_error_px(X, projection_matrices[c], pixel_by_cam[c]) for c in gated}
+            inliers = [c for c in gated if errs[c] < reproj_thresh_px]
+            if len(inliers) < min_cameras:
+                continue
+            mean_err = float(np.mean([errs[c] for c in inliers]))
+            if (best_inliers is None or len(inliers) > len(best_inliers)
+                    or (len(inliers) == len(best_inliers) and mean_err < best_err)):
+                best_inliers, best_err = inliers, mean_err
+
+        if best_inliers is None:
+            prev_cameras = None
+            continue
+
+        chosen, chosen_err = best_inliers, best_err
+        if prev_cameras is not None:
+            prev_avail = [c for c in prev_cameras if c in gated]
+            if len(prev_avail) >= min_cameras:
+                X_prev = triangulate_dlt({c: pixel_by_cam[c] for c in prev_avail}, projection_matrices)
+                if X_prev is not None:
+                    errs_prev = {c: _reproj_error_px(X_prev, projection_matrices[c], pixel_by_cam[c]) for c in gated}
+                    prev_inliers = [c for c in gated if errs_prev[c] < reproj_thresh_px]
+                    if len(prev_inliers) >= min_cameras:
+                        prev_mean_err = float(np.mean([errs_prev[c] for c in prev_inliers]))
+                        if (len(prev_inliers) >= len(best_inliers) - hysteresis_inlier_margin
+                                and prev_mean_err <= best_err * hysteresis_err_factor):
+                            chosen, chosen_err = prev_inliers, prev_mean_err
+
+        selection[frame] = {'cameras': chosen, 'mean_reproj_err': chosen_err, 'n_inliers': len(chosen)}
+        prev_cameras = chosen
+
+    return selection
+
+
+def triangulate_sequence_ransac(
+    landmarks, projection_matrices, width, height, landmark_ids, camera_selection,
+    landmark_confidence=None,
+):
+    """Triangulates every id in landmark_ids per frame using ONLY the cameras
+    ransac_select_cameras_sequence selected for that frame, via
+    triangulate_dlt_weighted. Weighted by landmark_confidence within that
+    already-chosen inlier set when given (this is where confidence-aware
+    consensus actually happens -- the camera SET itself was chosen purely
+    geometrically), else uniform weight among the inliers.
+    """
+    reconstruction = {}
+    for frame, sel in camera_selection.items():
+        cams = sel['cameras']
+        frame_points = {}
+        for lm_id in landmark_ids:
+            lm_key = str(lm_id)
+            points_2d, weights = {}, {}
+            for cam_id in cams:
+                obs = landmarks.get(cam_id, {}).get(frame, {}).get(lm_key)
+                if obs is None:
+                    continue
+                points_2d[cam_id] = (obs[0] * width, obs[1] * height)
+                weights[cam_id] = (
+                    landmark_confidence.get(cam_id, {}).get(frame, {}).get(lm_key, 1.0)
+                    if landmark_confidence is not None else 1.0
+                )
+            xyz = triangulate_dlt_weighted(points_2d, projection_matrices, weights)
+            if xyz is not None:
+                frame_points[lm_key] = xyz.tolist()
+        if frame_points:
+            reconstruction[frame] = frame_points
+    return reconstruction
+
+
+def ransac_per_camera_reproj_error(
+    landmarks, confidence, reconstruction, projection_matrices, width, height,
+    reference_landmark_id=0, min_confidence=0.5,
+):
+    """For each frame in `reconstruction` (e.g. triangulate_sequence_ransac's
+    output), reprojects that frame's already-triangulated reference_landmark_id
+    point into EVERY camera with a confident 2D observation of it that frame --
+    not just the inlier subset RANSAC actually selected. A camera excluded from
+    the winning inlier set on most frames will show up here as consistently
+    high-error, which is exactly the signal worth plotting per camera (unlike
+    ransac_select_cameras_sequence's own output, which only reports the
+    aggregate mean_reproj_err of the cameras it chose, not a per-camera
+    breakdown).
+
+    Returns dict[cam_id][frame_key] -> float (px).
+    """
+    lm_key = str(reference_landmark_id)
+    errors = {}
+    for frame, frame_points in reconstruction.items():
+        X = frame_points.get(lm_key)
+        if X is None:
+            continue
+        X = np.asarray(X, dtype=np.float64)
+        for cam_id, P in projection_matrices.items():
+            if confidence is not None and confidence.get(cam_id, {}).get(frame, 0) < min_confidence:
+                continue
+            obs = landmarks.get(cam_id, {}).get(frame, {}).get(lm_key)
+            if obs is None:
+                continue
+            pixel = (obs[0] * width, obs[1] * height)
+            errors.setdefault(cam_id, {})[frame] = _reproj_error_px(X, P, pixel)
+    return errors
+
+
+def kalman_rts_smooth(positions, valid_mask, meas_std, process_std=0.03):
+    """Constant-velocity Kalman filter + Rauch-Tung-Striebel (RTS) backward
+    smoother over one landmark's 3D trajectory. positions: (T,3); valid_mask:
+    (T,) bool; meas_std: (T,) per-frame position-measurement std (meters).
+    Frames with no triangulation (valid_mask False) get pure predictions, filled
+    in by the backward pass using later valid frames. Returns (T,3) smoothed
+    positions, or all-NaN if valid_mask is all False. Ported near-verbatim from
+    ransac_keypoint_reconstruction.ipynb's Stage 2c.
+    """
+    T = positions.shape[0]
+    if not valid_mask.any():
+        return np.full((T, 3), np.nan)
+
+    F = np.eye(6)
+    F[:3, 3:] = np.eye(3)
+    q = process_std ** 2
+    Q = np.block([
+        [np.eye(3) * (q / 4.0), np.eye(3) * (q / 2.0)],
+        [np.eye(3) * (q / 2.0), np.eye(3) * q],
+    ])
+    H = np.hstack([np.eye(3), np.zeros((3, 3))])
+
+    first = int(np.argmax(valid_mask))
+    x = np.zeros(6)
+    x[:3] = positions[first]
+    P = np.eye(6) * 1.0
+
+    xs_pred = np.zeros((T, 6))
+    Ps_pred = np.zeros((T, 6, 6))
+    xs_filt = np.zeros((T, 6))
+    Ps_filt = np.zeros((T, 6, 6))
+
+    for t in range(T):
+        if t > 0:
+            x = F @ x
+            P = F @ P @ F.T + Q
+        xs_pred[t], Ps_pred[t] = x, P
+        if valid_mask[t]:
+            R = np.eye(3) * meas_std[t] ** 2
+            S = H @ P @ H.T + R
+            K = P @ H.T @ np.linalg.inv(S)
+            x = x + K @ (positions[t] - H @ x)
+            P = (np.eye(6) - K @ H) @ P
+        xs_filt[t], Ps_filt[t] = x, P
+
+    xs_smooth = xs_filt.copy()
+    for t in range(T - 2, -1, -1):
+        C = Ps_filt[t] @ F.T @ np.linalg.inv(Ps_pred[t + 1])
+        xs_smooth[t] = xs_filt[t] + C @ (xs_smooth[t + 1] - xs_pred[t + 1])
+
+    return xs_smooth[:, :3]
+
+
+def smooth_reconstruction_sequence(
+    reconstruction, frame_keys, landmark_ids, n_inliers_by_frame,
+    process_std=0.03, meas_std_base=0.01, meas_std_2cam=0.015,
+):
+    """Applies kalman_rts_smooth per landmark id across frame_keys (in sequence
+    order), inflating measurement noise for frames triangulated from only 2
+    inlier cameras (n_inliers_by_frame[frame_key] == 2 -- less depth precision
+    than 3+ views). Returns a reconstruction dict in the same schema as the
+    input, covering only the span from each landmark's first to last valid
+    frame (matches ransac_keypoint_reconstruction.ipynb's Stage 2c convention).
+    """
+    T = len(frame_keys)
+    smoothed = {}
+    for lm_id in landmark_ids:
+        lm_key = str(lm_id)
+        positions = np.full((T, 3), np.nan)
+        valid_mask = np.zeros(T, dtype=bool)
+        for t, frame in enumerate(frame_keys):
+            pt = reconstruction.get(frame, {}).get(lm_key)
+            if pt is not None:
+                positions[t] = pt
+                valid_mask[t] = True
+        if not valid_mask.any():
+            continue
+        meas_std = np.array([
+            meas_std_2cam if n_inliers_by_frame.get(frame, 0) == 2 else meas_std_base
+            for frame in frame_keys
+        ])
+        smoothed_positions = kalman_rts_smooth(positions, valid_mask, meas_std, process_std=process_std)
+        valid_idx = np.where(valid_mask)[0]
+        lo, hi = valid_idx[0], valid_idx[-1] + 1
+        for t in range(lo, hi):
+            smoothed.setdefault(frame_keys[t], {})[lm_key] = smoothed_positions[t].tolist()
+    return smoothed
+
+
+def flag_jitter_frames(raw_reconstruction, smoothed_reconstruction, frame_keys,
+                        reference_landmark_id=0, mad_factor=4.0):
+    """Flags frames where the raw (RANSAC-triangulated) reference-landmark
+    position deviates sharply from its Kalman/RTS-smoothed trajectory -- evidence
+    that frame's camera-set choice (or underlying 2D detection) was an outlier,
+    now corrected by the smoother. This directly implements "a wrist can't move
+    too much frame to frame" as a principled median+MAD statistical test rather
+    than an ad hoc displacement threshold. Ported from
+    ransac_keypoint_reconstruction.ipynb's Stage 2d. Returns (flags, residuals):
+    flags is a set of flagged frame_keys; residuals is dict[frame_key] -> float
+    (meters), covering only frames present in both reconstructions.
+    """
+    lm_key = str(reference_landmark_id)
+    residuals = {}
+    for frame in frame_keys:
+        raw_pt = raw_reconstruction.get(frame, {}).get(lm_key)
+        smooth_pt = smoothed_reconstruction.get(frame, {}).get(lm_key)
+        if raw_pt is None or smooth_pt is None:
+            continue
+        residuals[frame] = float(np.linalg.norm(np.array(raw_pt) - np.array(smooth_pt)))
+    if not residuals:
+        return set(), residuals
+    values = np.array(list(residuals.values()))
+    med = np.median(values)
+    mad = np.median(np.abs(values - med)) + 1e-9
+    thresh = med + mad_factor * mad
+    flags = {frame for frame, r in residuals.items() if r > thresh}
+    return flags, residuals
+
+
+# ---------------------------------------------------------------------------
+# Hand-identity mixup detection. Motivated by an observation on the h5 rig
+# (ground-truth calibration, never inferred from the hand keypoints themselves):
+# when one hand's detection for a camera/frame is bad, the other hand for that
+# same camera/frame often looks bad too -- evidence the camera's detector
+# confused/swapped left vs right for that frame, not two independent unlucky
+# detections.
+#
+# detect_body_wrist_hand_swap is deliberately listed, and should be run, first:
+# it's the cheapest and most reliable of these tests (a same-detector, same-frame
+# body-pose estimate needs no other camera or the other detector to be confident
+# that frame, unlike the LOO/cross-detector tests below), so it belongs first in
+# any correction pipeline -- fix what it can cheaply and unambiguously fix before
+# spending the pricier multiview/cross-detector tests on what's left.
+# ---------------------------------------------------------------------------
+
+BODY_WRIST_COCO = {'left': 9, 'right': 10}  # COCO-17: left_wrist=9, right_wrist=10
+
+
+def detect_body_wrist_hand_swap(
+    landmarks_left, landmarks_right, landmarks_body, cam_id, frame, width, height,
+    hand_wrist_id=0, body_wrist_left_id=BODY_WRIST_COCO['left'], body_wrist_right_id=BODY_WRIST_COCO['right'],
+    swap_margin_px=20.0,
+):
+    """Cheapest, single-camera/frame, purely-2D swap test: a detector's own body
+    pose already carries independent left/right wrist keypoints for that same
+    frame, so they're a same-detector reference for which hand is which -- no
+    other camera or the other detector needs to have a confident detection that
+    frame, unlike detect_camera_hand_swap (needs >= min_loo_cameras other
+    cameras) or cross_detector_hand_disagreement (needs both detectors). Meant to
+    run FIRST in a correction pipeline, ahead of those pricier tests (see the
+    module comment above).
+
+    Flags a swap when swapping the hand-left/hand-right assignment reduces total
+    wrist-to-wrist pixel distance to the body's own left/right wrist by more than
+    `swap_margin_px` -- an explicit margin (not a bare comparison), since body-pose
+    wrist estimates are noisier than hand-model wrists and a bare comparison would
+    flip-flop on frames where the two assignments are nearly tied.
+
+    Returns None when undecidable: the body or either hand lacks a detection for
+    this camera/frame. Otherwise a dict with 'swap_detected' (bool),
+    'as_labeled_err'/'swapped_err' (summed px distance to the body's wrists under
+    each hypothesis), and 'margin' (as_labeled_err - swapped_err, positive favors
+    a swap).
+    """
+    hand_key = str(hand_wrist_id)
+    body_l_key = str(body_wrist_left_id)
+    body_r_key = str(body_wrist_right_id)
+
+    body = landmarks_body.get(cam_id, {}).get(frame)
+    l_lm = landmarks_left.get(cam_id, {}).get(frame)
+    r_lm = landmarks_right.get(cam_id, {}).get(frame)
+    if not body or not l_lm or not r_lm:
+        return None
+    body_l = body.get(body_l_key)
+    body_r = body.get(body_r_key)
+    hand_l = l_lm.get(hand_key)
+    hand_r = r_lm.get(hand_key)
+    if body_l is None or body_r is None or hand_l is None or hand_r is None:
+        return None
+
+    def px(pt):
+        return np.array([pt[0] * width, pt[1] * height], dtype=np.float64)
+
+    body_l_px, body_r_px, hand_l_px, hand_r_px = px(body_l), px(body_r), px(hand_l), px(hand_r)
+
+    as_labeled_err = float(np.linalg.norm(hand_l_px - body_l_px) + np.linalg.norm(hand_r_px - body_r_px))
+    swapped_err = float(np.linalg.norm(hand_r_px - body_l_px) + np.linalg.norm(hand_l_px - body_r_px))
+
+    return {
+        'swap_detected': swapped_err < as_labeled_err - swap_margin_px,
+        'as_labeled_err': as_labeled_err,
+        'swapped_err': swapped_err,
+        'margin': as_labeled_err - swapped_err,
+    }
+
+
+def detect_body_wrist_hand_swaps_sequence(
+    landmarks_left, landmarks_right, landmarks_body, cam_ids, frame_keys, width, height,
+    hand_wrist_id=0, swap_margin_px=20.0,
+):
+    """Loops detect_body_wrist_hand_swap over every (camera, frame) pair.
+    Returns dict[cam_id][frame_key] -> result dict, omitting undecidable
+    combinations (missing body or hand detection that frame)."""
+    results = {}
+    for cam_id in cam_ids:
+        for frame in frame_keys:
+            r = detect_body_wrist_hand_swap(
+                landmarks_left, landmarks_right, landmarks_body, cam_id, frame, width, height,
+                hand_wrist_id=hand_wrist_id, swap_margin_px=swap_margin_px,
+            )
+            if r is not None:
+                results.setdefault(cam_id, {})[frame] = r
+    return results
+
+
+def detect_camera_hand_swap(
+    landmarks_left, confidence_left, landmarks_right, confidence_right,
+    projection_matrices, width, height, cam_id, frame,
+    reference_landmark_id=0, min_loo_cameras=2, min_confidence=0.5, swap_margin_px=5.0,
+):
+    """Leave-one-out (LOO) swap-hypothesis test for one camera/frame: triangulate
+    left and right hands independently using every OTHER camera with a confident
+    detection that frame (the multiview consensus, deliberately excluding
+    cam_id's own observation so the test isn't circular), then compare cam_id's
+    reprojection error under the as-labeled assignment vs. the swapped one.
+    Flags a swap only when the swapped assignment fits distinctly better (by more
+    than swap_margin_px) -- an explicit margin, not a bare comparison, so
+    near-tied/ambiguous frames aren't flip-flopped (same rationale as
+    ransac_select_cameras_sequence's hysteresis). This directly tests the
+    hand-mixup hypothesis using the dataset's one fully-trustworthy asset --
+    ground-truth multiview geometry -- rather than inferring it indirectly.
+
+    Uses only reference_landmark_id (wrist=0) for both the LOO consensus and the
+    error comparison, matching this module's existing wrist-only convention for
+    pose/consensus decisions (see POSE_ESTIMATION_LANDMARK_IDS above) -- cheap and
+    robust, since a genuine hand-identity swap moves every landmark together, not
+    just some.
+
+    Returns None when undecidable: fewer than min_loo_cameras other cameras have
+    a confident detection for a hand, or cam_id itself lacks a confident
+    detection on either hand that frame. Otherwise a dict with 'swap_detected'
+    (bool), 'as_labeled_err'/'swapped_err' (mean px reprojection error under each
+    hypothesis), and 'margin' (as_labeled_err - swapped_err, positive favors a
+    swap).
+    """
+    lm_key = str(reference_landmark_id)
+    other_cams = [c for c in projection_matrices if c != cam_id]
+
+    def loo_point(landmarks, side_confidence):
+        points_2d = {}
+        for c in other_cams:
+            if side_confidence.get(c, {}).get(frame, 0) < min_confidence:
+                continue
+            obs = landmarks.get(c, {}).get(frame, {}).get(lm_key)
+            if obs is None:
+                continue
+            points_2d[c] = (obs[0] * width, obs[1] * height)
+        if len(points_2d) < min_loo_cameras:
+            return None
+        return triangulate_dlt(points_2d, projection_matrices)
+
+    def cam_pixel(landmarks, side_confidence):
+        if side_confidence.get(cam_id, {}).get(frame, 0) < min_confidence:
+            return None
+        obs = landmarks.get(cam_id, {}).get(frame, {}).get(lm_key)
+        if obs is None:
+            return None
+        return (obs[0] * width, obs[1] * height)
+
+    cam_left_px = cam_pixel(landmarks_left, confidence_left)
+    cam_right_px = cam_pixel(landmarks_right, confidence_right)
+    if cam_left_px is None or cam_right_px is None:
+        return None
+
+    X_left_loo = loo_point(landmarks_left, confidence_left)
+    X_right_loo = loo_point(landmarks_right, confidence_right)
+    if X_left_loo is None or X_right_loo is None:
+        return None
+
+    P = projection_matrices[cam_id]
+    as_labeled_err = (
+        _reproj_error_px(X_left_loo, P, cam_left_px) + _reproj_error_px(X_right_loo, P, cam_right_px)
+    )
+    swapped_err = (
+        _reproj_error_px(X_right_loo, P, cam_left_px) + _reproj_error_px(X_left_loo, P, cam_right_px)
+    )
+
+    return {
+        'swap_detected': swapped_err < as_labeled_err - swap_margin_px,
+        'as_labeled_err': as_labeled_err,
+        'swapped_err': swapped_err,
+        'margin': as_labeled_err - swapped_err,
+    }
+
+
+def detect_camera_hand_swaps_sequence(
+    landmarks_left, confidence_left, landmarks_right, confidence_right,
+    projection_matrices, width, height, cam_ids, frame_keys,
+    reference_landmark_id=0, min_loo_cameras=2, min_confidence=0.5, swap_margin_px=5.0,
+):
+    """Loops detect_camera_hand_swap over every (camera, frame) pair. Returns
+    dict[cam_id][frame_key] -> result dict, omitting undecidable combinations."""
+    results = {}
+    for cam_id in cam_ids:
+        for frame in frame_keys:
+            r = detect_camera_hand_swap(
+                landmarks_left, confidence_left, landmarks_right, confidence_right,
+                projection_matrices, width, height, cam_id, frame,
+                reference_landmark_id=reference_landmark_id, min_loo_cameras=min_loo_cameras,
+                min_confidence=min_confidence, swap_margin_px=swap_margin_px,
+            )
+            if r is not None:
+                results.setdefault(cam_id, {})[frame] = r
+    return results
+
+
+def cross_detector_hand_disagreement(
+    landmarks_mp_left, landmarks_mp_right, landmarks_dw_left, landmarks_dw_right,
+    cam_id, frame, width, height, landmark_ids=range(21), swap_ratio_thresh=0.5,
+):
+    """Cheap, single-camera/frame, purely-2D pre-filter (no triangulation): mean
+    pixel distance between MediaPipe's and DWPose's landmarks under the
+    as-labeled pairing (mp_left-vs-dw_left, mp_right-vs-dw_right) vs. the swapped
+    pairing (mp_left-vs-dw_right, mp_right-vs-dw_left). Flags 'likely_swap' when
+    the swapped pairing agrees distinctly better -- an order of magnitude cheaper
+    than detect_camera_hand_swap, used to prioritize which (camera, frame) pairs
+    are worth running that geometric test on, rather than sweeping it over every
+    camera/frame. Returns None if any of the four (detector, side) combinations
+    lacks a detection for this camera/frame.
+    """
+    def pixel_dist(lms_a, lms_b):
+        dists = []
+        for lm_id in landmark_ids:
+            a = lms_a.get(str(lm_id))
+            b = lms_b.get(str(lm_id))
+            if a is None or b is None:
+                continue
+            dists.append(float(np.hypot((a[0] - b[0]) * width, (a[1] - b[1]) * height)))
+        return float(np.mean(dists)) if dists else None
+
+    mp_left = landmarks_mp_left.get(cam_id, {}).get(frame)
+    mp_right = landmarks_mp_right.get(cam_id, {}).get(frame)
+    dw_left = landmarks_dw_left.get(cam_id, {}).get(frame)
+    dw_right = landmarks_dw_right.get(cam_id, {}).get(frame)
+    if not (mp_left and mp_right and dw_left and dw_right):
+        return None
+
+    d_ll = pixel_dist(mp_left, dw_left)
+    d_rr = pixel_dist(mp_right, dw_right)
+    d_lr = pixel_dist(mp_left, dw_right)
+    d_rl = pixel_dist(mp_right, dw_left)
+    if None in (d_ll, d_rr, d_lr, d_rl):
+        return None
+
+    same_side = (d_ll + d_rr) / 2.0
+    cross_side = (d_lr + d_rl) / 2.0
+    return {
+        'likely_swap': cross_side < swap_ratio_thresh * same_side,
+        'same_side': same_side,
+        'cross_side': cross_side,
+    }
+
+
+def detect_high_velocity_frames(
+    landmarks, cam_ids, frame_keys, width, height, reference_landmark_id=0, velocity_thresh_px=200.0,
+):
+    """Per-camera, frame-to-frame 2D pixel velocity of `reference_landmark_id`
+    (wrist=0), flagging frames where it exceeds `velocity_thresh_px` -- a hand
+    physically can't teleport that far in one frame at this capture rate, so a
+    spike almost always means the underlying 2D detection (or its L/R identity)
+    was wrong that frame, not that the hand actually moved that fast. `frame_keys`
+    must already be in temporal sequence order (velocity is undefined for the
+    first frame any camera has a detection, and after any gap the "previous"
+    position is reset rather than measured across the gap).
+
+    Deliberately a plain per-camera 2D measurement (no triangulation) -- this is
+    meant to run on whichever landmark space the caller is about to act on next
+    (raw pixels if immediately re-rendering to a video, undistorted if feeding
+    triangulation), so it takes `landmarks` directly rather than assuming one.
+
+    Returns dict[cam_id][frame_key] -> {'velocity_px': float, 'flagged': bool}.
+    """
+    result = {}
+    lm_key = str(reference_landmark_id)
+    for cam_id in cam_ids:
+        prev_px = None
+        for fk in frame_keys:
+            obs = landmarks.get(cam_id, {}).get(fk, {}).get(lm_key)
+            if obs is None:
+                prev_px = None
+                continue
+            px = np.array([obs[0] * width, obs[1] * height], dtype=np.float64)
+            if prev_px is not None:
+                vel = float(np.linalg.norm(px - prev_px))
+                result.setdefault(cam_id, {})[fk] = {'velocity_px': vel, 'flagged': vel > velocity_thresh_px}
+            prev_px = px
+    return result
+
+
+def apply_swap_corrections(landmarks_left, confidence_left, landmarks_right, confidence_right, swap_flags):
+    """Corrects a detector's left/right hand assignment wherever a mixup detector
+    flagged a (camera, frame) as swapped (e.g. detect_camera_hand_swaps_sequence's
+    'swap_detected', or any dict[cam_id][frame_key] -> bool of the same shape):
+    swaps that (camera, frame)'s 2D landmarks AND its confidence between the left
+    and right dicts, since the underlying detection didn't change, only which
+    physical hand it actually belongs to. Frames not flagged are passed through
+    unchanged (deep-copied, so the inputs are never mutated).
+
+    Returns (landmarks_left, confidence_left, landmarks_right, confidence_right,
+    n_corrected) -- the same 4-dict shape as the inputs plus a correction count.
+    """
+    new_landmarks_left = copy.deepcopy(landmarks_left)
+    new_confidence_left = copy.deepcopy(confidence_left)
+    new_landmarks_right = copy.deepcopy(landmarks_right)
+    new_confidence_right = copy.deepcopy(confidence_right)
+
+    n_corrected = 0
+    for cam_id, by_frame in swap_flags.items():
+        for fk, flagged in by_frame.items():
+            if not flagged:
+                continue
+            l_lm = landmarks_left.get(cam_id, {}).get(fk)
+            r_lm = landmarks_right.get(cam_id, {}).get(fk)
+            l_conf = confidence_left.get(cam_id, {}).get(fk)
+            r_conf = confidence_right.get(cam_id, {}).get(fk)
+
+            if r_lm is not None:
+                new_landmarks_left.setdefault(cam_id, {})[fk] = r_lm
+            else:
+                new_landmarks_left.get(cam_id, {}).pop(fk, None)
+            if l_lm is not None:
+                new_landmarks_right.setdefault(cam_id, {})[fk] = l_lm
+            else:
+                new_landmarks_right.get(cam_id, {}).pop(fk, None)
+
+            if r_conf is not None:
+                new_confidence_left.setdefault(cam_id, {})[fk] = r_conf
+            if l_conf is not None:
+                new_confidence_right.setdefault(cam_id, {})[fk] = l_conf
+            n_corrected += 1
+
+    return new_landmarks_left, new_confidence_left, new_landmarks_right, new_confidence_right, n_corrected
+
+
+def apply_confidence_penalty(confidence, flags, penalty_factor=0.01):
+    """Multiplies confidence[cam_id][frame_key] by `penalty_factor` wherever
+    flags[cam_id][frame_key] is truthy (e.g. detect_high_velocity_frames'
+    'flagged') -- e.g. a physically-implausible velocity spike shouldn't
+    necessarily exclude a frame outright (a later, better detector might still
+    want it), but it should stop dominating a confidence-weighted combination.
+    Returns (confidence, n_penalized); the input dict is not mutated.
+    """
+    new_confidence = copy.deepcopy(confidence)
+    n_penalized = 0
+    for cam_id, by_frame in flags.items():
+        for fk, v in by_frame.items():
+            flagged = v['flagged'] if isinstance(v, dict) else bool(v)
+            if not flagged:
+                continue
+            orig = confidence.get(cam_id, {}).get(fk, 0.0)
+            new_confidence.setdefault(cam_id, {})[fk] = orig * penalty_factor
+            n_penalized += 1
+    return new_confidence, n_penalized
 
 
 def save_reconstruction(path, data):
@@ -697,6 +1536,18 @@ HAND_CONNECTIONS = [
     (5, 9), (9, 13), (13, 17),
 ]
 
+# Standard COCO-17 body topology (nose, l/r eye, l/r ear, l/r shoulder, l/r elbow,
+# l/r wrist, l/r hip, l/r knee, l/r ankle -- ids 0-16 in that order), for skeletons
+# triangulated with landmark_ids=range(17) (see load_all_camera_calibration's
+# sibling body-extraction path in h5_hand_extraction.py).
+BODY_CONNECTIONS_COCO = [
+    (0, 1), (0, 2), (1, 3), (2, 4),          # face: nose-eyes-ears
+    (5, 6),                                    # shoulders
+    (5, 7), (7, 9), (6, 8), (8, 10),           # arms
+    (5, 11), (6, 12), (11, 12),                # torso
+    (11, 13), (13, 15), (12, 14), (14, 16),    # legs
+]
+
 
 def start_viser_server(port=None):
     return viser.ViserServer(port=port) if port is not None else viser.ViserServer()
@@ -726,7 +1577,21 @@ def add_camera_frustums(server, poses, K, width, height, scale=0.15):
         )
 
 
-def add_skeleton_frame(server, frame_points, name_prefix='/skeleton'):
+def add_skeleton_frame(
+    server, frame_points, name_prefix='/skeleton',
+    connections=HAND_CONNECTIONS, point_color=(220, 220, 220), bone_color=(0, 255, 120),
+    flagged=False, flagged_color=(230, 40, 40),
+):
+    """connections/point_color/bone_color default to exactly the previous
+    hardcoded behavior (backward compatible with run_skeleton_player and any
+    other existing caller). Pass connections=BODY_CONNECTIONS_COCO for a
+    body skeleton instead of a hand one. flagged=True overrides both colors to
+    flagged_color -- a whole-skeleton override rather than per-joint, matching
+    the granularity the jitter/swap mixup detectors actually operate at
+    (frame/hand, not individual joint)."""
+    if flagged:
+        point_color = flagged_color
+        bone_color = flagged_color
     if not frame_points:
         server.scene.add_point_cloud(
             name=f'{name_prefix}/joints',
@@ -738,19 +1603,19 @@ def add_skeleton_frame(server, frame_points, name_prefix='/skeleton'):
     joint_coords = {int(k): np.array(v, dtype=np.float32) for k, v in frame_points.items()}
     ids = sorted(joint_coords.keys())
     pts = np.stack([joint_coords[i] for i in ids])
-    colors = np.full((len(ids), 3), 220, dtype=np.uint8)
+    colors = np.full((len(ids), 3), point_color, dtype=np.uint8)
     server.scene.add_point_cloud(name=f'{name_prefix}/joints', points=pts, colors=colors, point_size=0.005)
 
     segs = [
         [joint_coords[a], joint_coords[b]]
-        for a, b in HAND_CONNECTIONS
+        for a, b in connections
         if a in joint_coords and b in joint_coords
     ]
     if segs:
         server.scene.add_line_segments(
             name=f'{name_prefix}/bones',
             points=np.array(segs, dtype=np.float32),
-            colors=np.array((0, 255, 120), dtype=np.uint8),
+            colors=np.array(bone_color, dtype=np.uint8),
             line_width=2.0,
         )
 
