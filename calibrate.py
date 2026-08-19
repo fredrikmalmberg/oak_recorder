@@ -104,7 +104,7 @@ DEFAULT_CONFIG = {
         "no_detection_warning_s": 20.0,
     },
     "output": {
-        "dir": "calibrations",
+        "dir": "output/calibration",
         "save_raw_images": False,
     },
     "viser": {

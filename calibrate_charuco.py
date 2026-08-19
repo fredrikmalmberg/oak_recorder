@@ -17,7 +17,7 @@ def collect_images(folder):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--images", required=True, help="Folder with images from ONE camera")
-    ap.add_argument("--out", default="charuco_calib_out", help="Output folder")
+    ap.add_argument("--out", default="output/charuco_calib", help="Output folder")
 
     # ChArUco board parameters
     ap.add_argument("--aruco_dict", default="DICT_4X4_50", help="OpenCV ArUco dict name (e.g., DICT_4X4_50)")

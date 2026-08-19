@@ -254,7 +254,7 @@ def main():
     )
     ap.add_argument("--ref-cam", default="cam0", help="Reference camera; becomes the world origin")
     ap.add_argument("--min-corners", type=int, default=8, help="Minimum ChArUco corners required to accept a frame's pose")
-    ap.add_argument("--out", default="extrinsics.json", help="Output JSON path")
+    ap.add_argument("--out", default="output/extrinsics/extrinsics.json", help="Output JSON path")
     ap.add_argument("--no-viewer", action="store_true", help="Skip launching the viser viewer")
     ap.add_argument(
         "--units-per-meter",
@@ -267,6 +267,9 @@ def main():
     calibs = parse_calib_args(args.calib)
     extrinsics = solve_extrinsics(args.session, calibs, args.ref_cam, args.min_corners)
 
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(extrinsics, f, indent=2)
     print(f"Saved extrinsics: {args.out}")

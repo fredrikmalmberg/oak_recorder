@@ -12,8 +12,8 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
-import dwpose_onnx
-import h5_dataset
+from . import dwpose_onnx
+from . import h5_dataset
 
 POSE_LEFT_WRIST = 15
 POSE_RIGHT_WRIST = 16

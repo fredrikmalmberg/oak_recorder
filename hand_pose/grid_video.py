@@ -20,8 +20,8 @@ import os
 import cv2
 import numpy as np
 
-import h5_dataset
-import hand_multiview
+from . import h5_dataset
+from . import hand_multiview
 
 BONE_THICKNESS = 4  # 2x hand_multiview.draw_hand_skeleton's own default (2)
 FLAG_COLOR = (0, 0, 255)

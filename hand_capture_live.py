@@ -27,7 +27,7 @@ except ImportError:
     dai = None
 
 import calibrate as cal
-import hand_multiview as hmv
+from hand_pose import hand_multiview as hmv
 
 # A hand-tracking button that enables the instant ≥1 camera is posed would be
 # meaningless (triangulation needs ≥2 views); "a bit of calibration, so the cameras
