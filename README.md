@@ -361,3 +361,34 @@ cell), which is kept but not documented separately here.
   notebooks above. They hardcode paths to an external `WiLoR` checkout and
   `/tmp/*` scripts that aren't part of this repo, so they aren't runnable as
   committed — kept for reference only.
+
+## Next steps / ideas
+
+Not implemented -- notes from a design discussion, kept here so the reasoning
+isn't lost before either gets picked up.
+
+**Persistent camera streams for short repeated recordings.** A typical
+session is many short (<30s) clips, but each `capture.py` run pays the full
+device-connect/boot cost once per process. `capture.py` already separates
+"device open/streaming" (`start_pipeline()`) from "recording active"
+(`begin_recording()`), so the expensive one-time setup already happens only
+once per process -- what's missing is (a) a control loop to start/stop
+individual clips without closing the process between them, and (b) per-clip
+file/log naming (currently one `video_path`/`log_path` per `CameraRecorder`
+for the whole process lifetime). Open questions before building this: how
+sync-calibration drifts over a long-lived session (currently computed once,
+post-warmup, per process) if the pipeline sits idle for extended periods
+between clips, and whether an idle-but-open pipeline is stable over long
+periods -- neither has been tested.
+
+**Separate worker process per camera, with an orchestrator.** Instead of one
+`capture.py` process looping over every camera sequentially, run each
+camera's pipeline in its own worker process, coordinated by an orchestrator.
+Main benefits: fault isolation (one crashing/hanging camera can't take the
+others down with it -- directly relevant given the boot-timeout/brownout
+issues tracked in `logs/camera_boot_log.jsonl`/`camera_boot_stats.py`) and
+real parallelism (avoiding GIL contention across cameras, which
+`BackgroundVideoWriter`'s per-camera thread is already a narrower fix for).
+Tradeoffs: adds complexity around cross-process time-sync coordination and
+IPC, and it would only contain the blast radius of the USB power/boot issue,
+not fix the underlying cause.
