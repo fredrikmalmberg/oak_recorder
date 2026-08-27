@@ -10,5 +10,6 @@
 
 *.h5
 recordings/*
+logs/*
 models/
 install.cmd

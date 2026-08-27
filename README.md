@@ -30,6 +30,9 @@ oak_recorder/
 ├── calibrate_charuco.py           # entry point: offline per-camera intrinsics
 ├── compute_extrinsics.py          # entry point: offline extrinsics + viewer
 ├── hand_capture_live.py           # entry point: live hand tracking
+├── check_usb_speed.py             # entry point: report each OAK's negotiated USB speed/location
+├── camera_boot_stats.py           # entry point: summarize logs/camera_boot_log.jsonl
+├── camera_settings.py             # shared iso/shutter/wb_k defaults, no CLI of its own
 ├── README.md, environment.yml, multicam_charuco_calibration_spec.md, .gitignore
 │
 ├── hand_pose/                      # helper library, no CLI of its own
@@ -59,6 +62,7 @@ oak_recorder/
 │   └── grid_videos/                     # notebooks/dwpose_vs_mediapipe_h5.ipynb
 │
 ├── recordings/                     # capture.py sessions (gitignored)
+├── logs/                            # camera_boot_log.jsonl (gitignored) -- see camera_boot_stats.py
 ├── tmp/                             # Testdata.h5 + h5_extraction_cache/ (gitignored)
 └── models/                          # DWPose ONNX weights (gitignored, not included)
 ```
@@ -66,14 +70,20 @@ oak_recorder/
 Entry points stay at the repo root (or in `notebooks/` for the two real
 notebooks) so they're easy to find; everything under `hand_pose/` is a pure
 helper library with no CLI of its own, imported by the entry points that need
-it. `output/`, `recordings/`, `tmp/`, and `models/` hold generated/external
-data, not source — none of it is tracked in git.
+it, and `camera_settings.py` is the same for the camera-facing scripts
+(`capture.py`, `calibrate.py`, `oak_camera.py`) at the repo root. `output/`,
+`recordings/`, `logs/`, `tmp/`, and `models/` hold generated/external data,
+not source — none of it is tracked in git.
 
 ## Capture — `capture.py`
 
 ```
 python capture.py [flags]
 ```
+
+`-i`/`-s` default from `camera_settings.py` (shared with `calibrate.py`/
+`oak_camera.py`, so "the same camera" means the same thing across scripts
+unless a script's own flag overrides it):
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -97,6 +107,21 @@ alignment runs (on by default), also `aligned/camN/*.jpg` +
 `compressed_video_grid.mp4` (small) or one full-resolution MP4 per camera
 (actual). No viser viewer — this is a recording tool.
 
+**Camera startup**: devices connect in a randomized order each run (so a
+boot-position bias, e.g. "whichever camera boots last," can't get conflated
+with a specific-camera bias), with a short stagger and up to 2 retries per
+device. This is defense against `X_LINK_DEVICE_NOT_FOUND`
+("Failed to find device after booting") -- an OAK camera draws a current
+spike while booting, and several connecting back-to-back with no gap can
+brown out whichever one boots last; this is a power-delivery issue, not a
+slow-boot one (raising depthai's boot timeout alone doesn't help). Every
+connect attempt (success or failure), with device ID, USB bus/port, and boot
+position, is logged to `logs/camera_boot_log.jsonl` -- see
+`camera_boot_stats.py` below. Shutdown closes every camera in parallel with
+a bounded per-device timeout rather than one at a time, so a single crashed
+device (depthai can block for many seconds trying to retrieve a crash dump
+that never arrives) can't stall the whole process on exit.
+
 ### Re-running alignment standalone — `align_session.py`
 
 `capture.py` calls this automatically after recording, but it also has its own
@@ -113,6 +138,27 @@ above (the report covers per-camera matched/discarded/missing frame counts,
 cross-camera timestamp spread, and warnings such as drift trend or a
 log/video frame-count mismatch). `--output-mp4 small` additionally writes
 `compressed_video_grid.mp4`. No viser viewer.
+
+### USB diagnostics — `check_usb_speed.py` / `camera_boot_stats.py`
+
+```
+python check_usb_speed.py
+python camera_boot_stats.py [path/to/camera_boot_log.jsonl]
+```
+
+`check_usb_speed.py` connects to every discovered OAK device (no pipeline,
+no streaming) and reports its negotiated USB link speed (`SUPER`/
+`SUPER_PLUS` = USB3; `HIGH`/`FULL`/`LOW` = USB2-class and will bottleneck
+throughput), USB location (`<bus>.<port>`), and connected camera sensor(s).
+Also flags devices that share a USB bus (possible bandwidth contention).
+
+`camera_boot_stats.py` reads `logs/camera_boot_log.jsonl` (written by every
+`capture.py` run -- see "Camera startup" above) and reports, per camera ID
+and per USB bus: offence (failed connect attempt) counts, attempts,
+sessions, hard failures (never connected at all that session), and a
+boot-position coverage grid (one each for successes/fails/totals, cameras or
+buses × boot position) so a positional bias (e.g. "always whichever camera
+boots last") can be told apart from a specific bad camera, cable, or port.
 
 ## Live camera preview/monitor — `oak_camera.py`
 

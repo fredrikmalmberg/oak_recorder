@@ -1,6 +1,8 @@
 import argparse
+import json
 import math
 import os
+import random
 import time
 import queue
 import threading
@@ -15,6 +17,7 @@ from align_session import (
     convert_mjpegs_to_grid_mp4,
     default_align_threshold_ms,
 )
+from camera_settings import DEFAULT_CAMERA_SETTINGS
 
 # ==============================================================================
 # 1. OPTIMIZED CONFIGURATION FOR SIGN LANGUAGE KEYPOINT TRACKING
@@ -27,17 +30,24 @@ VIEW_W, VIEW_H    = 1280, 720   # Lightweight 720p for GUI preview
 ENCODER_PROFILE   = dai.VideoEncoderProperties.Profile.MJPEG
 MJPEG_QUALITY     = 70 # 95    # High JPEG quality to eliminate edge blurring
 
-# Camera Exposure Controls (Completely eliminates motion blur)
-# 1500 us = 1/666s shutter speed. Requires bright, flicker-free studio lights!
-FORCED_SHUTTER_US = 2000  # max 2ms shutter speed
-FORCED_ISO        = 200   # max 200 ISO
-FORCED_WB_K       = 4500  # fixed white balance color temperature
+# Camera Exposure Controls -- defaults come from camera_settings.py (the
+# single source of truth other scripts fall back to); override via -i/-s at
+# the CLI. Requires bright, flicker-free studio lights for a short shutter.
+FORCED_SHUTTER_US = DEFAULT_CAMERA_SETTINGS["shutter_us"]
+FORCED_ISO        = DEFAULT_CAMERA_SETTINGS["iso"]
+FORCED_WB_K       = DEFAULT_CAMERA_SETTINGS["wb_k"]
 
 RECORD_DIR        = "recordings"
 PREVIEW_GRID_W    = 1920
 PREVIEW_GRID_H    = 1080
 PREVIEW_WINDOW    = "Sign Language Session Monitor"
 DEFAULT_WARMUP_FRAMES = 60
+
+# Persistent (across every run, not per-session) log of camera connect attempts
+# -- see connect_device_with_retry/log_boot_event and camera_boot_stats.py,
+# the small reader script that tabulates offences (failed attempts) per
+# camera ID from this file.
+BOOT_LOG_PATH = os.path.join("logs", "camera_boot_log.jsonl")
 
 # ==============================================================================
 # 2. ASYNCHRONOUS FILE WRITER THREAD (Prevents GUI Frame Drops)
@@ -81,6 +91,74 @@ class BackgroundVideoWriter(threading.Thread):
     def stop(self):
         self.running = False
         self.join()
+
+
+def log_boot_event(**event):
+    """Appends one JSON-line event to BOOT_LOG_PATH -- one line per connect
+    *attempt* (success or fail, not just hard failures), so camera_boot_stats.py
+    can compute both raw offence counts and failure rates per device. Always
+    on (no opt-out flag) -- this is exactly the kind of long-tail, hard-to-
+    reproduce hardware flakiness where you want data from every run, not just
+    the ones where you remembered to enable logging.
+    """
+    os.makedirs(os.path.dirname(BOOT_LOG_PATH), exist_ok=True)
+    event["ts"] = datetime.now().isoformat()
+    with open(BOOT_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def connect_device_with_retry(device_info, session, boot_position, retries=2, retry_delay_s=3.0):
+    """dai.Device(device_info) can fail with X_LINK_DEVICE_NOT_FOUND ("Failed to
+    find device after booting") when several OAK cameras are booted back to
+    back -- each camera draws a current spike while booting (up to 900mA on
+    USB3 per Luxonis's own USB deployment guide), and with enough devices
+    connecting close together the combined inrush can brown out whichever one
+    boots last, regardless of which physical camera that happens to be. This
+    is a power-delivery issue, not a timing one -- raising the boot timeout
+    does NOT help (confirmed: doubling DEPTHAI_BOOTUP_TIMEOUT made no
+    difference), since a browned-out device never completes booting at all,
+    it doesn't just boot slowly. The real fix is hardware (a powered USB3 hub,
+    or spreading cameras across more host controllers) -- this retry is only a
+    best-effort software mitigation for the case where the brownout is
+    transient and clears once the other devices' inrush has settled.
+
+    `boot_position` is this device's index in THIS run's connect order (which
+    main() now randomizes per run) -- logged alongside device_id so
+    camera_boot_stats.py can check for a position bias (e.g. "always whichever
+    camera goes last") separately from a device-identity bias (e.g. "always
+    this specific camera"), instead of conflating the two the way a fixed
+    boot order would.
+
+    Also logs `usb_location` (device_info.name, a "<bus>.<port>"-style string
+    -- see check_usb_speed.py's usb_bus() for the same convention) so failures
+    can additionally be checked for a hub/controller bias -- e.g. several
+    cameras sharing a bus number consistently showing up together in the
+    offence counts would point at that shared hub/controller specifically.
+    """
+    usb_location = device_info.name
+    last_exc = None
+    for attempt in range(1, retries + 2):
+        try:
+            device = dai.Device(device_info)
+            usb_speed = device.getUsbSpeed()
+            log_boot_event(
+                session=session, device_id=device_info.deviceId, boot_position=boot_position,
+                usb_location=usb_location, attempt=attempt, outcome="success",
+                usb_speed=usb_speed.name,
+            )
+            return device, usb_speed
+        except Exception as exc:
+            last_exc = exc
+            log_boot_event(
+                session=session, device_id=device_info.deviceId, boot_position=boot_position,
+                usb_location=usb_location, attempt=attempt, outcome="fail", error=str(exc),
+            )
+            if attempt <= retries:
+                print(f"  [Retry] Connect to {device_info.deviceId} failed "
+                      f"(attempt {attempt}/{retries + 1}): {exc} -- retrying in "
+                      f"{retry_delay_s:.0f}s...")
+                time.sleep(retry_delay_s)
+    raise last_exc
 
 
 # ==============================================================================
@@ -219,9 +297,10 @@ def run_warmup(recorders, warmup_frames, preview_enabled):
 
 
 class CameraRecorder:
-    def __init__(self, cam_idx, device_info, session_dir, preview, record=True):
+    def __init__(self, cam_idx, device_info, session, session_dir, preview, record=True):
         self.cam_idx = cam_idx
         self.cam_label = f"cam{cam_idx}"
+        self.device_id = device_info.deviceId
         self.record_enabled = record
         self.recording_active = False
         self.video_path = None
@@ -236,7 +315,11 @@ class CameraRecorder:
         if record:
             self.video_path, self.log_path = session_file_paths(session_dir, cam_idx)
 
-        self.device = dai.Device(device_info)
+        self.device, self.usb_speed = connect_device_with_retry(device_info, session, cam_idx)
+        speed_flag = ("" if self.usb_speed in (dai.UsbSpeed.SUPER, dai.UsbSpeed.SUPER_PLUS)
+                      else "  <-- USB2-class, may bottleneck/destabilize")
+        print(f"  [{self.cam_label}] USB speed: {self.usb_speed.name}{speed_flag}")
+
         self.pipeline, rec_endpoint, view_endpoint = create_dual_stream_pipeline(
             self.device, preview=preview
         )
@@ -244,11 +327,22 @@ class CameraRecorder:
         self.q_view = None
         if view_endpoint is not None:
             self.q_view = view_endpoint.createOutputQueue(maxSize=4, blocking=False)
-        self.pipeline.start()
 
         self.fps_counter = 0
         self.current_fps = 0.0
         self.preview_frame = None
+
+    def start_pipeline(self):
+        """Deliberately separate from __init__ -- see main()'s two-phase startup
+        loop. This starts streaming (bandwidth-heavy); __init__ only
+        connects/boots the device. Keeping streaming from starting on any
+        camera until every camera has finished booting avoids one source of
+        USB contention -- though the main cause of X_LINK_DEVICE_NOT_FOUND
+        with several cameras turned out to be power (boot current spikes,
+        not streaming bandwidth); see connect_device_with_retry's docstring
+        and the CONNECT_STAGGER_S comment in main().
+        """
+        self.pipeline.start()
 
     def begin_recording(self):
         if not self.record_enabled or self.recording_active:
@@ -257,7 +351,8 @@ class CameraRecorder:
         self.writer.start()
         self.log_file = open(self.log_path, "w", encoding="utf-8")
         self.log_file.write(f"# video={self.video_path}\n")
-        self.log_file.write(f"# camera={self.cam_label}\n")
+        self.log_file.write(f"# camera={self.cam_label} device_id={self.device_id} "
+                            f"usb_speed={self.usb_speed.name}\n")
         self.log_file.write(f"# iso={FORCED_ISO} shutter_us={FORCED_SHUTTER_US} "
                             f"{REC_W}x{REC_H}@{FPS}fps mjpeg_q={MJPEG_QUALITY}\n")
         if self.sync_host_offset_s is not None:
@@ -385,6 +480,27 @@ class CameraRecorder:
         self.device.close()
 
 
+def close_recorders_parallel(recorders, timeout_s=10.0):
+    """Closing cameras one at a time means total shutdown time is the SUM of
+    every device's close() time -- and a crashed device's close() can itself
+    block for many seconds while depthai waits for a crash dump that never
+    comes (the "Device likely crashed, but no crash dump could be extracted"/
+    "did not reboot in time" messages). Closing them all in parallel threads
+    instead makes shutdown take as long as the slowest device, not the sum of
+    all of them; joining with a timeout means one truly stuck device can't
+    hang the whole process on exit (the thread is left running as a daemon,
+    so it can't block interpreter exit either).
+    """
+    close_threads = [(r, threading.Thread(target=r.close, daemon=True)) for r in recorders]
+    for _, t in close_threads:
+        t.start()
+    for recorder, t in close_threads:
+        t.join(timeout=timeout_s)
+        if t.is_alive():
+            print(f"[Warning] {recorder.cam_label} ({recorder.device_id}) didn't finish "
+                  f"closing within {timeout_s:.0f}s -- moving on without waiting further.")
+
+
 # ==============================================================================
 # 4. MAIN CAPTURE AND RENDERING LOOP
 # ==============================================================================
@@ -423,12 +539,26 @@ def main(args=None):
 
     print("Initializing OAK device(s)...")
 
+    # Harmless safety margin, but NOT the main fix for X_LINK_DEVICE_NOT_FOUND
+    # with several cameras -- confirmed (by testing) that raising this alone
+    # doesn't help; that failure is a power/brownout issue, not a slow-boot
+    # one. See connect_device_with_retry's docstring for the actual mitigation.
+    # setdefault so an explicit env var from the caller always wins.
+    os.environ.setdefault("DEPTHAI_BOOTUP_TIMEOUT", "30000")
+
     device_infos = dai.Device.getAllAvailableDevices()
     if not device_infos:
         print("[Error] No active OAK device discovered.")
         return
 
-    print(f"Found {len(device_infos)} OAK device(s):")
+    # Randomized every run so a boot-order/position effect (e.g. "whichever
+    # camera boots last is more likely to fail") doesn't get conflated with a
+    # specific-camera effect -- with a fixed enumeration order, a camera that
+    # always happens to enumerate last would look like "always the same
+    # camera fails" even if the real cause is purely positional.
+    random.shuffle(device_infos)
+
+    print(f"Found {len(device_infos)} OAK device(s) (boot order randomized this run):")
     for cam_idx, info in enumerate(device_infos):
         print(f"  [{cam_idx}] ID: {info.deviceId}")
 
@@ -439,72 +569,103 @@ def main(args=None):
         os.makedirs(session_dir, exist_ok=True)
     recorders = []
 
+    # Everything from here through the run loop is one try/finally so a
+    # KeyboardInterrupt (or any other exception) at ANY point -- including
+    # mid-connect, which can now take a while with retries/stagger -- still
+    # reaches close_recorders_parallel below, instead of leaving already-
+    # connected devices dangling because the interrupt landed before the run
+    # loop's own try/finally (a real gap the old structure had).
     try:
-        for cam_idx, device_info in enumerate(device_infos):
-            print(f"Starting cam{cam_idx}...")
-            recorders.append(CameraRecorder(
-                cam_idx, device_info, session_dir, preview_enabled, record_enabled
-            ))
-    except Exception as e:
-        print(f"[Error] Failed to start camera: {e}")
-        for recorder in recorders:
-            recorder.close()
-        return
+        # Two phases, deliberately not combined: connect/boot every camera FIRST,
+        # then start streaming on all of them together, so a still-booting camera
+        # is never competing with already-streaming ones for USB bandwidth.
+        #
+        # A short stagger between connects is the main mitigation for
+        # X_LINK_DEVICE_NOT_FOUND ("Failed to find device after booting") with
+        # several cameras: each OAK draws a current spike while booting (up to
+        # 900mA on USB3, per Luxonis's own USB deployment guide), and connecting
+        # several back-to-back with no gap can brown out whichever one boots last
+        # -- a power-delivery issue, confirmed NOT a timing one (raising
+        # DEPTHAI_BOOTUP_TIMEOUT made no difference). connect_device_with_retry
+        # (used inside CameraRecorder.__init__) is the fallback for when a
+        # brownout happens anyway.
+        CONNECT_STAGGER_S = 1.5
+        try:
+            for cam_idx, device_info in enumerate(device_infos):
+                if cam_idx > 0:
+                    time.sleep(CONNECT_STAGGER_S)
+                print(f"Connecting cam{cam_idx} (ID: {device_info.deviceId})...")
+                recorders.append(CameraRecorder(
+                    cam_idx, device_info, timestamp, session_dir, preview_enabled, record_enabled
+                ))
+        except Exception as e:
+            # cam_idx/device_info still hold the values from the iteration that raised
+            # (for-loop variables aren't scoped to the loop body in Python) -- report
+            # which physical camera actually failed rather than just the error text.
+            print(f"[Error] Failed to connect cam{cam_idx} (ID: {device_info.deviceId}): {e}")
+            return
 
-    print(f"\n[Recording Setup]")
-    if record_enabled:
-        print(f"  Session folder: {session_dir}")
-    else:
-        print("  Recording: disabled")
-    print(f"  Configuration: 4K ({REC_W}x{REC_H}) MJPEG @ {FPS}fps")
-    print(f"  Shutter Time: {FORCED_SHUTTER_US} us | ISO: {FORCED_ISO}")
-    print(f"  Warmup: {'enabled' if warmup_enabled and record_enabled else 'disabled'}"
-          + (f" ({warmup_frames} frames)" if warmup_enabled and record_enabled else ""))
-    if align_raw:
-        print("  Alignment: raw MP4 only (no timestamp alignment)")
-    elif align_enabled:
-        align_mode = "host clock" if align_host_only else "unified device"
-        print(f"  Alignment: enabled ({align_mode}, threshold {align_threshold_ms:.1f}ms)")
-    else:
-        print("  Alignment: disabled")
-    if output_mp4 == "small":
-        if align_raw:
-            src = "raw MJPEG"
+        try:
+            for recorder in recorders:
+                print(f"Starting {recorder.cam_label} (ID: {recorder.device_id})...")
+                recorder.start_pipeline()
+        except Exception as e:
+            print(f"[Error] Failed to start {recorder.cam_label} (ID: {recorder.device_id}): {e}")
+            return
+
+        print(f"\n[Recording Setup]")
+        if record_enabled:
+            print(f"  Session folder: {session_dir}")
         else:
-            src = "aligned JPEGs" if align_enabled else "raw MJPEG"
-        cols, rows = preview_grid_layout(len(device_infos))
-        print(f"  MP4 export: small grid ({cols}x{rows} @ {PREVIEW_GRID_W}x{PREVIEW_GRID_H}) "
-              f"from {src}")
-    elif output_mp4 == "actual":
-        print(f"  MP4 export: enabled ({REC_W}x{REC_H}, full resolution per camera)")
-    else:
-        print("  MP4 export: disabled")
-    if record_enabled:
-        for recorder in recorders:
-            print(f"  {recorder.cam_label}: {recorder.video_path}")
-    if no_preview:
-        print("  Preview: disabled")
-        print("  Press Ctrl+C in the terminal to stop capture.\n")
-    else:
-        if len(recorders) > 1:
-            cols, rows = preview_grid_layout(len(recorders))
-            print(f"  Preview: {cols}x{rows} grid @ {PREVIEW_GRID_W}x{PREVIEW_GRID_H}")
-        print("  Press 'q' in the preview window to stop capture cleanly.\n")
+            print("  Recording: disabled")
+        print(f"  Configuration: 4K ({REC_W}x{REC_H}) MJPEG @ {FPS}fps")
+        print(f"  Shutter Time: {FORCED_SHUTTER_US} us | ISO: {FORCED_ISO}")
+        print(f"  Warmup: {'enabled' if warmup_enabled and record_enabled else 'disabled'}"
+              + (f" ({warmup_frames} frames)" if warmup_enabled and record_enabled else ""))
+        if align_raw:
+            print("  Alignment: raw MP4 only (no timestamp alignment)")
+        elif align_enabled:
+            align_mode = "host clock" if align_host_only else "unified device"
+            print(f"  Alignment: enabled ({align_mode}, threshold {align_threshold_ms:.1f}ms)")
+        else:
+            print("  Alignment: disabled")
+        if output_mp4 == "small":
+            if align_raw:
+                src = "raw MJPEG"
+            else:
+                src = "aligned JPEGs" if align_enabled else "raw MJPEG"
+            cols, rows = preview_grid_layout(len(device_infos))
+            print(f"  MP4 export: small grid ({cols}x{rows} @ {PREVIEW_GRID_W}x{PREVIEW_GRID_H}) "
+                  f"from {src}")
+        elif output_mp4 == "actual":
+            print(f"  MP4 export: enabled ({REC_W}x{REC_H}, full resolution per camera)")
+        else:
+            print("  MP4 export: disabled")
+        if record_enabled:
+            for recorder in recorders:
+                print(f"  {recorder.cam_label}: {recorder.video_path}")
+        if no_preview:
+            print("  Preview: disabled")
+            print("  Press Ctrl+C in the terminal to stop capture.\n")
+        else:
+            if len(recorders) > 1:
+                cols, rows = preview_grid_layout(len(recorders))
+                print(f"  Preview: {cols}x{rows} grid @ {PREVIEW_GRID_W}x{PREVIEW_GRID_H}")
+            print("  Press 'q' in the preview window to stop capture cleanly.\n")
 
-    if record_enabled:
-        if warmup_enabled:
-            run_warmup(recorders, warmup_frames, preview_enabled)
-        print("[Sync] Calibrating device-host offset from rec stream (post-warmup)...")
-        for recorder in recorders:
-            drain_other_recorders(recorders, recorder)
-            recorder.capture_sync_calibration(session_dir)
-        for recorder in recorders:
-            recorder.begin_recording()
-        print(f"[Recording started] {datetime.now().isoformat()}")
+        if record_enabled:
+            if warmup_enabled:
+                run_warmup(recorders, warmup_frames, preview_enabled)
+            print("[Sync] Calibrating device-host offset from rec stream (post-warmup)...")
+            for recorder in recorders:
+                drain_other_recorders(recorders, recorder)
+                recorder.capture_sync_calibration(session_dir)
+            for recorder in recorders:
+                recorder.begin_recording()
+            print(f"[Recording started] {datetime.now().isoformat()}")
 
-    fps_timestamp = time.monotonic()
+        fps_timestamp = time.monotonic()
 
-    try:
         while True:
             for recorder in recorders:
                 recorder.fetch_preview(preview_enabled)
@@ -544,10 +705,19 @@ def main(args=None):
         if preview_enabled:
             cv2.destroyAllWindows()
 
+        # Closed in parallel (see close_recorders_parallel) rather than one at a
+        # time in this loop -- a crashed device's close() can block for many
+        # seconds, and doing that sequentially for several cameras multiplies
+        # the wait. Safe to read writer.dropped/video_path/log_path right after:
+        # CameraRecorder.close() finalizes the log file and writer (fast) before
+        # it gets to the slow/crash-prone pipeline.stop()/device.close() calls,
+        # so those fields are already final even for a recorder whose close()
+        # thread is still stuck.
+        close_recorders_parallel(recorders)
+
         video_paths = []
         cam_labels = []
         for recorder in recorders:
-            recorder.close()
             if recorder.writer and recorder.writer.dropped > 0:
                 print(f"[Warning] {recorder.cam_label}: {recorder.writer.dropped} "
                       f"frames dropped (writer queue full).")
@@ -596,8 +766,9 @@ def main(args=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sign Language Capture")
-    parser.add_argument("-i", "--iso", type=int, default=200, help="ISO value")
-    parser.add_argument("-s", "--shutter", type=int, default=10000,
+    parser.add_argument("-i", "--iso", type=int, default=DEFAULT_CAMERA_SETTINGS["iso"],
+                        help="ISO value")
+    parser.add_argument("-s", "--shutter", type=int, default=DEFAULT_CAMERA_SETTINGS["shutter_us"],
                         help="Shutter speed in microseconds")
     parser.add_argument("-f", "--fps", type=int, default=30, help="Frames per second")
     parser.add_argument(
