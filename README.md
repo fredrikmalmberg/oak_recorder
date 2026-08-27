@@ -196,8 +196,8 @@ defaults on first run. Board spec, quality-gate thresholds, convergence
 criteria, etc. all live in that file.
 
 While running, type commands at the terminal: `save`, `reset <camN|all>`,
-`quit`. It also auto-stops once every camera has converged, or after
-`--duration` seconds if given.
+`uncache <camN|all>`, `quit`. It also auto-stops once every camera has
+converged, or after `--duration` seconds if given.
 
 **Opens a live viser viewer** at `http://localhost:<port>` (printed on
 startup): camera frustums (greyed out until a pose is solved), live detected
@@ -207,6 +207,18 @@ coverage %, converged yes/no), and a camera settings panel.
 **Output**: JSON written to `output/calibration/<timestamp>_<N>cam.json`
 (intrinsics + extrinsics + convergence report), written on `save`, `quit`,
 or auto-stop.
+
+**Intrinsics cache**: converged per-camera intrinsics (camera matrix +
+distortion coefficients) are also persisted to
+`output/calibration/intrinsics_cache.json`, keyed by each OAK device's
+stable hardware ID. On a later run, a camera whose device ID and resolution
+match a cache entry is loaded pre-converged and skips intrinsic sample
+collection entirely — only extrinsics (getting multiple cameras to see the
+board at once) need to be (re)established. Disable with
+`intrinsics_cache.enabled: false` in the config. A camera's cache entry
+survives `reset <camN>`/`reset all` by design; use `uncache <camN|all>` (or
+the "Uncache all intrinsics" viewer button) to force it back into live
+recalibration, e.g. after touching a lens's focus.
 
 > Recent fix: `calibrate.py`'s board-to-world "up" alignment was inverted —
 > solvePnP's local Z axis for a planar target points *into* the board, not

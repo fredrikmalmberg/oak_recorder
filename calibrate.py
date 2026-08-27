@@ -12,7 +12,8 @@ specified by the user and may need revisiting:
     graph (ties broken by total edge observation count).
   - Quality-gate threshold defaults (corner count, blur variance, coverage
     grid resolution, angle/pose diversity) are guesses tuned for a 6x4
-    40mm/30mm board at 4K; see `DEFAULT_CONFIG` below and calibrate_config.yaml.
+    65mm/49mm board (A3 print) at 4K; see `DEFAULT_CONFIG` below and
+    calibrate_config.yaml.
   - "Converged" = mean reprojection error under a threshold AND coverage grid
     sufficiently filled (see `intrinsics` config section).
   - Simultaneity tolerance for pairing free-running cameras' frames into an
@@ -54,15 +55,34 @@ import viser
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
+from camera_settings import DEFAULT_CAMERA_SETTINGS
+
 CONFIG_PATH_DEFAULT = "calibrate_config.yaml"
 
 DEFAULT_CONFIG = {
     "board": {
+        # 6x4 squares at 65mm/49mm -> 390x260mm, sized for an A3 print
+        # (297x420mm) with margin. See assets/charuco_board_6x4_65mm_A3.png.
         "squares_x": 6,
         "squares_y": 4,
-        "square_size_m": 0.040,
-        "marker_size_m": 0.030,
+        "square_size_m": 0.065,
+        "marker_size_m": 0.049,
         "aruco_dict": "DICT_4X4_50",
+    },
+    "alignment_board": {
+        # A separate board used only for the "set down direction" step -- same
+        # physical size as `board` (6x4 squares at 65mm/49mm, A3 print), but a
+        # different ArUco dictionary family (5x5 vs. `board`'s 4x4). Marker
+        # detection is dictionary-specific, so this board and the main one are
+        # mutually invisible to each other's detector even if both happen to
+        # be in frame at once -- same-family same-layout boards would collide
+        # on marker IDs and corrupt corner interpolation (see
+        # assets/charuco_alignment_board_6x4_65mm_A3.png).
+        "squares_x": 6,
+        "squares_y": 4,
+        "square_size_m": 0.065,
+        "marker_size_m": 0.049,
+        "aruco_dict": "DICT_5X5_50",
     },
     "camera": {
         "record_width": 3840,
@@ -71,9 +91,11 @@ DEFAULT_CONFIG = {
         "display_height": 270,
         "fps": 15,
         "mjpeg_quality": 90,
-        "shutter_us": 8000,
-        "iso": 400,
-        "wb_k": 4500,
+        # Exposure/white-balance default to camera_settings.py's shared values
+        # (same as capture.py) unless overridden here in calibrate_config.yaml.
+        "shutter_us": DEFAULT_CAMERA_SETTINGS["shutter_us"],
+        "iso": DEFAULT_CAMERA_SETTINGS["iso"],
+        "wb_k": DEFAULT_CAMERA_SETTINGS["wb_k"],
     },
     "quality_gates": {
         "min_corners": 8,
@@ -90,6 +112,15 @@ DEFAULT_CONFIG = {
         "min_samples_before_calibrate": 8,
         "recalibrate_every_n_samples": 3,
         "max_samples_per_camera": 150,
+    },
+    "intrinsics_cache": {
+        # Persists converged per-camera intrinsics across runs, keyed by each
+        # OAK device's stable hardware ID (see CalibCameraSession.device_id).
+        # A camera whose device ID and resolution match a cache entry skips
+        # intrinsic sample collection entirely on startup -- see
+        # make_calib_state / the "Intrinsics cache" section below.
+        "enabled": True,
+        "path": "output/calibration/intrinsics_cache.json",
     },
     "extrinsics": {
         "simultaneity_tolerance_ms": 80.0,
@@ -137,8 +168,8 @@ def load_config(path):
 # ==============================================================================
 # ChArUco board
 # ==============================================================================
-def build_board(cfg):
-    b = cfg["board"]
+def build_board(cfg, section="board"):
+    b = cfg[section]
     dict_id = getattr(cv2.aruco, b["aruco_dict"], None)
     if dict_id is None:
         options = [n for n in dir(cv2.aruco) if n.startswith("DICT_4X4_")]
@@ -198,13 +229,20 @@ def R_to_wxyz(R):
 
 # ==============================================================================
 # World alignment ("set down direction"): re-bases the whole scene so that a
-# board placed flat on the floor (camera looking down at it) defines gravity.
+# board placed flat on the floor (camera looking down at it) defines gravity --
+# AND so world (0,0,0) sits exactly at the board's own origin corner, with the
+# world X/Y axes pointing along the board's own edges (the A3 sheet's borders
+# are parallel to the ChArUco grid lines, so the board's local X/Y already
+# point along them -- no extra derivation needed for direction). The board's
+# object points are all Z=0 (it's a flat pattern), so its local XY-plane is
+# physically the floor itself -- aligning world to the board's full pose (not
+# just its rotation) therefore also puts the floor at world Z=0.
 #
 # viser's default up direction is +Z (like Blender/ROS/most robotics tooling --
 # not +Y as in some game engines/OpenGL-style conventions, which is a common
-# assumption to get wrong here). We align the board's own axes directly to the
-# world axes -- rather than calling viser's set_up_direction, which only affects
-# camera controls/lighting, not the actual geometry of already-placed
+# assumption to get wrong here). We align the board's own frame directly to the
+# world frame -- rather than calling viser's set_up_direction, which only
+# affects camera controls/lighting, not the actual geometry of already-placed
 # frustums/points.
 #
 # solvePnP's local Z axis for a planar target points *into* the board (the same
@@ -213,36 +251,41 @@ def R_to_wxyz(R):
 # _BOARD_UP_CORRECTION flips local Z (and Y, to keep a proper rotation, det=+1)
 # so the corrected local Z is the board's true upward normal before aligning it
 # to world +Z. (Verified empirically: without this flip, "down" came out
-# reversed.)
+# reversed.) This is a pure re-orientation of the board's own local axes about
+# its own origin, so it never moves where that origin actually is.
 # ==============================================================================
 _BOARD_UP_CORRECTION = np.diag([1.0, -1.0, -1.0])
 
 
 def compute_board_world_alignment(T_cam_to_world, R_board_to_cam, t_board_to_cam):
-    """Returns the corrected-up board rotation in the current (pre-alignment)
+    """Returns (R, t): the corrected-up board pose in the current (pre-alignment)
     world frame -- see apply_world_alignment for how this re-bases every stored
-    camera pose so that rotation becomes the identity (board's own axes == world
-    axes, with the board's true upward normal as +Z).
+    camera pose so that this pose becomes the identity (board's own origin/axes
+    == world origin/axes, with the board's true upward normal as +Z and the
+    floor -- the board's own physical plane -- at world Z=0).
     """
     T_board_to_world = T_cam_to_world @ rt_to_T(R_board_to_cam, t_board_to_cam)
-    R_board_to_world, _ = T_to_rt(T_board_to_world)
-    return R_board_to_world @ _BOARD_UP_CORRECTION
+    R_board_to_world, t_board_to_world = T_to_rt(T_board_to_world)
+    return R_board_to_world @ _BOARD_UP_CORRECTION, t_board_to_world
 
 
-def apply_world_alignment(pose_result, alignment_R):
+def apply_world_alignment(pose_result, alignment_R, alignment_t):
     """Mutates pose_result["poses"] in place. Call every tick on the fresh,
-    unaligned PoseGraph.solve() output -- alignment_R (the board's world rotation
-    at the moment the user confirmed it was flat, from compute_board_world_alignment)
-    is a fixed value from here on, not something the pose graph itself knows about.
+    unaligned PoseGraph.solve() output -- alignment_R/alignment_t (the board's
+    up-corrected world pose at the moment the user confirmed it was flat, from
+    compute_board_world_alignment) are fixed values from here on, not something
+    the pose graph itself knows about.
 
     Derivation: post-multiplying each stored world-to-camera transform T_wc by
-    [alignment_R | 0] is equivalent to rotating the world frame itself by
-    alignment_R^-1 -- i.e. exactly cancels the board's own rotation, making the
-    board's local axes equal the (new) world axes.
+    [alignment_R | alignment_t] is equivalent to re-basing the world frame
+    itself onto the board's own frame -- i.e. exactly cancels the board's own
+    pose, making the board's local origin/axes equal the (new) world
+    origin/axes (so the floor is world Z=0, and world (0,0,0) is the board's
+    own origin corner).
     """
     if pose_result is None or alignment_R is None:
         return
-    T_realign = rt_to_T(alignment_R, np.zeros(3))
+    T_realign = rt_to_T(alignment_R, alignment_t)
     for cam_id in pose_result["poses"]:
         pose_result["poses"][cam_id] = pose_result["poses"][cam_id] @ T_realign
 
@@ -294,8 +337,10 @@ class CameraCalibState:
         self.samples_since_calib = 0
         self.last_detection_ts = None
         self.last_edge_pose = None  # (ts, R, t, err) from the most recent PnP solve, for extrinsic edges
+        self.last_alignment_pose = None  # (ts, R, t) from the most recent alignment-board PnP solve
         self.connected = True
         self.last_warned_no_detection = False
+        self.intrinsics_locked = False  # True only when seeded from the intrinsics cache
 
     def sample_count(self):
         return len(self.object_points)
@@ -355,21 +400,24 @@ def process_detection(state, corners2d, ids, board_points_3d, gray, cfg):
     R, t, err = pose
 
     accepted = False
-    if len(state.coverage.cells_touched(corners2d)) >= qg["min_coverage_cells_per_frame"]:
-        if passes_novelty_gate(state, R, t, cfg):
-            ic = cfg["intrinsics"]
-            if state.sample_count() < ic["max_samples_per_camera"]:
-                state.object_points.append(obj.astype(np.float32))
-                state.image_points.append(corners2d.astype(np.float32))
-                state.accepted_poses.append((R, t))
-                state.coverage.mark(corners2d)
-                state.samples_since_calib += 1
-                accepted = True
+    if not state.intrinsics_locked:
+        if len(state.coverage.cells_touched(corners2d)) >= qg["min_coverage_cells_per_frame"]:
+            if passes_novelty_gate(state, R, t, cfg):
+                ic = cfg["intrinsics"]
+                if state.sample_count() < ic["max_samples_per_camera"]:
+                    state.object_points.append(obj.astype(np.float32))
+                    state.image_points.append(corners2d.astype(np.float32))
+                    state.accepted_poses.append((R, t))
+                    state.coverage.mark(corners2d)
+                    state.samples_since_calib += 1
+                    accepted = True
 
     return (R, t, err), accepted
 
 
 def maybe_recalibrate(state, cfg):
+    if state.intrinsics_locked:
+        return
     ic = cfg["intrinsics"]
     if state.sample_count() < ic["min_samples_before_calibrate"]:
         return
@@ -393,6 +441,104 @@ def maybe_recalibrate(state, cfg):
         state.reproj_error <= ic["reproj_error_threshold_px"]
         and state.coverage.ratio() >= ic["coverage_ratio_threshold"]
     )
+
+
+# ==============================================================================
+# Intrinsics cache: persists per-physical-camera K/dist across runs, keyed by
+# depthai's stable device_id (NOT the run-local cam0/cam1/... index, which is
+# not stable across process restarts -- see CalibCameraSession.device_id and
+# hand_capture_live.py's match_open_sessions_by_device_id for the existing
+# precedent of keying on device_id for exactly this reason).
+# ==============================================================================
+def _atomic_write_json(path, payload):
+    """No atomic-write helper exists elsewhere in this repo (load_config/
+    save_output both do a plain open()+dump()) -- introduced here because,
+    unlike those call sites (written once per invocation), this cache file is
+    read-modify-written repeatedly over a single long-running session, so a
+    crash mid-write is more likely to land on a corrupt file.
+    """
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def load_intrinsics_cache(cfg):
+    path = cfg["intrinsics_cache"]["path"]
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[Cache] Failed to read {path} ({exc}) -- starting with an empty cache.")
+        return {}
+
+
+def build_cache_entry(state):
+    """On-disk key names deliberately mirror build_output's per-camera
+    intrinsics keys (camera_matrix/dist_coeffs/image_width/image_height) for
+    consistency, plus cache-specific bookkeeping fields.
+    """
+    return {
+        "camera_matrix": state.K.tolist(),
+        "dist_coeffs": np.asarray(state.dist).ravel().tolist(),
+        "image_width": state.image_size[0],
+        "image_height": state.image_size[1],
+        "reprojection_error_px": state.reproj_error,
+        "coverage_ratio": state.coverage.ratio(),
+        "num_samples": state.sample_count(),
+        "calibrated_at": datetime.now().isoformat(),
+    }
+
+
+def upsert_intrinsics_cache(cfg, device_id, state, intrinsics_cache):
+    """Mutates intrinsics_cache in place (the in-memory dict main() carries for
+    the whole run) and rewrites the on-disk file. Called once, right after
+    maybe_recalibrate(), on the tick a camera's `converged` flips False -> True.
+    """
+    intrinsics_cache[device_id] = build_cache_entry(state)
+    path = cfg["intrinsics_cache"]["path"]
+    _atomic_write_json(path, intrinsics_cache)
+    print(f"[Cache] {state.cam_id}: intrinsics converged -- cached for device "
+          f"{device_id} (reproj={state.reproj_error:.3f}px).")
+
+
+def make_calib_state(cam_id, image_size, cfg, device_id, intrinsics_cache):
+    """Builds a fresh CameraCalibState and, if intrinsics_cache has a
+    resolution-matched entry for device_id, seeds it as already
+    intrinsics-converged (K/dist/reproj_error from the cache,
+    intrinsics_locked=True) so process_detection/maybe_recalibrate skip
+    intrinsic sample collection for this camera going forward. Used both at
+    camera-startup and by the 'reset' command handler, so a reset camera is
+    never left without its cached intrinsics.
+    """
+    state = CameraCalibState(cam_id, image_size, cfg)
+    if not cfg["intrinsics_cache"]["enabled"]:
+        return state
+    entry = intrinsics_cache.get(device_id)
+    if entry is None:
+        return state
+    if entry["image_width"] != image_size[0] or entry["image_height"] != image_size[1]:
+        print(f"[Cache] {cam_id}: cached intrinsics are for "
+              f"{entry['image_width']}x{entry['image_height']}, this run is "
+              f"{image_size[0]}x{image_size[1]} -- ignoring cache entry, "
+              f"calibrating fresh.")
+        return state
+    state.K = np.array(entry["camera_matrix"], dtype=np.float64)
+    state.dist = np.array(entry["dist_coeffs"], dtype=np.float64)
+    state.reproj_error = entry["reprojection_error_px"]
+    state.has_intrinsics_estimate = True
+    state.converged = True
+    state.intrinsics_locked = True
+    print(f"[Cache] {cam_id}: loaded cached intrinsics for device {device_id} "
+          f"(reproj={entry['reprojection_error_px']:.3f}px, saved "
+          f"{entry.get('calibrated_at', '?')}) -- intrinsics locked; this "
+          f"camera only needs extrinsics now.")
+    return state
 
 
 # ==============================================================================
@@ -666,12 +812,20 @@ class ViserManager:
         # viser has no plain background-color setter; a solid-color background image
         # is the documented way to get one.
         self.server.scene.set_background_image(np.zeros((2, 2, 3), dtype=np.uint8))
+        # Shadows are supported out of the box (frustums/board meshes already
+        # cast_shadow=True by default) -- just make sure the default light casts
+        # them too. viser has no mirror/reflection scene node, so that part of
+        # the ask isn't available.
+        self.server.scene.configure_default_lights(cast_shadow=True)
         self.cam_images = {}
         self.cam_status_md = {}
         self.frustums = {}
         self.board_frames = {}
         self.board_meshes = {}
+        self.alignment_board_frames = {}
+        self.alignment_board_meshes = {}
         self.unknown_labels = {}
+        self.floor_grid = None
 
     def add_camera_settings_panel(self):
         """Static (non-updating) readout of this run's fixed camera settings."""
@@ -684,6 +838,27 @@ class ViserManager:
                 f"**resolution**: {cam_cfg['record_width']}x{cam_cfg['record_height']}"
             )
 
+    def add_view_controls(self):
+        """Adjusts the 3D viewer's own perspective FOV -- NOT the visualized OAK
+        camera frustums, which are derived from real calibrated intrinsics
+        (see update_camera_pose) and must stay untouched. Applies to every
+        currently-connected client, and to any client that connects later.
+        """
+        with self.server.gui.add_folder("View"):
+            fov_slider = self.server.gui.add_slider(
+                "Viewer FOV (deg)", min=20, max=120, step=1, initial_value=50,
+            )
+
+            def _apply_fov(fov_deg):
+                fov_rad = math.radians(fov_deg)
+                for client in self.server.get_clients().values():
+                    client.camera.fov = fov_rad
+
+            fov_slider.on_update(lambda _: _apply_fov(fov_slider.value))
+            self.server.on_client_connect(
+                lambda client: setattr(client.camera, "fov", math.radians(fov_slider.value))
+            )
+
     def add_world_alignment_button(self, on_click):
         """`on_click` is called with no arguments the instant the button is pressed;
         it should just flag a request (the actual capture happens on the next tick
@@ -691,12 +866,37 @@ class ViserManager:
         """
         with self.server.gui.add_folder("World Alignment"):
             self.server.gui.add_markdown(
-                "Place the board flat on the floor where a camera can see it, then "
-                "click below. The world's up/down and horizontal axes will be set "
-                "from the board's orientation."
+                "Click below, then place the **alignment board** (same A3 size as the "
+                "calibration board but a different marker dictionary -- see "
+                "assets/charuco_alignment_board_6x4_65mm_A3.png) flat on the floor "
+                "where any one already-posed camera can see it. As soon as one camera "
+                "detects it, the world origin moves to the board's corner, +Z is set "
+                "to point up away from the floor, and the X/Y axes align with the "
+                "board's own edges -- only one camera needs to see it."
             )
             button = self.server.gui.add_button("Set down direction from board")
             button.on_click(lambda _: on_click())
+
+            # Standard viser ground-plane grid (xy plane, since this scene's up
+            # axis is +Z per the world-alignment convention -- see
+            # compute_board_world_alignment) as a visual check that the
+            # board-derived down direction actually looks horizontal. Off by
+            # default since it's only meaningful once alignment has been set.
+            # A visible light-gray plane_opacity (not just shadow_opacity) is
+            # needed for the floor to actually read as a floor -- viser's
+            # cast_shadow/receive_shadow default to True on frustums/meshes/
+            # the grid itself, so shadows should appear once lit. NOTE: viser's
+            # default-light shadow camera has a hardcoded ~20-unit far plane
+            # from the *viewer's own camera position* (not exposed via any
+            # Python API), so shadows silently stop rendering if the viewport
+            # is zoomed out further than that -- width/height below are sized
+            # to roughly match that range rather than picked arbitrarily large.
+            self.floor_grid = self.server.scene.add_grid(
+                "/floor_grid", width=20.0, height=20.0, cell_size=0.5, plane="xy", visible=False,
+                plane_color=(220, 220, 220), plane_opacity=0.6, shadow_opacity=0.4,
+            )
+            grid_checkbox = self.server.gui.add_checkbox("Show floor grid", initial_value=False)
+            grid_checkbox.on_update(lambda _: setattr(self.floor_grid, "visible", grid_checkbox.value))
         return button
 
     def add_global_controls(self, cmd_queue):
@@ -710,6 +910,8 @@ class ViserManager:
             save_button.on_click(lambda _: cmd_queue.put("save"))
             reset_button = self.server.gui.add_button("Reset all")
             reset_button.on_click(lambda _: cmd_queue.put("reset all"))
+            uncache_button = self.server.gui.add_button("Uncache all intrinsics")
+            uncache_button.on_click(lambda _: cmd_queue.put("uncache all"))
 
     def _ensure_camera_panel(self, cam_id):
         if cam_id in self.cam_images:
@@ -771,45 +973,80 @@ class ViserManager:
             f"/cameras_unknown/{cam_id}", f"{cam_id}: pose unknown", position=(0.0, 0.0, 0.0),
         )
 
-    def _board_footprint(self):
-        b = self.cfg["board"]
+    def remove_camera_pose(self, cam_id):
+        """Undoes update_camera_pose -- drops the frustum entirely (rather than just
+        leaving it at its last position) so mark_pose_unknown will show the "pose
+        unknown" placeholder again on the next tick. Needed for reset, since
+        update_camera_pose's frustum-reuse logic otherwise treats a camera as
+        permanently posed once it has been posed once.
+        """
+        handle = self.frustums.pop(cam_id, None)
+        if handle is not None:
+            handle.remove()
+
+    def _board_footprint(self, section="board"):
+        b = self.cfg[section]
         w = b["squares_x"] * b["square_size_m"]
         h = b["squares_y"] * b["square_size_m"]
         vertices = np.array([[0, 0, 0], [w, 0, 0], [w, h, 0], [0, h, 0]], dtype=np.float32)
         faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
         return vertices, faces
 
-    def update_board_pose(self, cam_id, T_board_to_world):
-        """Shows the board's actual physical footprint (not just an axis triad) at
-        the pose most recently observed by `cam_id`, so the operator can see where
-        the board is right now rather than just an abstract coordinate frame.
+    def _update_board_visual(self, frames, meshes, scene_prefix, section, color, cam_id, T_board_to_world):
+        """Shared by update_board_pose/update_alignment_board_pose: shows a board's
+        actual physical footprint (not just an axis triad) at the pose most
+        recently observed by `cam_id`, so the operator can see where the board is
+        right now rather than just an abstract coordinate frame.
         """
         wxyz = R_to_wxyz(T_board_to_world[:3, :3])
         position = T_board_to_world[:3, 3]
-        if cam_id in self.board_frames:
-            handle = self.board_frames[cam_id]
+        if cam_id in frames:
+            handle = frames[cam_id]
             handle.wxyz, handle.position, handle.visible = wxyz, position, True
-            mesh = self.board_meshes[cam_id]
+            mesh = meshes[cam_id]
             mesh.wxyz, mesh.position, mesh.visible = wxyz, position, True
         else:
-            self.board_frames[cam_id] = self.server.scene.add_frame(
-                f"/board/{cam_id}/axis", axes_length=0.08, axes_radius=0.004,
+            frames[cam_id] = self.server.scene.add_frame(
+                f"{scene_prefix}/{cam_id}/axis", axes_length=0.08, axes_radius=0.004,
                 wxyz=wxyz, position=position,
             )
-            vertices, faces = self._board_footprint()
-            self.board_meshes[cam_id] = self.server.scene.add_mesh_simple(
-                f"/board/{cam_id}/footprint", vertices, faces,
-                color=(230, 210, 60), opacity=0.35, side="double",
+            vertices, faces = self._board_footprint(section)
+            meshes[cam_id] = self.server.scene.add_mesh_simple(
+                f"{scene_prefix}/{cam_id}/footprint", vertices, faces,
+                color=color, opacity=0.35, side="double",
                 wxyz=wxyz, position=position,
             )
 
-    def hide_board_pose(self, cam_id):
-        handle = self.board_frames.get(cam_id)
+    def _hide_board_visual(self, frames, meshes, cam_id):
+        handle = frames.get(cam_id)
         if handle is not None:
             handle.visible = False
-        mesh = self.board_meshes.get(cam_id)
+        mesh = meshes.get(cam_id)
         if mesh is not None:
             mesh.visible = False
+
+    def update_board_pose(self, cam_id, T_board_to_world):
+        self._update_board_visual(
+            self.board_frames, self.board_meshes, "/board", "board", (230, 210, 60),
+            cam_id, T_board_to_world,
+        )
+
+    def hide_board_pose(self, cam_id):
+        self._hide_board_visual(self.board_frames, self.board_meshes, cam_id)
+
+    def update_alignment_board_pose(self, cam_id, T_board_to_world):
+        """Shows the alignment (floor) board's footprint as a green plane while
+        a 'set down direction' scan is in progress -- green reads as "this is
+        the floor", and separates it visually from the main calibration
+        board's yellow footprint.
+        """
+        self._update_board_visual(
+            self.alignment_board_frames, self.alignment_board_meshes, "/alignment_board",
+            "alignment_board", (60, 200, 90), cam_id, T_board_to_world,
+        )
+
+    def hide_alignment_board_pose(self, cam_id):
+        self._hide_board_visual(self.alignment_board_frames, self.alignment_board_meshes, cam_id)
 
 
 # ==============================================================================
@@ -837,6 +1074,7 @@ def build_output(cam_ids, calib_states, pose_result, cfg, device_ids=None):
                 "coverage_ratio": state.coverage.ratio(),
                 "num_samples": state.sample_count(),
                 "converged": state.converged,
+                "source": "cache" if state.intrinsics_locked else "live",
             },
             "extrinsics": None,
         }
@@ -960,6 +1198,7 @@ def main():
 
     cfg = load_config(args.config)
     _board, detector, board_points_3d = build_board(cfg)
+    _alignment_board, alignment_detector, alignment_board_points_3d = build_board(cfg, "alignment_board")
 
     device_infos = dai.Device.getAllAvailableDevices()
     if not device_infos:
@@ -967,14 +1206,21 @@ def main():
         return
     print(f"Found {len(device_infos)} OAK device(s).")
 
+    seen_ids = [info.deviceId for info in device_infos]
+    if len(set(seen_ids)) != len(seen_ids):
+        print(f"[Warning] Duplicate device_id(s) among discovered cameras: {seen_ids} -- "
+              f"intrinsics caching and reconnect-matching both key on device_id and will "
+              f"misbehave if it is not unique per physical camera.")
+
     cam_ids = [f"cam{i}" for i in range(len(device_infos))]
     sessions, calib_states = {}, {}
     image_size = (cfg["camera"]["record_width"], cfg["camera"]["record_height"])
+    intrinsics_cache = load_intrinsics_cache(cfg) if cfg["intrinsics_cache"]["enabled"] else {}
     try:
         for cam_id, info in zip(cam_ids, device_infos):
             print(f"Starting {cam_id} ({info.deviceId})...")
             sessions[cam_id] = CalibCameraSession(cam_id, info, cfg)
-            calib_states[cam_id] = CameraCalibState(cam_id, image_size, cfg)
+            calib_states[cam_id] = make_calib_state(cam_id, image_size, cfg, info.deviceId, intrinsics_cache)
     except Exception as exc:
         print(f"[Error] Failed to start cameras: {exc}")
         for session in sessions.values():
@@ -988,6 +1234,7 @@ def main():
     pose_graph = PoseGraph(cfg)
     viser_mgr = ViserManager(cfg)
     viser_mgr.add_camera_settings_panel()
+    viser_mgr.add_view_controls()
     print(f"[Viser] http://localhost:{viser_mgr.server.get_port()}")
     print("Type 'save' to write results now, 'reset <camN|all>' to clear samples, 'quit' to stop.\n")
 
@@ -996,11 +1243,12 @@ def main():
     threading.Thread(target=read_stdin_commands, args=(cmd_queue, stop_event), daemon=True).start()
     viser_mgr.add_global_controls(cmd_queue)
 
-    world_align = {"pending": False, "R": None}
+    world_align = {"pending": False, "R": None, "t": None}
 
     def request_world_alignment():
         world_align["pending"] = True
-        print("[Align] Waiting for a fresh board detection to set the world's down direction...")
+        print("[Align] Waiting for a fresh detection of the alignment board "
+              "(any one camera) to set the world's origin and down direction...")
 
     viser_mgr.add_world_alignment_button(request_world_alignment)
 
@@ -1010,6 +1258,30 @@ def main():
     last_reconnect_attempt = {cam_id: 0.0 for cam_id in cam_ids}
     start_time = time.monotonic()
     pose_result = None
+
+    def clear_extrinsics_for(target):
+        """Shared by the 'reset' and 'uncache' command handlers: drops pose-graph
+        edges and viser frustums for `target` (a cam_id, or "all") so stale
+        extrinsics don't linger against a now-fresh intrinsic state.
+        """
+        nonlocal pose_graph, pose_result
+        if target == "all":
+            pose_graph = PoseGraph(cfg)
+            pose_result = None
+            world_align["pending"] = False
+            world_align["R"] = None
+            world_align["t"] = None
+            for cam_id in cam_ids:
+                viser_mgr.remove_camera_pose(cam_id)
+            viser_mgr.hide_alignment_board_pose("origin")
+            print("[Reset] Pose graph and world alignment cleared.")
+        elif target in calib_states:
+            stale = [key for key in pose_graph.observations if target in key]
+            for key in stale:
+                del pose_graph.observations[key]
+            viser_mgr.remove_camera_pose(target)
+            if stale:
+                print(f"[Reset] {target}: {len(stale)} pose-graph edge(s) cleared.")
 
     try:
         while True:
@@ -1029,8 +1301,38 @@ def main():
                     target = parts[1] if len(parts) > 1 else "all"
                     for cam_id in (cam_ids if target == "all" else [target]):
                         if cam_id in calib_states:
-                            calib_states[cam_id] = CameraCalibState(cam_id, image_size, cfg)
+                            # Re-seeds from the intrinsics cache if a matching entry exists
+                            # (see make_calib_state) -- reset only clears samples/coverage/
+                            # extrinsics, not cached intrinsics; use 'uncache' for that.
+                            calib_states[cam_id] = make_calib_state(
+                                cam_id, image_size, cfg, sessions[cam_id].device_id, intrinsics_cache,
+                            )
                             print(f"[Reset] {cam_id} calibration state cleared.")
+                    # Per-camera intrinsic state alone doesn't drive extrinsics -- the pose
+                    # graph accumulates edge observations independently and keeps solving
+                    # from them regardless, so without this, camera frustums/board poses in
+                    # the viewer would survive a reset untouched.
+                    clear_extrinsics_for(target)
+                elif cmd.startswith("uncache"):
+                    parts = cmd.split()
+                    target = parts[1] if len(parts) > 1 else "all"
+                    targets = cam_ids if target == "all" else [target]
+                    evicted = False
+                    for cam_id in targets:
+                        if cam_id not in sessions:
+                            continue
+                        device_id = sessions[cam_id].device_id
+                        if intrinsics_cache.pop(device_id, None) is not None:
+                            evicted = True
+                            print(f"[Cache] {cam_id}: evicted cache entry for device {device_id}.")
+                        if cam_id in calib_states:
+                            # Plain constructor (not make_calib_state) -- the whole point is to
+                            # NOT immediately reload what was just evicted.
+                            calib_states[cam_id] = CameraCalibState(cam_id, image_size, cfg)
+                            print(f"[Reset] {cam_id} calibration state cleared (intrinsics uncached).")
+                    if evicted and cfg["intrinsics_cache"]["enabled"]:
+                        _atomic_write_json(cfg["intrinsics_cache"]["path"], intrinsics_cache)
+                    clear_extrinsics_for(target)
                 else:
                     print(f"[Command] Unrecognized: {cmd!r}")
 
@@ -1064,7 +1366,13 @@ def main():
                     continue
 
                 if session.last_frame_preview is not None:
-                    viser_mgr.update_thumbnail(cam_id, session.last_frame_preview, state.coverage)
+                    if state.intrinsics_locked:
+                        # No live coverage grid to show for a cache-loaded camera -- the
+                        # default all-red overlay would misleadingly read as "bad coverage"
+                        # despite the camera already being intrinsics-converged.
+                        viser_mgr.update_thumbnail_raw(cam_id, session.last_frame_preview)
+                    else:
+                        viser_mgr.update_thumbnail(cam_id, session.last_frame_preview, state.coverage)
 
                 if got_frame and session.last_frame_full is not None:
                     fresh_frames[cam_id] = (session.last_frame_full, session.last_frame_full_ts)
@@ -1074,6 +1382,37 @@ def main():
             for cam_id, (frame, frame_ts) in fresh_frames.items():
                 state = calib_states[cam_id]
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                # While a "set down direction" request is pending, independently scan
+                # every frame for the alignment board too (regardless of whether the
+                # main board was seen this tick) -- a different marker dictionary from
+                # the main board, detected with its own detector/object points but
+                # reusing this camera's already-estimated intrinsics for the PnP solve.
+                if world_align["pending"]:
+                    align_detection = detect_charuco(alignment_detector, gray)
+                    align_pose = None
+                    if align_detection is not None:
+                        a_corners2d, a_ids = align_detection
+                        if len(a_ids) >= cfg["quality_gates"]["min_corners"]:
+                            align_pose = solve_board_pose(
+                                alignment_board_points_3d[a_ids], a_corners2d, state.K, state.dist,
+                            )
+                    if align_pose is not None:
+                        a_R, a_t, _a_err = align_pose
+                        state.last_alignment_pose = (frame_ts, a_R, a_t)
+                        # Show it live, same way the main board's live pose is shown below --
+                        # needs this camera's own extrinsics (from a prior tick's pose graph
+                        # solve) to place the board footprint in world coordinates.
+                        if pose_result is not None and cam_id in pose_result["poses"]:
+                            T_cam_to_world = invert_T(pose_result["poses"][cam_id])
+                            viser_mgr.update_alignment_board_pose(cam_id, T_cam_to_world @ rt_to_T(a_R, a_t))
+                        else:
+                            viser_mgr.hide_alignment_board_pose(cam_id)
+                    else:
+                        # No alignment-board detection this tick -- hide it rather than
+                        # leaving this camera's last-ever sighting stuck on screen forever.
+                        viser_mgr.hide_alignment_board_pose(cam_id)
+
                 detection = detect_charuco(detector, gray)
                 if detection is None:
                     # No board seen this tick -- hide it rather than leaving this
@@ -1084,7 +1423,10 @@ def main():
 
                 pose, accepted = process_detection(state, corners2d, ids, board_points_3d, gray, cfg)
                 if accepted:
+                    was_converged = state.converged
                     maybe_recalibrate(state, cfg)
+                    if cfg["intrinsics_cache"]["enabled"] and state.converged and not was_converged:
+                        upsert_intrinsics_cache(cfg, sessions[cam_id].device_id, state, intrinsics_cache)
                 if pose is None:
                     viser_mgr.hide_board_pose(cam_id)
                     continue
@@ -1120,21 +1462,38 @@ def main():
 
                 if world_align["pending"]:
                     # Retried every tick (not just the tick of the click) until some
-                    # camera actually has a fresh, posed board detection to align to.
+                    # already-posed camera actually has a fresh alignment-board detection
+                    # to align to -- only one camera needs to see the (small) board.
                     now_wall = time.time()
                     for cam_id in cam_ids:
-                        edge = calib_states[cam_id].last_edge_pose
-                        if edge is None or cam_id not in pose_result["poses"]:
+                        align_pose = calib_states[cam_id].last_alignment_pose
+                        if align_pose is None or cam_id not in pose_result["poses"]:
                             continue
-                        edge_ts, R_bc, t_bc, _err = edge
-                        if now_wall - edge_ts > 2.0:
+                        pose_ts, R_bc, t_bc = align_pose
+                        if now_wall - pose_ts > 2.0:
                             continue
                         T_cam_to_world = invert_T(pose_result["poses"][cam_id])
-                        world_align["R"] = compute_board_world_alignment(T_cam_to_world, R_bc, t_bc)
+                        world_align["R"], world_align["t"] = compute_board_world_alignment(
+                            T_cam_to_world, R_bc, t_bc,
+                        )
                         world_align["pending"] = False
-                        print(f"[Align] World down direction set from {cam_id}'s board detection.")
+                        # Scanning has stopped -- clear the live per-camera alignment-board
+                        # visuals rather than leaving them frozen in the scene, and replace
+                        # them with one permanent marker at world origin: since the new world
+                        # frame IS the board's own up-corrected frame by construction, the
+                        # board's footprint re-expressed in it is always exactly this constant
+                        # transform (verified numerically), regardless of which camera/tick
+                        # triggered alignment -- no need to keep detecting it live to show
+                        # where the floor board was.
+                        for c in cam_ids:
+                            viser_mgr.hide_alignment_board_pose(c)
+                        viser_mgr.update_alignment_board_pose(
+                            "origin", rt_to_T(_BOARD_UP_CORRECTION, np.zeros(3)),
+                        )
+                        print(f"[Align] World origin/down direction set from {cam_id}'s "
+                              f"alignment-board detection.")
                         break
-                apply_world_alignment(pose_result, world_align["R"])
+                apply_world_alignment(pose_result, world_align["R"], world_align["t"])
 
                 for cam_id in cam_ids:
                     state = calib_states[cam_id]
@@ -1147,6 +1506,9 @@ def main():
             for cam_id in cam_ids:
                 state = calib_states[cam_id]
                 extra = []
+                if state.intrinsics_locked:
+                    extra.append(f"_intrinsics: loaded from cache "
+                                 f"({state.reproj_error:.3f}px at save time)_")
                 if state.last_detection_ts is not None:
                     silent_for = time.time() - state.last_detection_ts
                     if silent_for > runtime_cfg["no_detection_warning_s"]:
