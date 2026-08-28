@@ -91,6 +91,34 @@ def summarize(events):
     return by_device, hard_failures, by_bus
 
 
+def rank_boot_order(device_infos, log_path=DEFAULT_LOG_PATH):
+    """Orders device_infos (dai.DeviceInfo objects, e.g. from
+    dai.Device.getAllAvailableDevices()) so cameras with a worse track record
+    connect FIRST -- historical data showed failures cluster overwhelmingly at
+    the LAST boot position (whichever camera boots last competes against
+    every already-connected camera for USB power), so a camera with a bad
+    track record should never land there. Sorted by that device's own past
+    failure count (primary key), falling back to its current USB bus's past
+    failure count as a tiebreaker (a device can move ports between sessions,
+    so this is a weaker secondary signal, not the primary one); devices with
+    no history at all sort last, since they haven't shown a problem. No
+    randomness -- this is a fully deterministic ordering.
+
+    Safe with no log file yet (fresh install): everything scores 0 and the
+    original enumeration order is preserved (Python's sort is stable).
+    """
+    events = load_events(log_path)
+    by_device, _hard_failures, by_bus = summarize(events)
+
+    def badness(info):
+        device_failures = by_device.get(info.deviceId, {}).get("failures", 0)
+        bus = usb_bus(info.name) if getattr(info, "name", None) else None
+        bus_failures = by_bus.get(bus, {}).get("failures", 0) if bus else 0
+        return (device_failures, bus_failures)
+
+    return sorted(device_infos, key=badness, reverse=True)
+
+
 def build_position_grid(events, key_fn):
     """counts[key][boot_position] = {"success": n, "fail": n} -- how many
     attempts each row-key (a camera, or a USB bus -- see key_fn) has had at

@@ -548,7 +548,14 @@ def make_calib_state(cam_id, image_size, cfg, device_id, intrinsics_cache):
 # directly, since capture.py's pipeline builder reads its settings from
 # module-level constants instead of a config dict.
 # ==============================================================================
-def build_calibration_pipeline(device, cfg):
+def build_calibration_pipeline(device, cfg, with_control=False):
+    """with_control=True additionally wires cam.inputControl to a queue and
+    returns it as a 4th value, letting a caller send live dai.CameraControl
+    messages (e.g. setManualExposure) after pipeline.start() -- initialControl
+    above only sets the STARTING exposure/WB, not runtime changes. Default
+    False keeps the return a 3-tuple, unchanged for existing callers (e.g.
+    CalibCameraSession below, which has no use for runtime control).
+    """
     cam_cfg = cfg["camera"]
     pipeline = dai.Pipeline(device)
 
@@ -569,6 +576,9 @@ def build_calibration_pipeline(device, cfg):
         (cam_cfg["display_width"], cam_cfg["display_height"]),
         type=dai.ImgFrame.Type.BGR888p, fps=cam_cfg["fps"],
     )
+    if with_control:
+        control_queue = cam.inputControl.createInputQueue()
+        return pipeline, video_enc.out, out_preview, control_queue
     return pipeline, video_enc.out, out_preview
 
 
@@ -655,6 +665,15 @@ class PoseGraph:
         R_edge, t_edge = T_to_rt(T_edge)
         err = 0.5 * (err_a + err_b)
         self.observations.setdefault(key, []).append({"R": R_edge, "t": t_edge, "err": err})
+
+    def sample_count_for(self, cam_id):
+        """Total extrinsics (pairwise) observations this camera has
+        contributed to, across every edge it's part of -- distinct from
+        CameraCalibState.sample_count(), which counts intrinsics samples
+        (single-camera board detections, not simultaneous cross-camera
+        pairs).
+        """
+        return sum(len(obs) for key, obs in self.observations.items() if cam_id in key)
 
     def aggregate_edges(self):
         min_obs = self.cfg["extrinsics"]["min_edge_observations"]
@@ -838,6 +857,31 @@ class ViserManager:
                 f"**resolution**: {cam_cfg['record_width']}x{cam_cfg['record_height']}"
             )
 
+    def add_performance_panel(self):
+        """Live host-CPU readout so the operator can see the system getting
+        bogged down (e.g. during capture with several cameras encoding/
+        writing at once) before it costs dropped frames. Updated from the
+        main loop via update_performance -- see its own docstring for why
+        psutil.cpu_percent must only ever be sampled from that one call site.
+        """
+        with self.server.gui.add_folder("Performance"):
+            self.perf_md = self.server.gui.add_markdown("_CPU: --_")
+
+    def update_performance(self, cpu_pcts, postprocess_queue_depth=None):
+        """cpu_pcts: per-core percentages (psutil.cpu_percent(percpu=True)),
+        NOT the system-wide average -- averaging across cores hides exactly
+        the failure mode worth watching for: a single-threaded bottleneck
+        (an ffmpeg encode, GIL-bound Python work) pegging one core at 100%
+        while the rest sit idle averages out to a modest, unremarkable
+        number on a multi-core box. Shows the two busiest cores instead, by
+        (index, value) so two cores tied at the same percentage still show
+        as two distinct cores rather than the same one twice.
+        """
+        top2 = sorted(enumerate(cpu_pcts), key=lambda pair: pair[1], reverse=True)[:2]
+        top_str = ", ".join(f"core {i}: {p:.0f}%" for i, p in top2) if top2 else "--"
+        extra = f" | postprocess queue: {postprocess_queue_depth}" if postprocess_queue_depth else ""
+        self.perf_md.content = f"**CPU (busiest cores)**: {top_str}{extra}"
+
     def add_view_controls(self):
         """Adjusts the 3D viewer's own perspective FOV -- NOT the visualized OAK
         camera frustums, which are derived from real calibrated intrinsics
@@ -865,15 +909,6 @@ class ViserManager:
         that has a fresh board detection, since the board pose isn't known here).
         """
         with self.server.gui.add_folder("World Alignment"):
-            self.server.gui.add_markdown(
-                "Click below, then place the **alignment board** (same A3 size as the "
-                "calibration board but a different marker dictionary -- see "
-                "assets/charuco_alignment_board_6x4_65mm_A3.png) flat on the floor "
-                "where any one already-posed camera can see it. As soon as one camera "
-                "detects it, the world origin moves to the board's corner, +Z is set "
-                "to point up away from the floor, and the X/Y axes align with the "
-                "board's own edges -- only one camera needs to see it."
-            )
             button = self.server.gui.add_button("Set down direction from board")
             button.on_click(lambda _: on_click())
 
@@ -935,13 +970,19 @@ class ViserManager:
         self._ensure_camera_panel(cam_id)
         self.cam_images[cam_id].image = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-    def update_status(self, cam_id, state, extra_lines=()):
+    def update_status(self, cam_id, state, ext_samples=0, extra_lines=()):
+        """ext_samples: this camera's PoseGraph.sample_count_for(cam_id) --
+        how many pairwise (extrinsics) observations it's contributed to, as
+        opposed to state.sample_count() (intrinsics samples, single-camera
+        board detections).
+        """
         self._ensure_camera_panel(cam_id)
         conn = "connected" if state.connected else "**DISCONNECTED**"
         reproj = f"{state.reproj_error:.3f} px" if state.has_intrinsics_estimate else "n/a"
         lines = [
             f"**{cam_id}** -- {conn}",
-            f"samples: {state.sample_count()}",
+            f"samples for int: {state.sample_count()}",
+            f"samples for ext: {ext_samples}",
             f"reproj error: {reproj}",
             f"coverage: {state.coverage.ratio() * 100:.0f}%",
             f"converged: {'yes' if state.converged else 'no'}",
@@ -1518,7 +1559,7 @@ def main():
                             state.last_warned_no_detection = True
                 elif state.connected:
                     extra.append("**never detected the board yet**")
-                viser_mgr.update_status(cam_id, state, extra)
+                viser_mgr.update_status(cam_id, state, pose_graph.sample_count_for(cam_id), extra)
 
             if now - last_status_print >= runtime_cfg["status_print_interval_s"]:
                 last_status_print = now

@@ -225,6 +225,87 @@ recalibration, e.g. after touching a lens's focus.
 > out toward the camera, so a correction (`_BOARD_UP_CORRECTION`) now flips
 > local Z/Y before aligning to world +Z.
 
+## Combined calibration + capture app — `app.py`
+
+```
+python app.py [--config calibrate_config.yaml]
+```
+
+A single viser UI that boots every OAK camera once, then lets the operator
+load a saved calibration, run a live one, or continue uncalibrated, and
+switch into capture mode without re-booting cameras between those choices.
+Calibrate mode reuses `calibrate.py`'s engine directly (see that section
+above); this section covers capture mode.
+
+**Sessions and takes.** A capture *session* starts the moment the operator
+first presses "Start capture" (not at app boot) and is timestamped then;
+each individual recording within it is a *take* (`take_1`, `take_2`, ...),
+saved under `recordings/<session_ts>/take_<n>/` as
+`video_<cam>.mjpeg`/`frame_timestamps_<cam>.log` per camera (same shape
+`capture.py` itself writes), a `sync_still_<cam>.jpg` per camera from that
+take's device/host clock-sync read, and a `take_meta.json` recording the
+take's actual start time, which calibration was active (the loaded file's
+path, or `"uncalibrated"` if none), and each camera's applied
+exposure/USB speed/file paths.
+
+**No pipeline swap, ever.** There is exactly one `dai.Pipeline` per camera
+for the entire app run, built once at boot
+(`AppCameraSession.start_calibration_pipeline`) and used for both live
+ChArUco detection AND recording -- entering capture mode does not
+reconnect, re-boot, or rebuild anything, it just starts writing the stream
+that's already flowing to disk. Two things ruled out a per-session pipeline
+swap: building a second `dai.Pipeline` on an already-used, already-stopped
+`dai.Device` was found to crash `depthai` 3.7.1 natively (confirmed via
+isolated hardware testing), and the "safe" way to swap (close + reopen
+every device) reintroduces the exact multi-camera boot/brownout risk
+`boot_cameras` exists to harden against -- reproduced live (the same
+historically-bad camera failed to reconnect) before this was simplified
+away. The practical consequence: recordings run at whatever
+`camera.fps`/`camera.mjpeg_quality` are set to in `calibrate_config.yaml`
+(30fps/quality-90 by default) rather than a separately-tuned capture
+profile -- quality is kept high rather than `capture.py`'s own leaner 70,
+since heavier JPEG compression risks ChArUco corner-detection precision
+during calibration, at the cost of larger files during capture.
+
+**Recording button.** Idle → "Start capture" disables the button
+("Starting...") while that take's sync-calibration read and writer/log
+setup happen (typically well under a second, since no pipeline/device work
+is involved), then flips to a "Stop" button with a blinking recording
+indicator and the current take's name. "Stop" similarly shows
+"Stopping..." while files close, then returns to idle, ready for the next
+take.
+
+**Live previews during capture.** A dropdown next to the recording button
+("Auto" / "Always on" / "Always off") controls whether camera thumbnails
+keep updating while recording. "Auto" (the default) watches the CPU panel
+below and throttles preview decode/GUI updates off if host CPU stays above
+`runtime.cpu_throttle_threshold_pct` (default 85%) while a take is active,
+back on below `runtime.cpu_throttle_release_pct` (70%) -- the MJPEG
+encode/disk-write path itself is never throttled, only the preview
+decode/thumbnail-push cost. The operator's explicit choice always overrides
+Auto.
+
+**CPU panel.** A "Performance" panel in the sidebar shows live host CPU% and
+the postprocessing queue depth, so it's visible if capture is starting to
+bog the system down before it costs dropped frames.
+
+**Postprocessing worker (`postprocess.py`).** When a take stops, its folder
+is handed off to a background worker -- a plain `threading.Thread` +
+`queue.Queue`, **not** an AI-agent-spawning mechanism -- that runs a list of
+processing steps over it one take at a time (never overlapping with itself,
+but never blocking the *next* take from starting either). Today that list
+has exactly one step: building a small per-take grid video (reusing
+`align_session.convert_mjpegs_to_grid_mp4`) tiling every camera's footage,
+saved under `<take_dir>/processed/`. This worker is meant to grow --
+expect it to be asked to do a lot more over time (quality checks, hand/pose
+extraction, flagging bad takes, etc.), each as an ordinary Python function
+appended to `postprocess.PROCESSING_STEPS`.
+
+Alignment/sync analysis is still deliberately out of scope here (as it
+already is for `capture.py`'s own standalone flow) -- only clock logging
+(the per-take sync-calibration read, and per-frame host/device timestamps in
+each take's `.log` file) is done for now.
+
 ## Live hand tracking — `hand_capture_live.py`
 
 ```
@@ -367,19 +448,16 @@ cell), which is kept but not documented separately here.
 Not implemented -- notes from a design discussion, kept here so the reasoning
 isn't lost before either gets picked up.
 
-**Persistent camera streams for short repeated recordings.** A typical
-session is many short (<30s) clips, but each `capture.py` run pays the full
-device-connect/boot cost once per process. `capture.py` already separates
-"device open/streaming" (`start_pipeline()`) from "recording active"
-(`begin_recording()`), so the expensive one-time setup already happens only
-once per process -- what's missing is (a) a control loop to start/stop
-individual clips without closing the process between them, and (b) per-clip
-file/log naming (currently one `video_path`/`log_path` per `CameraRecorder`
-for the whole process lifetime). Open questions before building this: how
-sync-calibration drifts over a long-lived session (currently computed once,
-post-warmup, per process) if the pipeline sits idle for extended periods
-between clips, and whether an idle-but-open pipeline is stable over long
-periods -- neither has been tested.
+**Persistent camera streams for short repeated recordings.** Implemented for
+the recording side -- see `app.py`'s "Combined calibration + capture app"
+section above (sessions/takes, one pipeline for the whole app run, never
+swapped, a fresh writer/log per take). Went further than originally
+sketched here: rather than a pipeline swap once per capture session, there
+turned out to be no swap at all -- calibration and capture share the same
+running pipeline. The one part still genuinely open: whether that pipeline
+stays stable across a *long* idle gap between takes (many minutes) hasn't
+been tested, and per-take sync-calibration (rather than once per session)
+was deliberately chosen to sidestep that question rather than answer it.
 
 **Separate worker process per camera, with an orchestrator.** Instead of one
 `capture.py` process looping over every camera sequentially, run each
