@@ -478,6 +478,28 @@ def load_intrinsics_cache(cfg):
         return {}
 
 
+def backup_intrinsics_cache_entry(cfg, device_id, entry):
+    """Called right before an intrinsics_cache entry is evicted ('uncache'
+    command) so the old intrinsics are recoverable rather than silently
+    gone -- e.g. if uncache was clicked/typed by mistake, or just to compare
+    before/after touching a lens's focus. One JSON file per eviction event
+    (not overwritten by a later eviction of the same device), named
+    <timestamp>_<device_id>.json so it sorts chronologically and is easy to
+    trace back to the device -- same naming shape calibration_output_path
+    already uses for saved sessions. Lives alongside intrinsics_cache.json
+    itself (not logs/, which is for ephemeral operational events) since
+    this is data the operator may genuinely want back.
+    """
+    backup_dir = os.path.join(os.path.dirname(cfg["intrinsics_cache"]["path"]), "intrinsics_cache_backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_dir, f"{ts}_{device_id}.json")
+    _atomic_write_json(backup_path, {
+        "device_id": device_id, "evicted_at": datetime.now().isoformat(), "cache_entry": entry,
+    })
+    return backup_path
+
+
 def build_cache_entry(state):
     """On-disk key names deliberately mirror build_output's per-camera
     intrinsics keys (camera_matrix/dist_coeffs/image_width/image_height) for
@@ -844,18 +866,40 @@ class ViserManager:
         self.alignment_board_frames = {}
         self.alignment_board_meshes = {}
         self.unknown_labels = {}
-        self.floor_grid = None
+        # Standard viser ground-plane grid (xy plane, since this scene's up
+        # axis is +Z per the world-alignment convention -- see
+        # compute_board_world_alignment) as a visual check that the
+        # board-derived down direction actually looks horizontal. Hidden
+        # until show_floor() is called (once world alignment succeeds).
+        # A visible light-gray plane_opacity (not just shadow_opacity) is
+        # needed for the floor to actually read as a floor -- viser's
+        # cast_shadow/receive_shadow default to True on frustums/meshes/
+        # the grid itself, so shadows should appear once lit. NOTE: viser's
+        # default-light shadow camera has a hardcoded ~20-unit far plane
+        # from the *viewer's own camera position* (not exposed via any
+        # Python API), so shadows silently stop rendering if the viewport
+        # is zoomed out further than that -- width/height below are sized
+        # to roughly match that range rather than picked arbitrarily large.
+        self.floor_grid = self.server.scene.add_grid(
+            "/floor_grid", width=20.0, height=20.0, cell_size=0.5, plane="xy", visible=False,
+            plane_color=(220, 220, 220), plane_opacity=0.6, shadow_opacity=0.4,
+        )
 
     def add_camera_settings_panel(self):
-        """Static (non-updating) readout of this run's fixed camera settings."""
+        """Static (non-updating) readout of this run's fixed camera settings.
+        Returns the folder handle so callers can add more controls into the
+        same group later (e.g. app.py's exposure button) via `with folder:`.
+        """
         cam_cfg = self.cfg["camera"]
-        with self.server.gui.add_folder("Camera Settings"):
+        folder = self.server.gui.add_folder("Camera Settings")
+        with folder:
             self.server.gui.add_markdown(
                 f"**fps**: {cam_cfg['fps']}\n\n"
                 f"**shutter**: {cam_cfg['shutter_us']} us\n\n"
                 f"**iso**: {cam_cfg['iso']}\n\n"
                 f"**resolution**: {cam_cfg['record_width']}x{cam_cfg['record_height']}"
             )
+        return folder
 
     def add_performance_panel(self):
         """Live host-CPU readout so the operator can see the system getting
@@ -867,7 +911,7 @@ class ViserManager:
         with self.server.gui.add_folder("Performance"):
             self.perf_md = self.server.gui.add_markdown("_CPU: --_")
 
-    def update_performance(self, cpu_pcts, postprocess_queue_depth=None):
+    def update_performance(self, cpu_pcts, postprocess_queue_depth=None, cam_fps=None):
         """cpu_pcts: per-core percentages (psutil.cpu_percent(percpu=True)),
         NOT the system-wide average -- averaging across cores hides exactly
         the failure mode worth watching for: a single-threaded bottleneck
@@ -876,11 +920,42 @@ class ViserManager:
         number on a multi-core box. Shows the two busiest cores instead, by
         (index, value) so two cores tied at the same percentage still show
         as two distinct cores rather than the same one twice.
+
+        cam_fps: optional {cam_id: fps} -- shown here instead of per-camera,
+        since it's a live/frequently-updating number that's more useful
+        grouped with the rest of the performance readout than repeated in
+        every camera's own status panel.
         """
         top2 = sorted(enumerate(cpu_pcts), key=lambda pair: pair[1], reverse=True)[:2]
-        top_str = ", ".join(f"core {i}: {p:.0f}%" for i, p in top2) if top2 else "--"
+        top_str = ", ".join(f"{i}: {p:.0f}%" for i, p in top2) if top2 else "--"
         extra = f" | postprocess queue: {postprocess_queue_depth}" if postprocess_queue_depth else ""
-        self.perf_md.content = f"**CPU (busiest cores)**: {top_str}{extra}"
+        lines = [f"**CPU (busiest cores)**: {top_str}{extra}"]
+        if cam_fps:
+            fps_str = " ".join(
+                f"{cam_id}={fps:.1f}" if fps else f"{cam_id}=--" for cam_id, fps in cam_fps.items()
+            )
+            lines.append(f"**fps**: {fps_str}")
+        self.perf_md.content = "\n\n".join(lines)
+
+    def add_connection_banner(self):
+        """Always-present, initially-empty/hidden markdown line -- shows
+        which camera(s) are currently disconnected without blocking the
+        rest of the UI (a modal would prevent clicking Stop/other controls
+        mid-take, which is exactly when a disconnect is most likely to
+        matter). Updated once per tick from update_connection_banner.
+        """
+        self.connection_banner_md = self.server.gui.add_markdown("", visible=False)
+
+    def update_connection_banner(self, disconnected_cam_ids):
+        if not disconnected_cam_ids:
+            self.connection_banner_md.content = ""
+            self.connection_banner_md.visible = False
+            return
+        names = ", ".join(sorted(disconnected_cam_ids))
+        self.connection_banner_md.content = (
+            f"**⚠ {len(disconnected_cam_ids)} camera(s) disconnected: {names}**"
+        )
+        self.connection_banner_md.visible = True
 
     def add_view_controls(self):
         """Adjusts the 3D viewer's own perspective FOV -- NOT the visualized OAK
@@ -907,32 +982,38 @@ class ViserManager:
         """`on_click` is called with no arguments the instant the button is pressed;
         it should just flag a request (the actual capture happens on the next tick
         that has a fresh board detection, since the board pose isn't known here).
+        No folder wrapper -- caller places this wherever makes sense (app.py
+        puts it directly under the Calibrate tab's ChArUco toggle).
         """
-        with self.server.gui.add_folder("World Alignment"):
-            button = self.server.gui.add_button("Set down direction from board")
-            button.on_click(lambda _: on_click())
-
-            # Standard viser ground-plane grid (xy plane, since this scene's up
-            # axis is +Z per the world-alignment convention -- see
-            # compute_board_world_alignment) as a visual check that the
-            # board-derived down direction actually looks horizontal. Off by
-            # default since it's only meaningful once alignment has been set.
-            # A visible light-gray plane_opacity (not just shadow_opacity) is
-            # needed for the floor to actually read as a floor -- viser's
-            # cast_shadow/receive_shadow default to True on frustums/meshes/
-            # the grid itself, so shadows should appear once lit. NOTE: viser's
-            # default-light shadow camera has a hardcoded ~20-unit far plane
-            # from the *viewer's own camera position* (not exposed via any
-            # Python API), so shadows silently stop rendering if the viewport
-            # is zoomed out further than that -- width/height below are sized
-            # to roughly match that range rather than picked arbitrarily large.
-            self.floor_grid = self.server.scene.add_grid(
-                "/floor_grid", width=20.0, height=20.0, cell_size=0.5, plane="xy", visible=False,
-                plane_color=(220, 220, 220), plane_opacity=0.6, shadow_opacity=0.4,
-            )
-            grid_checkbox = self.server.gui.add_checkbox("Show floor grid", initial_value=False)
-            grid_checkbox.on_update(lambda _: setattr(self.floor_grid, "visible", grid_checkbox.value))
+        button = self.server.gui.add_button("Set down direction from board")
+        button.on_click(lambda _: on_click())
         return button
+
+    def show_floor(self):
+        """Called once world alignment succeeds -- makes the floor grid
+        visible automatically, no manual toggle needed.
+        """
+        self.floor_grid.visible = True
+
+    def set_view(self, position, look_at, up_direction=(0.0, 0.0, 1.0)):
+        """Points the 3D viewer's camera at a fixed pose -- applied to every
+        currently-connected client, and to any client that connects later
+        (same broadcast-plus-on_client_connect pattern add_view_controls
+        uses for FOV). Called once world alignment succeeds, so the operator
+        lands on a sensible view of the newly-established floor without
+        having to manually orbit there.
+        """
+        for client in self.server.get_clients().values():
+            client.camera.position = position
+            client.camera.look_at = look_at
+            client.camera.up_direction = up_direction
+
+        def _apply_to_new_client(client):
+            client.camera.position = position
+            client.camera.look_at = look_at
+            client.camera.up_direction = up_direction
+
+        self.server.on_client_connect(_apply_to_new_client)
 
     def add_global_controls(self, cmd_queue):
         """Convenience buttons (spec section 8). These only enqueue the same
@@ -977,10 +1058,8 @@ class ViserManager:
         board detections).
         """
         self._ensure_camera_panel(cam_id)
-        conn = "connected" if state.connected else "**DISCONNECTED**"
         reproj = f"{state.reproj_error:.3f} px" if state.has_intrinsics_estimate else "n/a"
         lines = [
-            f"**{cam_id}** -- {conn}",
             f"samples for int: {state.sample_count()}",
             f"samples for ext: {ext_samples}",
             f"reproj error: {reproj}",
@@ -1274,6 +1353,7 @@ def main():
 
     pose_graph = PoseGraph(cfg)
     viser_mgr = ViserManager(cfg)
+    viser_mgr.add_connection_banner()
     viser_mgr.add_camera_settings_panel()
     viser_mgr.add_view_controls()
     print(f"[Viser] http://localhost:{viser_mgr.server.get_port()}")
@@ -1363,9 +1443,12 @@ def main():
                         if cam_id not in sessions:
                             continue
                         device_id = sessions[cam_id].device_id
-                        if intrinsics_cache.pop(device_id, None) is not None:
+                        evicted_entry = intrinsics_cache.pop(device_id, None)
+                        if evicted_entry is not None:
                             evicted = True
-                            print(f"[Cache] {cam_id}: evicted cache entry for device {device_id}.")
+                            backup_path = backup_intrinsics_cache_entry(cfg, device_id, evicted_entry)
+                            print(f"[Cache] {cam_id}: evicted cache entry for device {device_id} "
+                                  f"(backed up to {backup_path}).")
                         if cam_id in calib_states:
                             # Plain constructor (not make_calib_state) -- the whole point is to
                             # NOT immediately reload what was just evicted.
@@ -1531,6 +1614,8 @@ def main():
                         viser_mgr.update_alignment_board_pose(
                             "origin", rt_to_T(_BOARD_UP_CORRECTION, np.zeros(3)),
                         )
+                        viser_mgr.show_floor()
+                        viser_mgr.set_view(position=(3.0, 0.0, 2.0), look_at=(0.0, 0.0, 0.0))
                         print(f"[Align] World origin/down direction set from {cam_id}'s "
                               f"alignment-board detection.")
                         break
@@ -1560,6 +1645,10 @@ def main():
                 elif state.connected:
                     extra.append("**never detected the board yet**")
                 viser_mgr.update_status(cam_id, state, pose_graph.sample_count_for(cam_id), extra)
+
+            viser_mgr.update_connection_banner(
+                [cam_id for cam_id in cam_ids if not calib_states[cam_id].connected]
+            )
 
             if now - last_status_print >= runtime_cfg["status_print_interval_s"]:
                 last_status_print = now

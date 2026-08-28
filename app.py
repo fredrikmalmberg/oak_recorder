@@ -79,6 +79,137 @@ def list_available_calibrations(cfg):
     return sorted(paths, reverse=True)
 
 
+def matches_active_cameras(path, active_device_ids):
+    """Exact match, not "the file's cameras are a superset of what's active"
+    -- a saved calibration missing even one currently-connected camera, or
+    covering extra cameras that aren't connected right now, isn't a real
+    match for this session. Reuses load_calibration_output's own filtering
+    (only cameras that actually got a solved pose count), so this always
+    agrees with what loading the file would actually produce.
+    """
+    loaded = calibrate.load_calibration_output(path)
+    saved_device_ids = {entry["device_id"] for entry in loaded.values() if entry.get("device_id")}
+    return saved_device_ids == active_device_ids, len(saved_device_ids)
+
+
+def verify_floor_board(viser_mgr, sessions, cam_ids, loaded_cameras_candidate,
+                        alignment_detector, alignment_board_points_3d, cfg):
+    """Pre-flight sanity check before "Load & start capture" commits: tries
+    to detect the alignment/floor board live, using each camera's OWN saved
+    intrinsics from the candidate file, and shows the PnP reprojection
+    error -- a large jump from what's expected suggests the rig has moved
+    since this calibration was saved. Runs synchronously on the setup
+    thread (the same one already blocking on the picker) -- nothing else is
+    happening at this point in the app's life, so this is the "background"
+    check without needing real threading. Returns True to proceed with
+    loading, False to go back to the picker (operator hit Cancel with no
+    board detected).
+    """
+    with viser_mgr.server.gui.add_modal("Verifying calibration...") as modal:
+        status_md = viser_mgr.server.gui.add_markdown(
+            "_Looking for the floor board -- place it where any camera can see it..._"
+        )
+        ok_btn = viser_mgr.server.gui.add_button("OK", visible=False)
+        proceed_btn = viser_mgr.server.gui.add_button("Proceed anyway", visible=False)
+        cancel_btn = viser_mgr.server.gui.add_button("Cancel", visible=False)
+
+    proceed_result = {"value": None}
+    done = threading.Event()
+
+    def _ok(_):
+        proceed_result["value"] = True
+        done.set()
+
+    def _proceed_anyway(_):
+        proceed_result["value"] = True
+        done.set()
+
+    def _cancel(_):
+        proceed_result["value"] = False
+        done.set()
+
+    ok_btn.on_click(_ok)
+    proceed_btn.on_click(_proceed_anyway)
+    cancel_btn.on_click(_cancel)
+
+    found_cam_id, found_err = None, None
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and found_cam_id is None:
+        for cam_id in cam_ids:
+            session = sessions[cam_id]
+            if not session.connected:
+                continue
+            entry = loaded_cameras_candidate.get(session.device_id)
+            if entry is None:
+                continue
+            try:
+                got = session.poll(decode_full=True, decode_preview=False)
+            except Exception:
+                continue
+            if not got or session.last_frame_full is None:
+                continue
+            gray = cv2.cvtColor(session.last_frame_full, cv2.COLOR_BGR2GRAY)
+            detection = calibrate.detect_charuco(alignment_detector, gray)
+            if detection is None:
+                continue
+            corners2d, ids = detection
+            if len(ids) < cfg["quality_gates"]["min_corners"]:
+                continue
+            solved = calibrate.solve_board_pose(
+                alignment_board_points_3d[ids], corners2d, entry["K"], entry["dist"],
+            )
+            if solved is None:
+                continue
+            _R, _t, found_err = solved
+            found_cam_id = cam_id
+            break
+        if found_cam_id is None:
+            time.sleep(0.02)
+
+    if found_cam_id is not None:
+        status_md.content = (
+            f"_Floor board detected by **{found_cam_id}**._\n\n"
+            f"**Reprojection error: {found_err:.3f}px**\n\n"
+            "Does this look right (rig hasn't moved much since this calibration "
+            "was saved)?"
+        )
+        ok_btn.visible = True
+    else:
+        status_md.content = (
+            "_No floor board detected within a couple seconds._\n\n"
+            "Proceed anyway without this check?"
+        )
+        proceed_btn.visible = True
+        cancel_btn.visible = True
+
+    done.wait()
+    modal.close()
+    return proceed_result["value"]
+
+
+def maybe_undistort(frame, K, dist, display_size, record_size):
+    """K=None means "no usable intrinsics for this camera right now" (not
+    yet converged / not in the loaded file / uncalibrated mode) -- returns
+    frame unchanged rather than raising, which is what lets the global
+    undistort toggle apply blindly across every camera regardless of
+    whether each one actually has intrinsics yet.
+
+    K is computed for the FULL recording resolution, but frame is at the
+    smaller preview resolution -- fx/fy/cx/cy scale with resolution, so K
+    needs rescaling before cv2.undistort can be applied here; dist
+    coefficients don't (OpenCV's pinhole model is scale-invariant there).
+    """
+    if K is None:
+        return frame
+    scale = display_size[0] / record_size[0]
+    K_scaled = K.copy()
+    K_scaled[0, 0] *= scale
+    K_scaled[1, 1] *= scale
+    K_scaled[0, 2] *= scale
+    K_scaled[1, 2] *= scale
+    return cv2.undistort(frame, K_scaled, dist)
+
+
 # ==============================================================================
 # Camera session: connects once (via capture.py's hardened retry helper) and
 # holds whichever pipeline is currently active on that connection. Deliberately
@@ -409,45 +540,85 @@ def boot_cameras(viser_mgr, cfg):
 # ==============================================================================
 # Calibration picker: load / start new / continue uncalibrated.
 # ==============================================================================
-def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrinsics_cache, image_size):
+def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrinsics_cache, image_size,
+                             alignment_detector, alignment_board_points_3d):
     """intrinsics_cache/image_size let this show, per booted camera, whether
     its intrinsics are already cached AND resolution-matched -- the exact
     same condition make_calib_state checks before treating a camera as
     intrinsics-locked, so what's shown here always matches what a
     "Start new calibration" click would actually do with that camera.
+
+    Saved calibrations render one row per file, matching-camera files first
+    (newest-first within each group) -- a file whose camera set doesn't
+    exactly match the currently-booted rig gets disabled Load buttons
+    rather than being hidden, so it's still visible but can't be picked.
+    Loops (rather than returning immediately) so "Load & start capture"'s
+    floor-board pre-flight check (verify_floor_board) can send the operator
+    back to this same picker on Cancel instead of aborting the app.
     """
     calib_files = list_available_calibrations(cfg)
-    with viser_mgr.server.gui.add_modal("Calibration") as modal:
-        camera_lines = []
-        for cam_id in cam_ids:
-            session = sessions[cam_id]
-            entry = intrinsics_cache.get(session.device_id)
-            if entry is None:
-                status = "_no cached intrinsics_"
-            elif entry["image_width"] != image_size[0] or entry["image_height"] != image_size[1]:
-                status = (f"_cached intrinsics are for {entry['image_width']}x{entry['image_height']}, "
-                          f"this run is {image_size[0]}x{image_size[1]} -- will recalibrate_")
+    active_device_ids = {sessions[cam_id].device_id for cam_id in cam_ids}
+    match_info = {path: matches_active_cameras(path, active_device_ids) for path in calib_files}
+    ordered_files = (
+        [p for p in calib_files if match_info[p][0]] + [p for p in calib_files if not match_info[p][0]]
+    )
+
+    while True:
+        with viser_mgr.server.gui.add_modal("Calibration") as modal:
+            camera_lines = []
+            for cam_id in cam_ids:
+                session = sessions[cam_id]
+                entry = intrinsics_cache.get(session.device_id)
+                if entry is None:
+                    status = "_no cached intrinsics_"
+                elif entry["image_width"] != image_size[0] or entry["image_height"] != image_size[1]:
+                    status = (f"_cached intrinsics are for {entry['image_width']}x{entry['image_height']}, "
+                              f"this run is {image_size[0]}x{image_size[1]} -- will recalibrate_")
+                else:
+                    status = f"**intrinsics cached** ({entry['reprojection_error_px']:.3f}px reproj)"
+                camera_lines.append(
+                    f"- **{cam_id}** (`{session.device_id}`, USB {session.usb_speed.name}): {status}"
+                )
+            viser_mgr.server.gui.add_markdown("**Connected cameras:**\n\n" + "\n".join(camera_lines))
+
+            if ordered_files:
+                for path in ordered_files:
+                    matches, cam_count = match_info[path]
+                    label = os.path.basename(path)
+                    note = "" if matches else " -- camera mismatch"
+                    viser_mgr.server.gui.add_markdown(
+                        f"**{label}** ({cam_count} camera{'s' if cam_count != 1 else ''}){note}"
+                    )
+                    load_btn = viser_mgr.server.gui.add_button("Load", disabled=not matches)
+                    load_btn.on_click(lambda _, p=path: cmd_queue.put(("load_calibration", p)))
+                    capture_btn = viser_mgr.server.gui.add_button("Load & start capture", disabled=not matches)
+                    capture_btn.on_click(lambda _, p=path: cmd_queue.put(("load_and_capture", p)))
             else:
-                status = f"**intrinsics cached** ({entry['reprojection_error_px']:.3f}px reproj)"
-            camera_lines.append(f"- **{cam_id}** (`{session.device_id}`, USB {session.usb_speed.name}): {status}")
-        viser_mgr.server.gui.add_markdown("**Connected cameras:**\n\n" + "\n".join(camera_lines))
+                viser_mgr.server.gui.add_markdown("_No saved calibrations found in "
+                                                   f"`{cfg['output']['dir']}`._")
+            start_btn = viser_mgr.server.gui.add_button("Start new calibration")
+            start_btn.on_click(lambda _: cmd_queue.put(("start_calibration", None)))
+            skip_btn = viser_mgr.server.gui.add_button("Continue uncalibrated")
+            skip_btn.on_click(lambda _: cmd_queue.put(("uncalibrated", None)))
 
-        if calib_files:
-            labels = [os.path.basename(p) for p in calib_files]
-            dropdown = viser_mgr.server.gui.add_dropdown("Saved calibrations", labels, initial_value=labels[0])
-            load_btn = viser_mgr.server.gui.add_button("Load selected")
-            load_btn.on_click(lambda _: cmd_queue.put(("load_calibration", calib_files[labels.index(dropdown.value)])))
-        else:
-            viser_mgr.server.gui.add_markdown("_No saved calibrations found in "
-                                               f"`{cfg['output']['dir']}`._")
-        start_btn = viser_mgr.server.gui.add_button("Start new calibration")
-        start_btn.on_click(lambda _: cmd_queue.put(("start_calibration", None)))
-        skip_btn = viser_mgr.server.gui.add_button("Continue uncalibrated")
-        skip_btn.on_click(lambda _: cmd_queue.put(("uncalibrated", None)))
+        choice = cmd_queue.get()  # blocks the setup thread until the operator picks one
+        modal.close()
 
-    choice = cmd_queue.get()  # blocks the setup thread until the operator picks one
-    modal.close()
-    return choice
+        if choice[0] == "load_and_capture":
+            path = choice[1]
+            loaded_candidate = calibrate.load_calibration_output(path)
+            loaded_cameras_candidate = {
+                entry["device_id"]: entry for entry in loaded_candidate.values() if entry.get("device_id")
+            }
+            proceed = verify_floor_board(
+                viser_mgr, sessions, cam_ids, loaded_cameras_candidate,
+                alignment_detector, alignment_board_points_3d, cfg,
+            )
+            if proceed:
+                return choice
+            continue  # Cancel -- re-show the picker
+
+        return choice
 
 
 # ==============================================================================
@@ -491,6 +662,7 @@ def main():
     setup_queue = queue.Queue()
     action, action_arg = show_calibration_picker(
         viser_mgr, cfg, setup_queue, sessions, cam_ids, intrinsics_cache, image_size,
+        alignment_detector, alignment_board_points_3d,
     )
 
     # ── Persistent state, shared by whichever mode is active ──────────────────
@@ -503,9 +675,9 @@ def main():
     app_state = {"mode": "uncalibrated"}
     loaded_cameras = {}  # device_id -> {"K","dist","width","height","R","t"} when mode == "loaded"
 
-    loaded_calibration_path = action_arg if action == "load_calibration" else None
+    loaded_calibration_path = action_arg if action in ("load_calibration", "load_and_capture") else None
 
-    if action == "load_calibration":
+    if action in ("load_calibration", "load_and_capture"):
         loaded = calibrate.load_calibration_output(action_arg)
         loaded_cameras = {entry["device_id"]: entry for entry in loaded.values() if entry.get("device_id")}
         app_state["mode"] = "loaded"
@@ -540,25 +712,11 @@ def main():
         for cam_id in cam_ids:
             viser_mgr._ensure_camera_panel(cam_id)
     preview_panel.dock_left()
-    preview_panel.set_width(360)
+    preview_panel.set_width(252)  # 70% of the previous 360
 
-    viser_mgr.add_camera_settings_panel()  # static readout of the starting config values
+    viser_mgr.add_connection_banner()
+    camera_settings_folder = viser_mgr.add_camera_settings_panel()  # static readout of the starting config values
     viser_mgr.add_performance_panel()
-
-    # Always-visible shutdown control -- enqueue-then-drain, same idiom as
-    # every other button in this file: the on_click callback (viser's own
-    # background thread pool) only flips a flag and gives immediate visual
-    # feedback; the main loop thread (see shutdown_event.is_set() check
-    # below) does the actual, bounded cleanup and then force-exits the
-    # process. See main()'s tail-end comment for why a forced exit is used.
-    shutdown_event = threading.Event()
-    shutdown_btn = viser_mgr.server.gui.add_button("Shutdown app")
-
-    def _request_shutdown(_):
-        shutdown_btn.label, shutdown_btn.disabled = "Shutting down...", True
-        shutdown_event.set()
-
-    shutdown_btn.on_click(_request_shutdown)
 
     # Exposure control lives in a modal (opened on demand) rather than an
     # always-visible slider pair -- a slider alone gives no feedback on
@@ -606,8 +764,24 @@ def main():
         apply_btn.on_click(_apply)
         close_btn.on_click(_close)
 
-    exposure_btn = viser_mgr.server.gui.add_button("Exposure...")
-    exposure_btn.on_click(lambda _: open_exposure_modal())
+    with camera_settings_folder:
+        exposure_btn = viser_mgr.server.gui.add_button("Exposure...")
+        exposure_btn.on_click(lambda _: open_exposure_modal())
+
+    # Global "Undistort views" toggle -- pure display flag, no device access,
+    # so it's safe to flip directly from the callback thread (unlike
+    # anything touching dai pipelines/queues). Applied in Pass 1 to every
+    # camera's preview thumbnail via maybe_undistort, which gracefully
+    # passes a frame through unchanged for any camera lacking real
+    # intrinsics for the current mode.
+    undistort_state = {"enabled": False}
+    undistort_btn = viser_mgr.server.gui.add_button("Undistort views: OFF")
+
+    def _toggle_undistort(_):
+        undistort_state["enabled"] = not undistort_state["enabled"]
+        undistort_btn.label = f"Undistort views: {'ON' if undistort_state['enabled'] else 'OFF'}"
+
+    undistort_btn.on_click(_toggle_undistort)
 
     viser_mgr.add_view_controls()
 
@@ -622,13 +796,9 @@ def main():
         print("[Align] Waiting for a fresh detection of the alignment board "
               "(any one camera) to set the world's origin and down direction...")
 
-    viser_mgr.add_world_alignment_button(request_world_alignment)
-
     # Lets the operator pause the expensive part of Pass 2 (both the full-res
     # JPEG decode and ChArUco detection -- see poll()'s decode_full param,
-    # which this toggle also gates) without leaving calibrate mode entirely
-    # -- camera frustums/board poses just freeze at their last value while
-    # paused, rather than disappearing.
+    # which this toggle also gates) without leaving calibrate mode entirely.
     detection_state = {"enabled": True}
 
     # ── Capture mode state -- see README.md's "Capture mode" section ────────
@@ -655,9 +825,18 @@ def main():
         detection_checkbox = viser_mgr.server.gui.add_checkbox(
             "ChArUco detection enabled", initial_value=True,
         )
-        detection_checkbox.on_update(
-            lambda _: detection_state.__setitem__("enabled", detection_checkbox.value)
-        )
+
+        def _toggle_detection(_):
+            detection_state["enabled"] = detection_checkbox.value
+            if not detection_checkbox.value:
+                # Hide rather than freeze -- the checkbox itself already
+                # makes the paused state obvious, so a stale-looking board
+                # pose left on screen would be misleading, not just old.
+                for cam_id in cam_ids:
+                    viser_mgr.hide_board_pose(cam_id)
+
+        detection_checkbox.on_update(_toggle_detection)
+        viser_mgr.add_world_alignment_button(request_world_alignment)
         viser_mgr.add_global_controls(cmd_queue)
     with tab_group.add_tab("Capture"):
         preview_mode_dropdown = viser_mgr.server.gui.add_dropdown(
@@ -671,6 +850,43 @@ def main():
         capture_btn.on_click(lambda _: capture_cmd_queue.put(
             "stop" if capture_state["phase"] == "recording" else "start"
         ))
+
+    if action == "load_and_capture":
+        # Skip the button click entirely -- "Load & start capture" already
+        # got its confirmation via verify_floor_board's modal. Seeding the
+        # phase here means the main loop's existing starting-phase handling
+        # (_do_start_take, below) kicks off take_1 on its very first tick.
+        capture_state["phase"] = "starting"
+        capture_btn.label, capture_btn.disabled = "Starting...", True
+        capture_status_md.content = "_Starting take..._"
+
+    # Always-visible shutdown control -- styled as a clearly destructive
+    # action (red + power icon) and placed last, so it renders at the
+    # bottom of the panel. Enqueue-then-drain, same idiom as every other
+    # button in this file: on_click only opens a confirm modal; only that
+    # modal's "Confirm shutdown" button actually sets shutdown_event. The
+    # main loop thread (see shutdown_event.is_set() check below) does the
+    # actual, bounded cleanup and then force-exits the process -- see
+    # main()'s tail-end comment for why a forced exit is used.
+    shutdown_event = threading.Event()
+    shutdown_btn = viser_mgr.server.gui.add_button("Shutdown app", color="red", icon="power")
+
+    def _open_shutdown_modal():
+        modal = viser_mgr.server.gui.add_modal("Confirm shutdown")
+        with modal:
+            viser_mgr.server.gui.add_markdown("Shut down the app? This closes every camera and exits.")
+            confirm_btn = viser_mgr.server.gui.add_button("Confirm shutdown", color="red", icon="power")
+            cancel_btn = viser_mgr.server.gui.add_button("Cancel")
+
+        def _confirm(_):
+            shutdown_btn.label, shutdown_btn.disabled = "Shutting down...", True
+            shutdown_event.set()
+            modal.close()
+
+        confirm_btn.on_click(_confirm)
+        cancel_btn.on_click(lambda _: modal.close())
+
+    shutdown_btn.on_click(lambda _: _open_shutdown_modal())
 
     def clear_extrinsics_for(target):
         """Same as calibrate.py's own helper of this name."""
@@ -830,9 +1046,12 @@ def main():
                             if cam_id not in sessions:
                                 continue
                             device_id = sessions[cam_id].device_id
-                            if intrinsics_cache.pop(device_id, None) is not None:
+                            evicted_entry = intrinsics_cache.pop(device_id, None)
+                            if evicted_entry is not None:
                                 evicted = True
-                                print(f"[Cache] {cam_id}: evicted cache entry for device {device_id}.")
+                                backup_path = calibrate.backup_intrinsics_cache_entry(cfg, device_id, evicted_entry)
+                                print(f"[Cache] {cam_id}: evicted cache entry for device {device_id} "
+                                      f"(backed up to {backup_path}).")
                             if cam_id in calib_states:
                                 calib_states[cam_id] = calibrate.CameraCalibState(cam_id, image_size, cfg)
                                 print(f"[Reset] {cam_id} calibration state cleared (intrinsics uncached).")
@@ -890,7 +1109,8 @@ def main():
             if psutil is not None and now - perf_state["last_sample_mono"] >= 1.0:
                 perf_state["last_sample_mono"] = now
                 perf_state["cpu_pcts"] = psutil.cpu_percent(interval=None, percpu=True)
-                viser_mgr.update_performance(perf_state["cpu_pcts"], postproc.queue.qsize())
+                cam_fps = {cam_id: sessions[cam_id].fps for cam_id in cam_ids}
+                viser_mgr.update_performance(perf_state["cpu_pcts"], postproc.queue.qsize(), cam_fps)
 
             max_cpu_pct = max(perf_state["cpu_pcts"]) if perf_state["cpu_pcts"] else 0.0
             if capture_state["phase"] == "recording":
@@ -953,10 +1173,25 @@ def main():
 
                 if session.preview_updated and session.last_frame_preview is not None:
                     state = calib_states.get(cam_id)
+                    preview_frame = session.last_frame_preview
+                    if undistort_state["enabled"]:
+                        undistort_K = undistort_dist = None
+                        if app_state["mode"] == "loaded":
+                            entry = loaded_cameras.get(session.device_id)
+                            if entry is not None:
+                                undistort_K, undistort_dist = entry["K"], entry["dist"]
+                        elif (app_state["mode"] == "calibrate" and state is not None
+                              and state.has_intrinsics_estimate):
+                            undistort_K, undistort_dist = state.K, state.dist
+                        preview_frame = maybe_undistort(
+                            preview_frame, undistort_K, undistort_dist,
+                            (cfg["camera"]["display_width"], cfg["camera"]["display_height"]),
+                            (cfg["camera"]["record_width"], cfg["camera"]["record_height"]),
+                        )
                     if app_state["mode"] == "calibrate" and state is not None and not state.intrinsics_locked:
-                        viser_mgr.update_thumbnail(cam_id, session.last_frame_preview, state.coverage)
+                        viser_mgr.update_thumbnail(cam_id, preview_frame, state.coverage)
                     else:
-                        viser_mgr.update_thumbnail_raw(cam_id, session.last_frame_preview)
+                        viser_mgr.update_thumbnail_raw(cam_id, preview_frame)
 
                 if need_full_decode and got_frame and session.last_frame_full is not None:
                     fresh_frames[cam_id] = (session.last_frame_full, session.last_frame_full_ts)
@@ -1070,6 +1305,8 @@ def main():
                             viser_mgr.update_alignment_board_pose(
                                 "origin", calibrate.rt_to_T(calibrate._BOARD_UP_CORRECTION, np.zeros(3)),
                             )
+                            viser_mgr.show_floor()
+                            viser_mgr.set_view(position=(2.0, -6.0, 5.0), look_at=(0.0, 0.0, 0.0))
                             print(f"[Align] World origin/down direction set from {cam_id}'s "
                                   f"alignment-board detection.")
                             break
@@ -1130,10 +1367,8 @@ def main():
             for cam_id in cam_ids:
                 session = sessions[cam_id]
                 state = calib_states[cam_id]
-                extra = [f"**fps**: {session.fps:.1f}" if session.fps else "**fps**: --"]
+                extra = []
                 if app_state["mode"] == "calibrate":
-                    if not detection_state["enabled"]:
-                        extra.append("_ChArUco detection paused_")
                     if state.intrinsics_locked:
                         extra.append(f"_intrinsics: loaded from cache "
                                      f"({state.reproj_error:.3f}px at save time)_")
@@ -1145,12 +1380,14 @@ def main():
                         extra.append("**never detected the board yet**")
                 viser_mgr.update_status(cam_id, state, pose_graph.sample_count_for(cam_id), extra)
 
+            viser_mgr.update_connection_banner([cam_id for cam_id in cam_ids if not sessions[cam_id].connected])
+
             if now - last_status_print >= runtime_cfg["status_print_interval_s"]:
                 last_status_print = now
                 connected = sum(1 for s in sessions.values() if s.connected)
                 det_str = "on" if detection_state["enabled"] else "off"
                 top2_cpu = sorted(enumerate(perf_state["cpu_pcts"]), key=lambda pair: pair[1], reverse=True)[:2]
-                cpu_str = ", ".join(f"core{i}={p:.0f}%" for i, p in top2_cpu) if top2_cpu else "--"
+                cpu_str = ", ".join(f"{i}={p:.0f}%" for i, p in top2_cpu) if top2_cpu else "--"
                 print(f"[Status] mode={app_state['mode']} | detection={det_str} | "
                       f"{connected}/{len(cam_ids)} camera(s) connected | "
                       f"pass2: {last_pass2_cams} cam(s) in {last_pass2_ms:.0f}ms | "
