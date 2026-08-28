@@ -886,20 +886,34 @@ class ViserManager:
         )
 
     def add_camera_settings_panel(self):
-        """Static (non-updating) readout of this run's fixed camera settings.
-        Returns the folder handle so callers can add more controls into the
-        same group later (e.g. app.py's exposure button) via `with folder:`.
+        """Readout of this run's camera settings -- fps/resolution are fixed
+        for the whole run, but shutter/iso start here as just the config's
+        starting values and go stale the moment a live exposure change is
+        applied (see app.py's Exposure modal) unless update_camera_settings
+        is called to refresh them. Returns the folder handle so callers can
+        add more controls into the same group later (e.g. app.py's exposure
+        button) via `with folder:`.
         """
         cam_cfg = self.cfg["camera"]
+        self._camera_settings_fps = cam_cfg["fps"]
+        self._camera_settings_resolution = f"{cam_cfg['record_width']}x{cam_cfg['record_height']}"
         folder = self.server.gui.add_folder("Camera Settings")
         with folder:
-            self.server.gui.add_markdown(
-                f"**fps**: {cam_cfg['fps']}\n\n"
-                f"**shutter**: {cam_cfg['shutter_us']} us\n\n"
-                f"**iso**: {cam_cfg['iso']}\n\n"
-                f"**resolution**: {cam_cfg['record_width']}x{cam_cfg['record_height']}"
-            )
+            self.camera_settings_md = self.server.gui.add_markdown("")
+        self.update_camera_settings(cam_cfg["shutter_us"], cam_cfg["iso"])
         return folder
+
+    def update_camera_settings(self, shutter_us, iso):
+        """Refreshes the Camera Settings panel's shutter/iso readout --
+        call this once a live exposure change is actually confirmed applied
+        (not just requested), so the panel never shows a stale value.
+        """
+        self.camera_settings_md.content = (
+            f"**fps**: {self._camera_settings_fps}\n\n"
+            f"**shutter**: {shutter_us} us\n\n"
+            f"**iso**: {iso}\n\n"
+            f"**resolution**: {self._camera_settings_resolution}"
+        )
 
     def add_performance_panel(self):
         """Live host-CPU readout so the operator can see the system getting
