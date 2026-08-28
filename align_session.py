@@ -26,14 +26,23 @@ def preview_grid_layout(num_cameras):
     return cols, rows
 
 
-def xstack_layout(num_cameras):
+def xstack_layout(num_cameras, cell_w, cell_h):
+    """Literal pixel offsets, not chained wN/hN ffmpeg-expression references
+    -- safe here because every stream is scaled to this same uniform
+    cell_w x cell_h before xstack (both call sites do this). A prior
+    wN-chaining version was WRONG for any grid 3+ columns/rows wide: it set
+    each cell's offset to just ONE preceding cell's width/height (`w{i-1}`/
+    `h{i-cols}`) instead of the SUM of all preceding same-row/column cells,
+    so e.g. a 3-column grid's 3rd column landed at 1x cell_w instead of 2x,
+    overlapping the 2nd column -- confirmed against a real 6-camera (3x2)
+    take where this silently hid 2 of the 6 cameras behind others in the
+    output grid video, i.e. only 4 appeared visible.
+    """
     cols, _rows = preview_grid_layout(num_cameras)
     parts = []
     for i in range(num_cameras):
         row, col = divmod(i, cols)
-        x = "0" if col == 0 else f"w{i - 1}"
-        y = "0" if row == 0 else f"h{i - cols}"
-        parts.append(f"{x}_{y}")
+        parts.append(f"{col * cell_w}_{row * cell_h}")
     return "|".join(parts)
 
 
@@ -540,7 +549,7 @@ def convert_mjpegs_to_grid_mp4(video_paths, fps, session_dir):
     stack_inputs = "".join(f"[v{i}]" for i in range(num_cameras))
     filter_complex = (
         ";".join(scale_filters)
-        + f";{stack_inputs}xstack=inputs={num_cameras}:layout={xstack_layout(num_cameras)}[v]"
+        + f";{stack_inputs}xstack=inputs={num_cameras}:layout={xstack_layout(num_cameras, cell_w, cell_h)}[v]"
     )
 
     cmd.extend([
@@ -591,7 +600,7 @@ def convert_aligned_jpegs_to_grid_mp4(session_dir, cam_labels, fps):
     stack_inputs = "".join(f"[v{i}]" for i in range(num_cameras))
     filter_complex = (
         ";".join(scale_filters)
-        + f";{stack_inputs}xstack=inputs={num_cameras}:layout={xstack_layout(num_cameras)}[v]"
+        + f";{stack_inputs}xstack=inputs={num_cameras}:layout={xstack_layout(num_cameras, cell_w, cell_h)}[v]"
     )
 
     cmd.extend([
