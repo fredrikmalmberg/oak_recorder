@@ -32,8 +32,53 @@ failed to reconnect) before this design was simplified to avoid it
 entirely. So entering capture mode is instant: a take just starts writing
 the already-running stream to disk. See README.md's "Capture mode" section
 for the full session/take/postprocessing design.
+
+The UI is two docked panels, both docked left so they land side by side.
+Which one ends up at the screen edge is decided by PANEL CREATION order,
+not by which dock_left() call happens first (a wrong fix tried once
+already) -- viser's client applies every panel's placement in
+Object.keys(panels) order (client/src/ControlPanel/placementCoordinator.
+tsx), i.e. add_panel()-call order, and dockToEdge always inserts the panel
+being processed as the new OUTERMOST column (client/src/dock/
+layoutOps.test.ts -- the opposite of what PanelHandle.dock_left's own
+Python docstring claims). So preview_panel is add_panel()'ed (and, to be
+robust either way, also dock_left()'ed) FIRST, main_panel SECOND (see
+main()), landing main_panel at the screen edge and preview_panel pushed
+inward beside it. The outer one, "main" (300px wide), holds every button,
+split into "Calibration" and "Capture" tabs
+(Calibration is added first so it's the one showing on a fresh boot --
+viser exposes no way to detect or set which tab is active from Python,
+GuiTabHandle/GuiTabGroupHandle have neither an on-select callback nor an
+observable "active" state, confirmed via introspection -- so tab-add order
+is the only lever available). The inner one, "live view" (960px, sized for
+its grid), holds nothing but live camera imagery and each camera's
+metrics, in one of two views: a 2-column HTML grid of every camera's
+thumbnail (base64 JPEG data URIs, that camera's status lines baked in as
+text underneath -- native GUI widgets only stack in one column with no
+grid/row layout, confirmed via introspection, so a raw HTML block is the
+only way to get a real grid, and per-camera markdown can't be interleaved
+between its cells), or a single native image widget showing just the
+"middle"/selected camera (highlighted green among the 3D view's frustums,
+see wire_frustum_click and the main loop's per-tick highlight block) plus
+its own metrics below it as markdown. view_state["mode"] ("Grid" or
+"Single camera") toggles which is visible -- a direct, explicit choice via
+a "Live view shows" dropdown mirrored on both main_panel tabs (_set_view),
+defaulting to Grid (so the app starts in the grid view). This can't be
+inferred from anything else: two earlier attempts (detection_state
+["enabled"], then app_state["mode"]) both turned out wrong, since neither
+one actually tracks which main_panel tab is showing -- viser exposes no
+way to detect that from Python at all (GuiTabHandle/GuiTabGroupHandle have
+no on-select callback or observable "active" state).
+Per-camera Undistort checkboxes (plus an "Undistort all
+cameras" checkbox that sets every one of them at once, one-shot -- it
+doesn't stay synced if a per-camera checkbox is later toggled
+individually) live in the live-view panel, next to the grid, since
+they're a per-camera view option rather than a button; per-camera Reset
+buttons stay with the rest of the buttons in main.
 """
 import argparse
+import base64
+import html
 import os
 import queue
 import re
@@ -56,6 +101,7 @@ try:
 except ImportError:
     psutil = None
 
+import align_session
 import calibrate
 import camera_boot_stats
 import capture
@@ -187,39 +233,83 @@ def verify_floor_board(viser_mgr, sessions, cam_ids, loaded_cameras_candidate,
     return proceed_result["value"]
 
 
-def ensure_camera_panel_with_reset(viser_mgr, cam_id, cmd_queue):
-    """Same as ViserManager._ensure_camera_panel (calibrate.py), plus a
-    per-camera Reset button -- built here rather than in calibrate.py so
-    this stays an app.py-only change (calibrate.py's own standalone tool
-    doesn't get this button). Populates viser_mgr.cam_images/cam_status_md
-    directly, the same two dicts _ensure_camera_panel itself populates, so
-    update_thumbnail*/update_status keep working unmodified: they call
-    _ensure_camera_panel first, which no-ops as soon as cam_id is already
-    present in cam_images.
+def pick_middle_camera(cam_positions):
+    """cam_positions: {cam_id: np.ndarray[3]} for cameras with a currently
+    known pose (however rough -- works with as few as one, matching "as
+    soon as we have the pose somewhat"). Cameras are arranged in a
+    semicircle; the "middle" one is found by projecting each camera's
+    (x, y) position onto the group's own dominant spread axis (PCA's first
+    component) and taking the median along it.
 
-    The button sends "reset <cam_id>" on the same cmd_queue the sidebar's
-    Save/Uncache buttons use -- reuses the main loop's existing per-camera
-    reset command handling (calibrate.py:1415's `elif cmd.startswith("reset")`
-    logic, mirrored in app.py's own cmd_queue drain), so it only takes
-    effect during a live calibration session, same as those.
+    Deliberately NOT "angle around the centroid": for a semicircle (not a
+    full circle), the point cloud's centroid sits well inside the arc, not
+    at its true center, which biases angle-based ordering -- confirmed via
+    a synthetic 5-camera semicircle test where it picked the wrong (2nd,
+    not 3rd/true-middle) camera. Projecting onto the dominant spread axis
+    doesn't depend on knowing the arc's actual center at all.
     """
-    if cam_id in viser_mgr.cam_images:
-        return
-    with viser_mgr.server.gui.add_folder(cam_id):
-        viser_mgr.cam_images[cam_id] = viser_mgr.server.gui.add_image(
-            np.zeros((4, 4, 3), dtype=np.uint8), label="live",
+    if not cam_positions:
+        return None
+    items = list(cam_positions.items())
+    if len(items) == 1:
+        return items[0][0]
+    positions_xy = np.array([p[:2] for _, p in items])
+    centered = positions_xy - positions_xy.mean(axis=0)
+    _u, _s, vt = np.linalg.svd(centered)
+    primary_axis = vt[0]
+    projections = centered @ primary_axis
+    median_idx = np.argsort(projections)[len(projections) // 2]
+    return items[median_idx][0]
+
+
+def build_camera_grid_html(cam_ids, latest_preview_frames, metrics=None):
+    """2-column CSS grid of base64-embedded JPEG thumbnails, each camera's
+    status lines baked in as plain text underneath -- the only way to get
+    both a real multi-column layout AND per-camera-positioned text out of
+    viser (its native GUI widgets only stack in a single column with no
+    grid/row/column container, confirmed via introspection, so a native
+    markdown widget can't be interleaved between grid cells). latest_
+    preview_frames holds whatever Pass 1 last decoded for each camera
+    (already undistorted per-camera if that toggle is on, already
+    coverage-overlaid in calibrate mode). metrics is an optional
+    {cam_id: [line, ...]} of plain-text status lines -- HTML-escaped here
+    so callers don't have to.
+    """
+    metrics = metrics or {}
+    cells = []
+    for cam_id in cam_ids:
+        frame = latest_preview_frames.get(cam_id)
+        if frame is None:
+            image_html = (
+                '<div style="aspect-ratio:16/9;background:#333;color:#aaa;'
+                'display:flex;align-items:center;justify-content:center">no signal</div>'
+            )
+        else:
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            image_html = (
+                f'<img src="data:image/jpeg;base64,{base64.b64encode(buf).decode("ascii")}" '
+                f'style="width:100%;display:block">'
+                if ok else '<div style="color:#aaa">decode failed</div>'
+            )
+        metric_html = "".join(f"<div>{html.escape(line)}</div>" for line in metrics.get(cam_id, []))
+        cells.append(
+            f'<div><div style="text-align:center;font-size:12px">{cam_id}</div>'
+            f'{image_html}'
+            f'<div style="font-size:11px;color:#ccc">{metric_html}</div></div>'
         )
-        viser_mgr.cam_status_md[cam_id] = viser_mgr.server.gui.add_markdown("_waiting for data..._")
-        reset_btn = viser_mgr.server.gui.add_button(f"Reset {cam_id}")
-        reset_btn.on_click(lambda _: cmd_queue.put(f"reset {cam_id}"))
+    return (
+        '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:4px">'
+        + "".join(cells) + "</div>"
+    )
 
 
 def maybe_undistort(frame, K, dist, display_size, record_size):
     """K=None means "no usable intrinsics for this camera right now" (not
     yet converged / not in the loaded file / uncalibrated mode) -- returns
-    frame unchanged rather than raising, which is what lets the global
-    undistort toggle apply blindly across every camera regardless of
-    whether each one actually has intrinsics yet.
+    frame unchanged rather than raising, which is what lets the "Undistort
+    all cameras" checkbox apply blindly across every camera regardless of
+    whether each one actually has intrinsics yet (Pass 1 prints a one-time
+    warning per camera in this situation instead).
 
     K is computed for the FULL recording resolution, but frame is at the
     smaller preview resolution -- fx/fy/cx/cy scale with resolution, so K
@@ -551,15 +641,27 @@ def boot_cameras(viser_mgr, cfg):
                 status_rows[info.deviceId].content = f"`{info.deviceId}` -- **FAILED**: {exc}"
                 print(f"[Error] {cam_id} ({info.deviceId}) failed to boot: {exc}")
 
-        close_btn = viser_mgr.server.gui.add_button("Continue")
-        done = threading.Event()
-        close_btn.on_click(lambda _: done.set())
-        # Wait for the operator to actually click through -- important when
-        # there's a failure to read, and `with modal:` itself does NOT close
-        # the modal on exit (it only stops routing new GUI elements into it),
-        # so without an explicit close() below the modal would stay on screen
-        # forever regardless of this wait.
-        done.wait()
+        # Skip the click-through entirely when every discovered device
+        # booted AND is running USB3 ("SuperSpeed" -- dai.UsbSpeed.SUPER/
+        # SUPER_PLUS, the same check_usb_speed.py/capture.py already use to
+        # flag a USB2-class bottleneck risk): nothing to read, nothing to
+        # decide. A boot failure (sessions shorter than device_infos) or
+        # any USB2-class camera still needs the operator's eyes before
+        # proceeding, so those cases keep the button + wait unchanged.
+        all_healthy = len(sessions) == len(device_infos) and all(
+            sess.usb_speed in (dai.UsbSpeed.SUPER, dai.UsbSpeed.SUPER_PLUS)
+            for sess in sessions.values()
+        )
+        if not all_healthy:
+            close_btn = viser_mgr.server.gui.add_button("Continue")
+            done = threading.Event()
+            close_btn.on_click(lambda _: done.set())
+            # Wait for the operator to actually click through -- important
+            # when there's a failure to read, and `with modal:` itself does
+            # NOT close the modal on exit (it only stops routing new GUI
+            # elements into it), so without an explicit close() below the
+            # modal would stay on screen forever regardless of this wait.
+            done.wait()
     modal.close()
     return sessions
 
@@ -591,6 +693,13 @@ def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrin
 
     while True:
         with viser_mgr.server.gui.add_modal("Calibration") as modal:
+            with viser_mgr.server.gui.add_folder("Get started"):
+                start_btn = viser_mgr.server.gui.add_button("Start new calibration", color="green")
+                start_btn.on_click(lambda _: cmd_queue.put(("start_calibration", None)))
+                skip_btn = viser_mgr.server.gui.add_button("Continue uncalibrated", color="red")
+                skip_btn.on_click(lambda _: cmd_queue.put(("uncalibrated", None)))
+            viser_mgr.server.gui.add_divider()
+
             camera_lines = []
             for cam_id in cam_ids:
                 session = sessions[cam_id]
@@ -631,10 +740,6 @@ def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrin
                     "_Mismatched calibrations (different camera set -- can't be loaded):_\n\n"
                     + "\n".join(lines)
                 )
-            start_btn = viser_mgr.server.gui.add_button("Start new calibration")
-            start_btn.on_click(lambda _: cmd_queue.put(("start_calibration", None)))
-            skip_btn = viser_mgr.server.gui.add_button("Continue uncalibrated")
-            skip_btn.on_click(lambda _: cmd_queue.put(("uncalibrated", None)))
 
         choice = cmd_queue.get()  # blocks the setup thread until the operator picks one
         modal.close()
@@ -734,27 +839,10 @@ def main():
         print("[Calibration] Continuing uncalibrated.")
 
     # ── Persistent GUI chrome ───────────────────────────────────────────────
-    # cmd_queue is also used below by the per-camera Reset buttons, so it's
-    # created here rather than further down where the rest of the sidebar
-    # controls live.
+    # cmd_queue is also used by the Calibration tab's Save/Uncache/per-camera
+    # Reset buttons (built further down, alongside the Capture tab), so it's
+    # created up front rather than closer to where those live.
     cmd_queue = queue.Queue()
-
-    # Live previews get their own standalone, dockable panel (viser.PanelHandle,
-    # 1.1.0+) on the left, instead of living in the default sidebar with
-    # everything else. ensure_camera_panel_with_reset only *creates* each
-    # camera's folder/widgets the first time it's called (cam_id in
-    # viser_mgr.cam_images guards it, same as calibrate.py's own
-    # _ensure_camera_panel, which it defers to once the entry already
-    # exists) -- calling it once here, inside the panel's tab, is enough to
-    # route those folders into this panel; later update_thumbnail*/
-    # update_status calls just mutate the already-created handles and don't
-    # care what container is "current" at that point.
-    preview_panel = viser_mgr.server.gui.add_panel()
-    with preview_panel.add_tab("Cameras"):
-        for cam_id in cam_ids:
-            ensure_camera_panel_with_reset(viser_mgr, cam_id, cmd_queue)
-    preview_panel.dock_left()
-    preview_panel.set_width(252)  # 70% of the previous 360
 
     viser_mgr.add_connection_banner()
     camera_settings_folder = viser_mgr.add_camera_settings_panel()  # static readout of the starting config values
@@ -810,21 +898,6 @@ def main():
         exposure_btn = viser_mgr.server.gui.add_button("Exposure...")
         exposure_btn.on_click(lambda _: open_exposure_modal())
 
-    # Global "Undistort views" toggle -- pure display flag, no device access,
-    # so it's safe to flip directly from the callback thread (unlike
-    # anything touching dai pipelines/queues). Applied in Pass 1 to every
-    # camera's preview thumbnail via maybe_undistort, which gracefully
-    # passes a frame through unchanged for any camera lacking real
-    # intrinsics for the current mode.
-    undistort_state = {"enabled": False}
-    undistort_btn = viser_mgr.server.gui.add_button("Undistort views: OFF")
-
-    def _toggle_undistort(_):
-        undistort_state["enabled"] = not undistort_state["enabled"]
-        undistort_btn.label = f"Undistort views: {'ON' if undistort_state['enabled'] else 'OFF'}"
-
-    undistort_btn.on_click(_toggle_undistort)
-
     viser_mgr.add_view_controls()
 
     def request_world_alignment():
@@ -838,8 +911,66 @@ def main():
 
     # Lets the operator pause the expensive part of Pass 2 (both the full-res
     # JPEG decode and ChArUco detection -- see poll()'s decode_full param,
-    # which this toggle also gates) without leaving calibrate mode entirely.
+    # which this toggle also gates). detection_state["enabled"] is ONLY
+    # about that detect/solve pipeline now -- it deliberately does NOT
+    # decide what the live-preview panel shows (see show_grid in the main
+    # loop for that, keyed off app_state["mode"]/capture_state["phase"]
+    # instead). The two used to share one flag; that was a bug (the Capture
+    # tab's "sanity check" checkbox could force the grid open during actual
+    # capture work), fixed by decoupling them. Two checkboxes (one per
+    # main_panel tab) both read/write this same flag; see _set_detection.
     detection_state = {"enabled": True}
+
+    # Per-camera undistort, set all at once via the "Undistort all cameras"
+    # checkbox in the live-preview panel (there's no per-camera control
+    # anymore -- see _set_undistort_all). Absent key == off, same as
+    # capture_preview below.
+    undistort_state = {}
+
+    # Cameras that currently have undistort enabled but no usable
+    # intrinsics yet (maybe_undistort is silently passing the raw frame
+    # through) -- surfaced as a per-camera metrics line (see
+    # per_cam_metrics in the main loop) instead of a console print.
+    # Rebuilt fresh every tick in Pass 1, so this needs no throttling the
+    # way a print-based warning would.
+    undistort_missing_intrinsics = set()
+
+    # wired_frustum_clicks tracks which camera frustums already have their
+    # on_click handler attached (frustum handles are created once and
+    # reused across pose updates -- attaching twice would double-fire a
+    # click).
+    wired_frustum_clicks = set()
+
+    # Capture mode's single live preview: which camera, and whether that
+    # choice is still auto-picked (pick_middle_camera, re-run every tick
+    # pose data is available) or a manual override from clicking a frustum
+    # in the 3D view (see Pass 2 below).
+    capture_preview = {"selected": None, "auto": True}
+
+    # Explicit, operator-controlled choice of what the live-preview panel
+    # shows -- "grid" (all cameras + metrics) or "single" (the selected
+    # camera, highlighted in 3D). This can NOT be inferred from anything
+    # else: viser exposes no way to detect which main_panel tab is actually
+    # showing (GuiTabHandle/GuiTabGroupHandle have no on-select callback or
+    # observable "active" state, confirmed via introspection), and two
+    # earlier attempts to guess a proxy for it (detection_state["enabled"],
+    # then app_state["mode"]) both turned out wrong in practice -- neither
+    # one actually tracks which tab the operator is looking at. A real
+    # button/dropdown click is the only signal Python can trust, so this is
+    # driven by one, mirrored on both main_panel tabs (see _set_view below).
+    # "Grid" | "Single camera" -- defaults to Grid, matching "always start
+    # the app in calibration".
+    view_state = {"mode": "Grid"}
+
+    # Populated by Pass 1 each tick: cam_id -> latest (possibly undistorted/
+    # coverage-overlaid) preview frame. Read by both the live-preview
+    # panel's grid and its single Capture-view image, so neither has to
+    # re-decode or duplicate that per-camera logic.
+    latest_preview_frames = {}
+
+    grid_state = {"last_update_mono": 0.0}
+
+    mode_cmd_queue = queue.Queue()  # separate from cmd_queue: must work in any app_state["mode"]
 
     # ── Capture mode state -- see README.md's "Capture mode" section ────────
     capture_cmd_queue = queue.Queue()  # separate from cmd_queue: must work in any app_state["mode"]
@@ -849,61 +980,268 @@ def main():
         "take_n": 0,
         "take_name": None,
         "take_dir": None,
+        # Every take this session, oldest first -- {take_n, take_name,
+        # take_dir, start_time_unix, stop_time_unix (None while recording)}.
+        # Unlike the fields above (which only ever hold the CURRENT/latest
+        # take, overwritten in place by _do_start_take), this accumulates,
+        # so the Capture tab's takes list (see the main loop) can show every
+        # take's length and postprocessing status, not just the latest.
+        "takes": [],
     }
     perf_state = {"cpu_pcts": [], "last_sample_mono": 0.0, "throttled": False}
     preview_mode = {"choice": "Auto"}  # "Auto" | "Always on" | "Always off"
     postproc = postprocess.PostprocessWorker()
     postproc.start()
 
-    # add_tab_group() itself is a plain handle, not a context manager -- only
-    # the individual add_tab(...) handles support `with`.
-    mode_cmd_queue = queue.Queue()  # separate from cmd_queue: must work in any app_state["mode"]
+    # Panel ORDER here (which is created first) is what actually determines
+    # left-to-right position, NOT the order dock_left() is called (that was
+    # last turn's wrong fix). Confirmed by reading viser's client source:
+    # the placement coordinator applies every panel's position in
+    # Object.keys(panels) order -- i.e. panel-creation/registration order --
+    # regardless of when each one's dock_left() command was issued
+    # (client/src/ControlPanel/placementCoordinator.tsx: "for (const uuid of
+    # Object.keys(panels)) processPanel(uuid)"), and dockToEdge always
+    # inserts the panel being processed as the NEW OUTERMOST column
+    # (client/src/dock/layoutOps.test.ts: "docks to the far-left (outermost)
+    # when the edge already has content" -- the opposite of what
+    # PanelHandle.dock_left's own Python docstring claims). So whichever
+    # panel is CREATED (add_panel()'ed) second ends up outermost (at the
+    # screen edge), pushing the first-created one inward. To land main_panel
+    # at the screen edge with preview_panel to its right, preview_panel must
+    # be created (and, to be robust to any arrival-order-vs-registration-
+    # order subtlety, also docked) FIRST, main_panel SECOND.
 
-    tab_group = viser_mgr.server.gui.add_tab_group()
-    with tab_group.add_tab("Calibrate"):
-        mode_md = viser_mgr.server.gui.add_markdown(
-            f"Mode: **{app_state['mode']}**. Use Save/Uncache below, or each camera's own "
-            f"Reset button in the live-preview panel, during a live session."
+    # Live-preview panel: imagery and per-camera metrics only, no buttons
+    # (except the single "Undistort all cameras" checkbox -- a view option,
+    # grouped here with the camera displays rather than with the rest of
+    # the buttons in main_panel). Both views live in the same tab
+    # and are toggled via .visible in the main loop (see show_grid, driven
+    # by view_state["mode"] -- the explicit "Live view shows" dropdown,
+    # since viser can't tell Python which main_panel tab is showing): the
+    # grid (all cameras, metrics baked into the HTML -- see
+    # build_camera_grid_html) while view_state["mode"] == "Grid", the
+    # single selected-camera image (plus its own metrics as markdown, and
+    # that camera highlighted green in the 3D view -- see the main loop's
+    # frustum highlight block) otherwise.
+    preview_panel = viser_mgr.server.gui.add_panel()
+    with preview_panel.add_tab("Live view"):
+        grid_html = viser_mgr.server.gui.add_html(build_camera_grid_html(cam_ids, latest_preview_frames))
+        capture_preview_image = viser_mgr.server.gui.add_image(
+            np.zeros((4, 4, 3), dtype=np.uint8), label="live",
         )
-        start_calibration_btn = viser_mgr.server.gui.add_button("Start new calibration")
-        start_calibration_btn.on_click(lambda _: mode_cmd_queue.put("start_calibration_live"))
-        detection_checkbox = viser_mgr.server.gui.add_checkbox(
-            "ChArUco detection enabled", initial_value=True,
+        capture_preview_status_md = viser_mgr.server.gui.add_markdown("_waiting for data..._")
+        undistort_all_checkbox = viser_mgr.server.gui.add_checkbox(
+            "Undistort all cameras", initial_value=False,
         )
 
-        def _toggle_detection(_):
-            detection_state["enabled"] = detection_checkbox.value
-            if not detection_checkbox.value:
-                # Hide rather than freeze -- the checkbox itself already
-                # makes the paused state obvious, so a stale-looking board
-                # pose left on screen would be misleading, not just old.
-                for cam_id in cam_ids:
-                    viser_mgr.hide_board_pose(cam_id)
+    def _set_undistort_all(enabled):
+        """undistort_all_checkbox is the only operator control now
+        (per-camera checkboxes removed) -- fans a single toggle out to
+        every camera's undistort_state entry. Cameras without usable
+        intrinsics yet just silently keep showing their raw frame (see
+        maybe_undistort's K=None passthrough and the per-camera metrics
+        warning in Pass 1 below).
+        """
+        for cam_id in cam_ids:
+            undistort_state[cam_id] = enabled
 
-        detection_checkbox.on_update(_toggle_detection)
+    undistort_all_checkbox.on_update(lambda _: _set_undistort_all(undistort_all_checkbox.value))
+    preview_panel.dock_left()
+    preview_panel.set_width(960)  # 2 wide columns, room for each camera's baked-in metrics text
+
+    # Main/leftmost panel: buttons only, nothing else. Two tabs, Calibration
+    # added first -- since viser can't switch tabs from Python (see
+    # detection_state's comment above), tab-add order is the only lever for
+    # "always start the app in calibration" for THIS panel; the live-preview
+    # panel above doesn't have that problem since it isn't tab-based, it
+    # just shows/hides its two views directly off show_grid.
+    main_panel = viser_mgr.server.gui.add_panel()
+    with main_panel.add_tab("Calibration"):
+        mode_md = viser_mgr.server.gui.add_markdown(f"Mode: **{app_state['mode']}**")
+        calibration_view_dropdown = viser_mgr.server.gui.add_dropdown(
+            "Live view shows", ("Grid", "Single camera"), initial_value=view_state["mode"],
+        )
+        start_btn = viser_mgr.server.gui.add_button("Start new calibration")
+        start_btn.on_click(lambda _: mode_cmd_queue.put("start_calibration_live"))
+
+        calibration_detection_checkbox = viser_mgr.server.gui.add_checkbox(
+            "ChArUco detection enabled", initial_value=detection_state["enabled"],
+        )
+
         viser_mgr.add_world_alignment_button(request_world_alignment)
-        # Inline Save/Uncache-all (not calibrate.py's shared add_global_controls,
-        # which also has a "Reset all" button -- redundant here since "Start
-        # new calibration" above already does that same reset; per-camera
-        # reset lives under each camera's own live-preview panel instead,
-        # see ensure_camera_panel_with_reset). Kept app.py-only on purpose.
-        with viser_mgr.server.gui.add_folder("Controls"):
-            save_button = viser_mgr.server.gui.add_button("Save now")
-            save_button.on_click(lambda _: cmd_queue.put("save"))
-            uncache_button = viser_mgr.server.gui.add_button("Uncache all intrinsics")
-            uncache_button.on_click(lambda _: cmd_queue.put("uncache all"))
-    with tab_group.add_tab("Capture"):
+
+        save_button = viser_mgr.server.gui.add_button("Save now")
+        save_button.on_click(lambda _: cmd_queue.put("save"))
+        uncache_button = viser_mgr.server.gui.add_button("Uncache all intrinsics")
+        uncache_button.on_click(lambda _: cmd_queue.put("uncache all"))
+
+        for cam_id in cam_ids:
+            reset_btn = viser_mgr.server.gui.add_button(f"Reset {cam_id}")
+            reset_btn.on_click(lambda _, c=cam_id: cmd_queue.put(f"reset {c}"))
+
+    capture_tab = main_panel.add_tab("Capture")
+    with capture_tab:
+        capture_view_dropdown = viser_mgr.server.gui.add_dropdown(
+            "Live view shows", ("Grid", "Single camera"), initial_value=view_state["mode"],
+        )
         preview_mode_dropdown = viser_mgr.server.gui.add_dropdown(
-            "Live previews", ("Auto", "Always on", "Always off"), initial_value="Auto",
+            "Live previews", ("Auto", "Always on", "Always off"), initial_value=preview_mode["choice"],
         )
         preview_mode_dropdown.on_update(
             lambda _: preview_mode.__setitem__("choice", preview_mode_dropdown.value)
         )
+        capture_detection_checkbox = viser_mgr.server.gui.add_checkbox(
+            "ChArUco detection enabled (sanity check)", initial_value=detection_state["enabled"],
+        )
         capture_status_md = viser_mgr.server.gui.add_markdown("_Idle._")
-        capture_btn = viser_mgr.server.gui.add_button("Start capture")
+        capture_btn = viser_mgr.server.gui.add_button("Start capture", color="green")
         capture_btn.on_click(lambda _: capture_cmd_queue.put(
             "stop" if capture_state["phase"] == "recording" else "start"
         ))
+        viser_mgr.server.gui.add_divider()
+        no_takes_md = viser_mgr.server.gui.add_markdown("_No takes yet._")
+
+    main_panel.dock_left()
+    main_panel.set_width(300)
+
+    # take_n -> {"label_md": GuiMarkdownHandle, "play_btn": GuiButtonHandle},
+    # one pair per take, built by _build_take_row as each take starts (see
+    # _do_start_take) and kept updated in place every main-loop tick (see
+    # the "Rebuild each take's row" block below) rather than torn down and
+    # rebuilt, since viser has no way to reorder/replace GUI children --
+    # only ever append within capture_tab.
+    take_row_widgets = {}
+
+    def _open_take_video_modal(take):
+        """Play a postprocessed take's grid video in a modal by decoding it
+        with cv2 and pushing frames through a GuiImageHandle's .image --
+        exactly the mechanism the live-preview panel already uses for
+        camera frames (see capture_preview_image.image = ... in the main
+        loop below). A first version instead pointed a raw <video src=...>
+        tag (via add_html) at a second static-file HTTP server; that never
+        rendered anything in real use, and there's no way to open the
+        browser's console/network tab from here to diagnose why. Reusing
+        the frame-push channel that's already proven to work end-to-end in
+        this app sidesteps the whole serving/cross-port/HTML-injection path.
+        """
+        grid_video_path = align_session.grid_mp4_path(os.path.join(take["take_dir"], "processed"))
+        stop_event = threading.Event()
+
+        modal = viser_mgr.server.gui.add_modal(f"Take {take['take_n']} -- grid video")
+        with modal:
+            # viser's add_modal has no width control (its GuiModalMessage
+            # carries only title/order), and Mantine's default modal renders
+            # at a fixed ~407px regardless of content -- confirmed via
+            # Playwright that even an !important CSS override of `width`
+            # alone does nothing, because Mantine sizes the dialog through
+            # flex-basis, not width, so width has no effect on a flex child
+            # with a fixed flex-basis. Forcing all three (width, max-width,
+            # flex-basis) via JS after the dialog exists is what actually
+            # works. There's no direct Python->JS bridge (add_html sinks
+            # through dangerouslySetInnerHTML, which never runs <script>
+            # tags), so this reuses the same img-onerror trick as the
+            # hostname lookup earlier in this file's history: image loads
+            # are a real async network request, so onerror always fires,
+            # regardless of how the <img> was inserted -- unlike the <svg
+            # onload=...> tried first for that, which empirically never
+            # fired for a programmatically-inserted inline SVG. The retry
+            # loop matters: onerror can fire before Mantine's modal
+            # transition has actually attached .mantine-Modal-content to
+            # the DOM (confirmed via Playwright -- a bare, unretried lookup
+            # intermittently found no ancestor and silently did nothing).
+            # 1221px = 3x the measured ~407px default, per the user's ask;
+            # max-width keeps it from overflowing a narrower browser window.
+            viser_mgr.server.gui.add_html(
+                '<img src="__resolve_modal_size__" style="display:none" onerror="'
+                "const self = this; let tries = 0; (function widen() { "
+                "const c = self.closest('.mantine-Modal-content'); "
+                "if (c) { "
+                "c.style.setProperty('width', '1221px', 'important'); "
+                "c.style.setProperty('max-width', '90vw', 'important'); "
+                "c.style.setProperty('flex-basis', '1221px', 'important'); "
+                "self.remove(); "
+                "} else if (tries++ < 20) { setTimeout(widen, 50); } "
+                "else { self.remove(); }"
+                "})();"
+                '">'
+            )
+            video_image = viser_mgr.server.gui.add_image(np.zeros((4, 4, 3), dtype=np.uint8))
+            status_md = viser_mgr.server.gui.add_markdown("_Loading..._")
+            close_btn = viser_mgr.server.gui.add_button("Close")
+
+        def _close(_):
+            stop_event.set()
+            modal.close()
+
+        close_btn.on_click(_close)
+
+        def _playback_loop():
+            cap = cv2.VideoCapture(grid_video_path)
+            if not cap.isOpened():
+                status_md.content = f"_Could not open `{grid_video_path}`_"
+                return
+            fps = cap.get(cv2.CAP_PROP_FPS) or cfg["camera"]["fps"]
+            frame_period_s = 1.0 / fps
+            status_md.visible = False
+            try:
+                while not stop_event.is_set():
+                    ok, frame_bgr = cap.read()
+                    if not ok:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop back to the start
+                        continue
+                    video_image.image = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    stop_event.wait(frame_period_s)
+            finally:
+                cap.release()
+
+        threading.Thread(target=_playback_loop, daemon=True).start()
+
+    def _build_take_row(take):
+        no_takes_md.visible = False
+        with capture_tab:
+            label_md = viser_mgr.server.gui.add_markdown("")
+            play_btn = viser_mgr.server.gui.add_button("Play video", visible=False)
+        play_btn.on_click(lambda _: _open_take_video_modal(take))
+        take_row_widgets[take["take_n"]] = {"label_md": label_md, "play_btn": play_btn}
+
+    def _set_detection(enabled):
+        """Shared by both tabs' checkboxes -- keeps them in sync (only one
+        tab is visible at a time, but the other's value should still be
+        correct whenever the operator switches to it) and centralizes the
+        hide-board-poses-on-off behavior. Deliberately does NOT touch the
+        live-preview panel's grid/single-image visibility -- see _set_view
+        below for that. The two used to share detection_state as one flag;
+        that was a bug (the Capture tab's "sanity check" checkbox forced the
+        grid open even during capture work), and a later attempt to key
+        visibility off app_state["mode"] instead was ALSO wrong (mode stays
+        "calibrate" across both tabs until the operator explicitly loads/
+        starts something else, so it doesn't track which tab is showing
+        either) -- there is no way to infer this from any other state,
+        confirmed via introspection (GuiTabHandle/GuiTabGroupHandle have no
+        on-select callback or observable "active" state), so it's now a
+        direct, explicit choice instead of an inference.
+        """
+        detection_state["enabled"] = enabled
+        capture_detection_checkbox.value = enabled
+        calibration_detection_checkbox.value = enabled
+        if not enabled:
+            for cam_id in cam_ids:
+                viser_mgr.hide_board_pose(cam_id)
+
+    def _set_view(mode):
+        """Shared by both tabs' "Live view shows" dropdowns -- the ONLY
+        thing that decides grid vs. single-camera in the live-preview panel
+        (see show_grid in the main loop). Kept in sync the same way as
+        _set_detection's pair of checkboxes.
+        """
+        view_state["mode"] = mode
+        calibration_view_dropdown.value = mode
+        capture_view_dropdown.value = mode
+
+    capture_detection_checkbox.on_update(lambda _: _set_detection(capture_detection_checkbox.value))
+    calibration_detection_checkbox.on_update(lambda _: _set_detection(calibration_detection_checkbox.value))
+    capture_view_dropdown.on_update(lambda _: _set_view(capture_view_dropdown.value))
+    calibration_view_dropdown.on_update(lambda _: _set_view(calibration_view_dropdown.value))
 
     if action == "load_and_capture":
         # Skip the button click entirely -- "Load & start capture" already
@@ -911,7 +1249,7 @@ def main():
         # phase here means the main loop's existing starting-phase handling
         # (_do_start_take, below) kicks off take_1 on its very first tick.
         capture_state["phase"] = "starting"
-        capture_btn.label, capture_btn.disabled = "Starting...", True
+        capture_btn.label, capture_btn.disabled, capture_btn.color = "Starting...", True, "red"
         capture_status_md.content = "_Starting take..._"
 
     # Always-visible shutdown control -- styled as a clearly destructive
@@ -954,6 +1292,10 @@ def main():
             for cam_id in cam_ids:
                 viser_mgr.remove_camera_pose(cam_id)
             viser_mgr.hide_alignment_board_pose("origin")
+            # remove_camera_pose destroys the frustum handle -- the next
+            # pose update creates a fresh one, which needs its on_click
+            # re-wired (see Pass 2's frustum-click-wiring block).
+            wired_frustum_clicks.clear()
             print("[Reset] Pose graph and world alignment cleared.")
         elif target in calib_states:
             stale = [key for key in pose_graph.observations if target in key]
@@ -962,6 +1304,29 @@ def main():
             viser_mgr.remove_camera_pose(target)
             if stale:
                 print(f"[Reset] {target}: {len(stale)} pose-graph edge(s) cleared.")
+
+    def wire_frustum_click(cam_id):
+        """Attaches the click-to-select-for-Capture-preview handler to a
+        camera's frustum, once -- frustum handles are created once and
+        reused across pose updates (calibrate.py's update_camera_pose only
+        creates a new one if cam_id isn't already in viser_mgr.frustums), so
+        calling on_click twice would double-fire a single click. Coloring
+        itself happens centrally, every tick (see the main loop's frustum
+        highlight block below), not here -- so the highlight stays correct
+        for an auto-picked selection too, not just a manual click.
+        """
+        if cam_id in wired_frustum_clicks:
+            return
+        frustum = viser_mgr.frustums.get(cam_id)
+        if frustum is None:
+            return
+        wired_frustum_clicks.add(cam_id)
+
+        def _on_click(_):
+            capture_preview["selected"] = cam_id
+            capture_preview["auto"] = False
+
+        frustum.on_click(_on_click)
 
     def start_new_calibration_live():
         """Same as picking 'Start new calibration' at boot (main()'s own
@@ -983,10 +1348,7 @@ def main():
             )
             viser_mgr.hide_board_pose(cam_id)
         clear_extrinsics_for("all")
-        mode_md.content = (
-            "Mode: **calibrate**. Use Save/Uncache below, or each camera's own "
-            "Reset button in the live-preview panel, during a live session."
-        )
+        mode_md.content = "Mode: **calibrate**"
         print("[Calibration] Live calibration (re)started.")
 
     def write_take_meta(take_dir, cameras_meta):
@@ -1036,6 +1398,15 @@ def main():
         )
         os.makedirs(take_dir, exist_ok=True)
         capture_state["take_dir"] = take_dir
+        new_take = {
+            "take_n": capture_state["take_n"],
+            "take_name": capture_state["take_name"],
+            "take_dir": take_dir,
+            "start_time_unix": time.time(),
+            "stop_time_unix": None,
+        }
+        capture_state["takes"].append(new_take)
+        _build_take_row(new_take)
 
         if app_state["mode"] == "loaded":
             calibration_line = f"calibration_mode=loaded calibration_path={loaded_calibration_path}"
@@ -1045,6 +1416,19 @@ def main():
             f"session_ts={capture_state['session_ts']} take_n={capture_state['take_n']} "
             f"take_name={capture_state['take_name']}",
             calibration_line,
+            # One-time snapshot of what the operator had the live-preview
+            # panel set to at the moment this take started -- NOT re-sampled
+            # during recording, so this only answers "what was going on
+            # when the take began," not a timeline of changes mid-take.
+            # detection_enabled logs pre_capture_enabled (the operator's
+            # setting before the mutual-exclusion logic force-disabled it
+            # for the take, set just above in the "starting"-phase handler)
+            # rather than detection_state["enabled"] itself, which is
+            # always False during a take by construction and would be
+            # useless for correlating detection with capture timing.
+            f"preview_mode={preview_mode['choice']} view_mode={view_state['mode']} "
+            f"detection_enabled={detection_state.get('pre_capture_enabled', False)} "
+            f"preview_camera={capture_preview['selected']}",
         ]
 
         cameras_meta = {}
@@ -1082,6 +1466,8 @@ def main():
                 session.end_recording()
         if capture_state["take_dir"] is not None:
             postproc.queue.put(capture_state["take_dir"])
+        if capture_state["takes"]:
+            capture_state["takes"][-1]["stop_time_unix"] = time.time()
         print(f"[Capture] {capture_state['take_name']} stopped -- queued for postprocessing.")
 
     runtime_cfg = cfg["runtime"]
@@ -1155,13 +1541,13 @@ def main():
             # before the wait rather than after.
             while not capture_cmd_queue.empty():
                 cmd = capture_cmd_queue.get()
-                if cmd == "start" and capture_state["phase"] == "idle":
+                if cmd == "start" and capture_state["phase"] == "idle" and not detection_state["enabled"]:
                     capture_state["phase"] = "starting"
-                    capture_btn.label, capture_btn.disabled = "Starting...", True
+                    capture_btn.label, capture_btn.disabled, capture_btn.color = "Starting...", True, "red"
                     capture_status_md.content = "_Starting take..._"
                 elif cmd == "stop" and capture_state["phase"] == "recording":
                     capture_state["phase"] = "stopping"
-                    capture_btn.label, capture_btn.disabled = "Stopping...", True
+                    capture_btn.label, capture_btn.disabled, capture_btn.color = "Stopping...", True, "green"
                     capture_status_md.content = "_Stopping..._"
 
             if capture_state["phase"] == "starting":
@@ -1174,25 +1560,60 @@ def main():
                 # so stopping restores it rather than always re-enabling.
                 detection_state["pre_capture_enabled"] = detection_state["enabled"]
                 if detection_state["enabled"]:
-                    detection_state["enabled"] = False
-                    detection_checkbox.value = False
-                    for cam_id in cam_ids:
-                        viser_mgr.hide_board_pose(cam_id)
+                    _set_detection(False)
                 _do_start_take()
                 capture_state["phase"] = "recording"
-                capture_btn.label, capture_btn.disabled = "Stop", False
+                capture_btn.label, capture_btn.disabled, capture_btn.color = "Stop", False, "red"
             elif capture_state["phase"] == "stopping":
                 _do_stop_take()
                 capture_state["phase"] = "idle"
-                capture_btn.label, capture_btn.disabled = "Start capture", False
+                capture_btn.label, capture_btn.disabled, capture_btn.color = "Start capture", False, "green"
                 capture_status_md.content = "_Idle._"
                 if detection_state.pop("pre_capture_enabled", False):
-                    detection_state["enabled"] = True
-                    detection_checkbox.value = True
+                    _set_detection(True)
 
             if capture_state["phase"] == "recording":
                 dot = "\U0001F534" if (time.time() % 1.0) < 0.5 else "⚪"
                 capture_status_md.content = f"{dot} **Recording** -- {capture_state['take_name']}"
+            elif capture_state["phase"] == "idle":
+                # Mutual exclusion: never let detection and recording run at
+                # once (confirmed via a real take that leaving detection on
+                # tanks recording fps ~5x) -- unlike the auto-off-during-a-
+                # take above, this additionally blocks *starting* a take at
+                # all while the operator has deliberately left detection on.
+                capture_btn.disabled = detection_state["enabled"]
+                capture_status_md.content = (
+                    "_Turn off ChArUco detection to capture._" if detection_state["enabled"] else "_Idle._"
+                )
+
+            # Every take this session, oldest first -- length, and whether
+            # postprocessing has produced its grid MP4 yet (plus a Play
+            # button once it has -- see _build_take_row/_open_take_video_modal
+            # above). One markdown+button pair per take (take_row_widgets),
+            # updated in place rather than rebuilding a single combined
+            # widget, since a Play button needs its own click handler per
+            # take. Cheap enough (a handful of takes, one small JSON read
+            # each) to just refresh every tick rather than throttle. Status
+            # comes from postprocess.read_status(), which reads the status
+            # file PostprocessWorker writes as it works ("queued" ->
+            # "processing" -> "done"/"failed") -- not inferred from whether
+            # the output mp4 exists, so a failed job shows as failed instead
+            # of stuck showing "processing...".
+            for take in capture_state["takes"]:
+                if take["stop_time_unix"] is not None:
+                    length_str = f"{take['stop_time_unix'] - take['start_time_unix']:.0f}s"
+                else:
+                    length_str = f"{time.time() - take['start_time_unix']:.0f}s (recording)"
+                status = postprocess.read_status(take["take_dir"])
+                status_str = {
+                    "queued": "queued for postprocessing",
+                    "processing": "processing...",
+                    "done": "postprocessed",
+                    "failed": f"postprocessing failed ({status.get('error', 'unknown error')})",
+                }.get(status["status"], status["status"])
+                row = take_row_widgets[take["take_n"]]
+                row["label_md"].content = f"Take {take['take_n']}: {length_str} -- {status_str}"
+                row["play_btn"].visible = status["status"] == "done"
 
             now = time.monotonic()
 
@@ -1230,8 +1651,23 @@ def main():
             else:  # Auto -- operator's explicit choice above always wins over this
                 previews_on = not perf_state["throttled"]
 
-            # Pass 1: fetch/decode every camera's latest frame -- always runs,
-            # regardless of mode, since live previews are always shown.
+            # Which live-preview view is showing -- a direct, explicit
+            # choice (view_state["mode"], set by the "Live view shows"
+            # dropdown mirrored on both main_panel tabs -- see _set_view),
+            # not inferred from detection_state or app_state["mode"]. Both
+            # of those were tried and both were wrong: neither one actually
+            # tracks which main_panel tab the operator is looking at, since
+            # viser exposes no way to detect that from Python at all.
+            show_grid = view_state["mode"] == "Grid"
+            grid_html.visible = show_grid
+            capture_preview_image.visible = not show_grid
+            capture_preview_status_md.visible = not show_grid
+
+            # Pass 1: fetch/decode every camera's latest frame. decode_preview
+            # is per-camera: every camera while the grid is showing (it
+            # needs all of them), otherwise only the single selected camera
+            # -- no reason to pay the decode cost for cameras nothing is
+            # showing.
             fresh_frames = {}
             for cam_id in cam_ids:
                 session = sessions[cam_id]
@@ -1250,15 +1686,12 @@ def main():
                 # use it this tick -- both "loaded" mode's sanity-check
                 # detection and "calibrate" mode's live detection are gated
                 # on the same ChArUco toggle (detection_state["enabled"]);
-                # "uncalibrated" never needs it at all. The toggle governing
-                # "loaded" mode too (not just "calibrate") is deliberate --
-                # it was previously wired to "calibrate" only, which made the
-                # checkbox silently do nothing in "loaded" mode. While
-                # actually recording this camera, the full-res packet is
-                # consumed by the recording write path instead (see poll()'s
-                # record= param) -- decode_full is moot there, and
+                # "uncalibrated" never needs it at all. While actually
+                # recording this camera, the full-res packet is consumed by
+                # the recording write path instead (see poll()'s record=
+                # param) -- decode_full is moot there, and
                 # detection_state["enabled"] is itself forced off for the
-                # duration of a take regardless of the checkbox (see the
+                # duration of a take regardless of any checkbox (see the
                 # "starting" phase transition below) specifically so this
                 # can't silently keep running during a recording.
                 recording_now = capture_state["phase"] == "recording" and session.recording_active
@@ -1267,9 +1700,12 @@ def main():
                     and detection_state["enabled"]
                     and app_state["mode"] in ("loaded", "calibrate")
                 )
+                decode_this_preview = previews_on and (
+                    show_grid or cam_id == capture_preview["selected"]
+                )
                 try:
                     got_frame = session.poll(
-                        decode_full=need_full_decode, decode_preview=previews_on, record=recording_now,
+                        decode_full=need_full_decode, decode_preview=decode_this_preview, record=recording_now,
                     )
                 except Exception as exc:
                     print(f"[Error] {cam_id} disconnected: {exc}")
@@ -1280,7 +1716,7 @@ def main():
                 if session.preview_updated and session.last_frame_preview is not None:
                     state = calib_states.get(cam_id)
                     preview_frame = session.last_frame_preview
-                    if undistort_state["enabled"]:
+                    if undistort_state.get(cam_id, False):
                         undistort_K = undistort_dist = None
                         if app_state["mode"] == "loaded":
                             entry = loaded_cameras.get(session.device_id)
@@ -1289,15 +1725,26 @@ def main():
                         elif (app_state["mode"] == "calibrate" and state is not None
                               and state.has_intrinsics_estimate):
                             undistort_K, undistort_dist = state.K, state.dist
+                        if undistort_K is None:
+                            undistort_missing_intrinsics.add(cam_id)
+                        else:
+                            undistort_missing_intrinsics.discard(cam_id)
                         preview_frame = maybe_undistort(
                             preview_frame, undistort_K, undistort_dist,
                             (cfg["camera"]["display_width"], cfg["camera"]["display_height"]),
                             (cfg["camera"]["record_width"], cfg["camera"]["record_height"]),
                         )
-                    if app_state["mode"] == "calibrate" and state is not None and not state.intrinsics_locked:
-                        viser_mgr.update_thumbnail(cam_id, preview_frame, state.coverage)
                     else:
-                        viser_mgr.update_thumbnail_raw(cam_id, preview_frame)
+                        undistort_missing_intrinsics.discard(cam_id)  # cleared once undistort is off
+                    if (detection_state["enabled"] and app_state["mode"] == "calibrate"
+                            and state is not None and not state.intrinsics_locked):
+                        preview_frame = calibrate.draw_coverage_overlay(preview_frame, state.coverage)
+                    latest_preview_frames[cam_id] = preview_frame
+                    if cam_id == capture_preview["selected"]:
+                        # Pushed even while capture_preview_image.visible is
+                        # False (detection currently on) so it's already
+                        # fresh the instant the operator switches views.
+                        capture_preview_image.image = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
 
                 if need_full_decode and got_frame and session.last_frame_full is not None:
                     fresh_frames[cam_id] = (session.last_frame_full, session.last_frame_full_ts)
@@ -1424,6 +1871,7 @@ def main():
                         if cam_id in pose_result["poses"]:
                             T_cam_to_world = calibrate.invert_T(pose_result["poses"][cam_id])
                             viser_mgr.update_camera_pose(cam_id, T_cam_to_world, state.K, *state.image_size)
+                            wire_frustum_click(cam_id)
                         else:
                             viser_mgr.mark_pose_unknown(cam_id)
 
@@ -1442,6 +1890,7 @@ def main():
                     T_cam_to_world = calibrate.invert_T(calibrate.rt_to_T(entry["R"], entry["t"]))
                     viser_mgr.update_camera_pose(cam_id, T_cam_to_world, entry["K"],
                                                   entry["width"], entry["height"])
+                    wire_frustum_click(cam_id)
                     if cam_id not in fresh_frames:
                         continue
                     frame, _frame_ts = fresh_frames[cam_id]
@@ -1466,26 +1915,89 @@ def main():
                 for cam_id in cam_ids:
                     viser_mgr.mark_pose_unknown(cam_id)
 
-            last_pass2_ms = (time.perf_counter() - pass2_t0) * 1000
+            # Capture preview's "middle camera" -- re-picked every tick from
+            # whatever poses currently exist (viser_mgr.frustums, populated
+            # by whichever Pass 2 branch above ran) as long as the operator
+            # hasn't manually clicked a different camera's frustum. Falls
+            # back to auto if a manually-selected camera disconnects, rather
+            # than showing a dead preview indefinitely.
+            if not capture_preview["auto"] and capture_preview["selected"] is not None:
+                sel_session = sessions.get(capture_preview["selected"])
+                if sel_session is None or not sel_session.connected:
+                    capture_preview["auto"] = True
+            if capture_preview["auto"]:
+                cam_positions = {
+                    cam_id: np.array(viser_mgr.frustums[cam_id].position)
+                    for cam_id in cam_ids if cam_id in viser_mgr.frustums
+                }
+                picked = pick_middle_camera(cam_positions)
+                if picked is not None:
+                    capture_preview["selected"] = picked
 
-            # Status panel: always shown, every mode -- fps is meaningful
-            # regardless of calibration state; the calibration-fitting-specific
-            # lines only make sense while a live session is actually running.
+            # Highlight whichever camera is selected (auto-picked or
+            # manually clicked, doesn't matter) green in the 3D view, every
+            # tick -- not just at click time -- so a freshly (re)created
+            # frustum (e.g. after a pose reset) still ends up the right
+            # color on its very next appearance.
             for cam_id in cam_ids:
-                session = sessions[cam_id]
+                frustum = viser_mgr.frustums.get(cam_id)
+                if frustum is not None:
+                    frustum.color = (
+                        (0, 255, 0) if cam_id == capture_preview["selected"] else (60, 140, 220)
+                    )
+
+            # Per-camera metrics -- computed every tick (cheap string
+            # formatting) since both the grid and the single Capture-view
+            # image want up-to-date numbers whenever they're actually
+            # visible. Plain text, not markdown: these lines get baked
+            # as escaped HTML into the grid AND used verbatim in the
+            # native capture_preview_status_md markdown widget below, so
+            # plain text is the only formatting both contexts render
+            # correctly. Coverage is deliberately NOT repeated here as a
+            # percentage: the red/green grid draw_coverage_overlay already
+            # paints it directly onto the thumbnail (Pass 1 above).
+            per_cam_metrics = {}
+            for cam_id in cam_ids:
                 state = calib_states[cam_id]
                 extra = []
                 if app_state["mode"] == "calibrate":
                     if state.intrinsics_locked:
-                        extra.append(f"_intrinsics: loaded from cache "
-                                     f"({state.reproj_error:.3f}px at save time)_")
+                        extra.append(f"intrinsics: loaded from cache "
+                                     f"({state.reproj_error:.3f}px at save time)")
                     if state.last_detection_ts is not None:
                         silent_for = time.time() - state.last_detection_ts
-                        if silent_for > runtime_cfg["no_detection_warning_s"]:
-                            extra.append(f"**no detection for {silent_for:.0f}s**")
+                        if silent_for > runtime_cfg["no_detection_warning_s"] and detection_state["enabled"]:
+                            extra.append(f"no detection for {silent_for:.0f}s")
                     elif state.connected:
-                        extra.append("**never detected the board yet**")
-                viser_mgr.update_status(cam_id, state, pose_graph.sample_count_for(cam_id), extra)
+                        extra.append("never detected the board yet")
+                if cam_id in undistort_missing_intrinsics:
+                    extra.append("undistort: enabled but no usable intrinsics -- showing raw frame")
+                reproj = f"{state.reproj_error:.3f} px" if state.has_intrinsics_estimate else "n/a"
+                per_cam_metrics[cam_id] = [
+                    f"samples for int: {state.sample_count()}",
+                    f"samples for ext: {pose_graph.sample_count_for(cam_id)}",
+                    f"reproj error: {reproj}",
+                    f"converged: {'yes' if state.converged else 'no'}",
+                    *extra,
+                ]
+
+            # Live-preview panel's grid -- throttled well below the main
+            # loop's own tick rate: JPEG-encoding+base64'ing every connected
+            # camera's frame every tick would be wasted work/bandwidth for
+            # something that only needs to look live, not match full fps.
+            # Gated on show_grid since the grid is hidden (and Pass 1 above
+            # isn't even decoding most cameras' previews) whenever it's
+            # False.
+            if show_grid and now - grid_state["last_update_mono"] >= 0.15:
+                grid_state["last_update_mono"] = now
+                grid_html.content = build_camera_grid_html(cam_ids, latest_preview_frames, per_cam_metrics)
+
+            if capture_preview["selected"] is not None:
+                capture_preview_status_md.content = "\n\n".join(
+                    per_cam_metrics.get(capture_preview["selected"], [])
+                )
+
+            last_pass2_ms = (time.perf_counter() - pass2_t0) * 1000
 
             viser_mgr.update_connection_banner([cam_id for cam_id in cam_ids if not sessions[cam_id].connected])
 
