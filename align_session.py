@@ -150,6 +150,35 @@ def parse_timestamp_log(log_path, host_offset_s=None):
     return entries
 
 
+def detect_sequence_gaps(entries):
+    """entries: parse_timestamp_log() output. A gap = consecutive entries
+    whose seq increases by more than 1 (dropped frame(s) at the device/USB
+    level -- sequence_num is a free-running per-device OAK counter, so a
+    gap here reflects a real drop, not a logging artifact). A decrease or
+    repeat is a distinct anomaly (device restart, log corruption) -- kept
+    separate rather than folded into the drop count, since it's a
+    different failure mode.
+    """
+    gaps, anomalies = [], []
+    for prev, cur in zip(entries, entries[1:]):
+        delta = cur["seq"] - prev["seq"]
+        if delta == 1:
+            continue
+        if delta > 1:
+            gaps.append({
+                "after_idx": cur["idx"], "before_seq": prev["seq"], "after_seq": cur["seq"],
+                "dropped_frames": delta - 1,
+                "before_host_ts_s": prev["host_ts_s"], "after_host_ts_s": cur["host_ts_s"],
+                "gap_duration_s": cur["host_ts_s"] - prev["host_ts_s"],
+            })
+        else:
+            anomalies.append({
+                "before_idx": prev["idx"], "after_idx": cur["idx"],
+                "before_seq": prev["seq"], "after_seq": cur["seq"],
+            })
+    return gaps, anomalies
+
+
 def nearest_entry(entries, slot_t, time_key="unified_ts_s"):
     if not entries:
         return None, None
@@ -466,6 +495,7 @@ def align_session(
                 f"{label}: log entries ({log_count}) != MJPEG frames ({video_count})"
             )
 
+        gaps, anomalies = detect_sequence_gaps(parsed[label])
         report["cameras"][label] = {
             "matched_frames": len(matched),
             "discarded_frames": len(discarded),
@@ -474,7 +504,51 @@ def align_session(
             "max_abs_offset_ms": max_off,
             "p95_abs_offset_ms": p95_off,
             "blue_placeholders": len(discarded) + len(missing),
+            # Sequence-number gaps -- a real device/USB-level frame drop
+            # (see detect_sequence_gaps). Rebuilt from the same parsed log
+            # entries already in scope here, no extra I/O.
+            "sequence_gaps": {
+                "count": len(gaps),
+                "total_dropped_frames": sum(g["dropped_frames"] for g in gaps),
+                "total_anomalies": len(anomalies),
+                "gaps": gaps,
+                "anomalies": anomalies,
+            },
+            # Per-slot offset (None at blue-placeholder slots) -- lets a
+            # viewer chart offset-over-time, and doubles as "which slots
+            # are placeholders for this camera" for anything sampling
+            # aligned/<label>/*.jpg by slot index (e.g. board-consistency
+            # checks, which must skip placeholder slots).
+            "slot_offsets_ms": [
+                m["offset_ms"] if m["status"] == "matched" else None for m in matches
+            ],
+            # Per-slot source frame index (this camera's own raw idx picked
+            # for each aligned slot; None at blue-placeholder slots) -- lets
+            # a viewer show frame-level adjustment: idx == slot means "used
+            # verbatim", idx drifting away from slot means frames are being
+            # held (repeated) or skipped to keep this camera in sync with
+            # the reference grid.
+            "slot_source_idx": [
+                m["idx"] if m["status"] == "matched" else None for m in matches
+            ],
         }
+        cam_times = [e[time_key] for e in parsed[label]]
+        report["cameras"][label]["crop"] = {
+            # Frames at the head/tail of this camera's own log that fall
+            # outside the cross-camera overlap window [t_start, t_end] --
+            # i.e. how much of THIS camera's own footage had to be thrown
+            # away to align all views, distinct from per-slot discarded/
+            # missing frames (which happen *inside* the overlap window).
+            "before_frames": sum(1 for t in cam_times if t < t_start),
+            "after_frames": sum(1 for t in cam_times if t > t_end),
+            "before_s": max(0.0, t_start - cam_times[0]),
+            "after_s": max(0.0, cam_times[-1] - t_end),
+        }
+        if gaps:
+            report["warnings"].append(
+                f"{label}: {sum(g['dropped_frames'] for g in gaps)} dropped frame(s) "
+                f"across {len(gaps)} gap(s) in sequence_num"
+            )
 
     report_path = os.path.join(session_dir, "alignment_report.json")
     with open(report_path, "w", encoding="utf-8") as f:
@@ -522,6 +596,14 @@ def print_alignment_report(report):
                 f"  {label}: {blue} blue placeholder frames "
                 f"({stats['discarded_frames']} discarded, "
                 f"{stats['missing_frames']} missing)"
+            )
+        crop = stats.get("crop")
+        if crop and (crop["before_frames"] or crop["after_frames"]):
+            print(
+                f"  {label}: cropped {crop['before_frames']} frame(s)/"
+                f"{crop['before_s']:.2f}s from start, "
+                f"{crop['after_frames']} frame(s)/{crop['after_s']:.2f}s from end "
+                f"to fit overlap window"
             )
     for warning in report["warnings"]:
         print(f"[Alignment] WARNING: {warning}")
