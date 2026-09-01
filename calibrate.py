@@ -1095,6 +1095,7 @@ class ViserManager:
             self.frustums[cam_id] = self.server.scene.add_camera_frustum(
                 f"/cameras/{cam_id}", fov=fov, aspect=aspect, scale=0.12,
                 wxyz=wxyz, position=position, color=(60, 140, 220),
+                variant="filled",
             )
         label = self.unknown_labels.pop(cam_id, None)
         if label is not None:

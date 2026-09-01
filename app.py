@@ -62,7 +62,7 @@ between its cells), or a single native image widget showing just the
 see wire_frustum_click and the main loop's per-tick highlight block) plus
 its own metrics below it as markdown. view_state["mode"] ("Grid" or
 "Single camera") toggles which is visible -- a direct, explicit choice via
-a "Live view shows" dropdown mirrored on both main_panel tabs (_set_view),
+a single "Live view shows" dropdown living in the live-view panel itself,
 defaulting to Grid (so the app starts in the grid view). This can't be
 inferred from anything else: two earlier attempts (detection_state
 ["enabled"], then app_state["mode"]) both turned out wrong, since neither
@@ -108,6 +108,63 @@ import capture
 import postprocess
 
 CALIBRATION_FILENAME_RE = re.compile(r"^\d{8}_\d{6}_\d+cam\.json$")
+SESSION_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
+TAKE_DIR_RE = re.compile(r"^take_(\d+)$")
+
+
+def list_sessions(cfg):
+    """recordings/<session_ts>/ dirs, newest first -- same shape as
+    list_available_calibrations below, just against the capture dir.
+    """
+    root = cfg["capture"]["dir"]
+    if not os.path.isdir(root):
+        return []
+    names = [
+        name for name in os.listdir(root)
+        if SESSION_DIR_RE.match(name) and os.path.isdir(os.path.join(root, name))
+    ]
+    return sorted(names, reverse=True)
+
+
+def session_display_name(cfg, session_ts):
+    """session_meta.json's session_name if the operator typed one at boot
+    (see boot_cameras/_do_start_take), else just the session_ts itself.
+    """
+    meta_path = os.path.join(cfg["capture"]["dir"], session_ts, "session_meta.json")
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                name = json.load(f).get("session_name")
+            if name:
+                return name
+        except (OSError, json.JSONDecodeError):
+            pass
+    return session_ts
+
+
+def list_takes(session_dir):
+    """take_<n> subfolders with a take_meta.json (skips a take directory
+    that was created but never actually written, e.g. an interrupted
+    boot), sorted by take number.
+    """
+    if not os.path.isdir(session_dir):
+        return []
+    found = []
+    for name in os.listdir(session_dir):
+        m = TAKE_DIR_RE.match(name)
+        if m and os.path.isfile(os.path.join(session_dir, name, "take_meta.json")):
+            found.append((int(m.group(1)), name))
+    return [name for _n, name in sorted(found)]
+
+
+def take_length_s(take_meta):
+    """No duration/frame_count is ever persisted to take_meta.json (see
+    write_take_meta) -- reconstruct it the same way align_session.py
+    itself would: one camera's own frame_timestamps log, divided by fps.
+    """
+    first_cam = next(iter(take_meta["cameras"].values()))
+    entries = align_session.parse_timestamp_log(first_cam["log_path"])
+    return len(entries) / take_meta["fps"]
 
 
 def list_available_calibrations(cfg):
@@ -618,6 +675,12 @@ def boot_cameras(viser_mgr, cfg):
     with viser_mgr.server.gui.add_modal("Booting OAK cameras...") as modal:
         viser_mgr.server.gui.add_markdown(f"Found {len(device_infos)} device(s). Cameras with a "
                                            f"worse track record boot first (see camera_boot_stats.py).")
+        # Pre-filled with the same timestamp format already used elsewhere
+        # as an implicit session name -- editable while the cameras boot,
+        # read once at the end (see the return below). This is a display
+        # name only; the recordings/<session_ts>/ folder itself keeps the
+        # timestamp naming (see session_meta.json in _do_start_take).
+        session_name_input = viser_mgr.server.gui.add_text("Session name", initial_value=session_ts)
         status_rows = {
             info.deviceId: viser_mgr.server.gui.add_markdown(f"`{info.deviceId}` -- waiting...")
             for info in device_infos
@@ -663,7 +726,7 @@ def boot_cameras(viser_mgr, cfg):
             # modal would stay on screen forever regardless of this wait.
             done.wait()
     modal.close()
-    return sessions
+    return sessions, session_name_input.value
 
 
 # ==============================================================================
@@ -785,7 +848,7 @@ def main():
     print(f"[Viser] http://localhost:{viser_mgr.server.get_port()}")
 
     try:
-        sessions = boot_cameras(viser_mgr, cfg)
+        sessions, session_name = boot_cameras(viser_mgr, cfg)
     except RuntimeError as exc:
         print(f"[Error] {exc}")
         return
@@ -957,7 +1020,7 @@ def main():
     # then app_state["mode"]) both turned out wrong in practice -- neither
     # one actually tracks which tab the operator is looking at. A real
     # button/dropdown click is the only signal Python can trust, so this is
-    # driven by one, mirrored on both main_panel tabs (see _set_view below).
+    # driven by the single "Live view shows" dropdown in the live-view panel.
     # "Grid" | "Single camera" -- defaults to Grid, matching "always start
     # the app in calibration".
     view_state = {"mode": "Grid"}
@@ -977,6 +1040,7 @@ def main():
     capture_state = {
         "phase": "idle",       # idle | starting | recording | stopping
         "session_ts": None,    # set on first "start" press, NOT boot time
+        "session_name": session_name,  # typed at boot; written into session_meta.json on first take
         "take_n": 0,
         "take_name": None,
         "take_dir": None,
@@ -1025,6 +1089,10 @@ def main():
     # frustum highlight block) otherwise.
     preview_panel = viser_mgr.server.gui.add_panel()
     with preview_panel.add_tab("Live view"):
+        view_dropdown = viser_mgr.server.gui.add_dropdown(
+            "Live view shows", ("Grid", "Single camera"), initial_value=view_state["mode"],
+        )
+        view_dropdown.on_update(lambda _: view_state.__setitem__("mode", view_dropdown.value))
         grid_html = viser_mgr.server.gui.add_html(build_camera_grid_html(cam_ids, latest_preview_frames))
         capture_preview_image = viser_mgr.server.gui.add_image(
             np.zeros((4, 4, 3), dtype=np.uint8), label="live",
@@ -1058,11 +1126,6 @@ def main():
     main_panel = viser_mgr.server.gui.add_panel()
     with main_panel.add_tab("Calibration"):
         mode_md = viser_mgr.server.gui.add_markdown(f"Mode: **{app_state['mode']}**")
-        calibration_view_dropdown = viser_mgr.server.gui.add_dropdown(
-            "Live view shows", ("Grid", "Single camera"), initial_value=view_state["mode"],
-        )
-        start_btn = viser_mgr.server.gui.add_button("Start new calibration")
-        start_btn.on_click(lambda _: mode_cmd_queue.put("start_calibration_live"))
 
         calibration_detection_checkbox = viser_mgr.server.gui.add_checkbox(
             "ChArUco detection enabled", initial_value=detection_state["enabled"],
@@ -1070,20 +1133,24 @@ def main():
 
         viser_mgr.add_world_alignment_button(request_world_alignment)
 
-        save_button = viser_mgr.server.gui.add_button("Save now")
+        save_button = viser_mgr.server.gui.add_button("Save now", color="green")
         save_button.on_click(lambda _: cmd_queue.put("save"))
-        uncache_button = viser_mgr.server.gui.add_button("Uncache all intrinsics")
-        uncache_button.on_click(lambda _: cmd_queue.put("uncache all"))
+
+        viser_mgr.server.gui.add_divider()
 
         for cam_id in cam_ids:
             reset_btn = viser_mgr.server.gui.add_button(f"Reset {cam_id}")
             reset_btn.on_click(lambda _, c=cam_id: cmd_queue.put(f"reset {c}"))
 
+        viser_mgr.server.gui.add_divider()
+
+        start_btn = viser_mgr.server.gui.add_button("Start new calibration", color="red")
+        start_btn.on_click(lambda _: mode_cmd_queue.put("start_calibration_live"))
+        uncache_button = viser_mgr.server.gui.add_button("Uncache all intrinsics", color="red")
+        uncache_button.on_click(lambda _: cmd_queue.put("uncache all"))
+
     capture_tab = main_panel.add_tab("Capture")
     with capture_tab:
-        capture_view_dropdown = viser_mgr.server.gui.add_dropdown(
-            "Live view shows", ("Grid", "Single camera"), initial_value=view_state["mode"],
-        )
         preview_mode_dropdown = viser_mgr.server.gui.add_dropdown(
             "Live previews", ("Auto", "Always on", "Always off"), initial_value=preview_mode["choice"],
         )
@@ -1100,6 +1167,48 @@ def main():
         ))
         viser_mgr.server.gui.add_divider()
         no_takes_md = viser_mgr.server.gui.add_markdown("_No takes yet._")
+
+    # (take_dir, take_meta, label_md) per past take found on disk --
+    # refreshed every main-loop tick alongside take_row_widgets below (see
+    # "Rebuild each take's row"), same tab-blind idiom as the rest of this
+    # panel: viser can't tell Python which main_panel tab is active, so
+    # every tab's widgets stay live regardless of visibility.
+    viewer_take_rows = []
+    viewer_tab = main_panel.add_tab("Viewer")
+    with viewer_tab:
+        sessions_on_disk = list_sessions(cfg)
+        if not sessions_on_disk:
+            viser_mgr.server.gui.add_markdown("_No past sessions found._")
+        for session_ts in sessions_on_disk:
+            session_dir = os.path.join(cfg["capture"]["dir"], session_ts)
+            take_names = list_takes(session_dir)
+            with viser_mgr.server.gui.add_folder(
+                session_display_name(cfg, session_ts), expand_by_default=False,
+            ):
+                if not take_names:
+                    viser_mgr.server.gui.add_markdown("_No takes in this session._")
+                for take_name in take_names:
+                    take_dir = os.path.join(session_dir, take_name)
+                    with open(os.path.join(take_dir, "take_meta.json"), encoding="utf-8") as f:
+                        take_meta = json.load(f)
+                    # Length can't change for a past take -- compute it once
+                    # here (parses a frame_timestamps log) rather than every
+                    # tick; only postprocess status (a small JSON read) is
+                    # worth refreshing live, since a job can still be running.
+                    try:
+                        length_str = f"{take_length_s(take_meta):.0f}s"
+                    except (OSError, KeyError, StopIteration, ZeroDivisionError):
+                        length_str = "?s"
+                    label_md = viser_mgr.server.gui.add_markdown("")
+                    play_btn = viser_mgr.server.gui.add_button("Play grid video")
+                    # take_meta.json's grid video always lives at
+                    # <take_dir>/processed/... (see align_session.grid_mp4_path
+                    # and _open_take_video_modal below) -- reused unchanged,
+                    # it already handles a not-yet-postprocessed take.
+                    play_btn.on_click(lambda _, td=take_dir, tn=take_meta["take_n"]:
+                                       _open_take_video_modal({"take_dir": td, "take_n": tn}))
+                    viser_mgr.server.gui.add_markdown("_3D playback (SMPLX) -- coming soon_")
+                    viewer_take_rows.append((take_dir, take_meta["take_n"], length_str, label_md))
 
     main_panel.dock_left()
     main_panel.set_width(300)
@@ -1209,8 +1318,9 @@ def main():
         tab is visible at a time, but the other's value should still be
         correct whenever the operator switches to it) and centralizes the
         hide-board-poses-on-off behavior. Deliberately does NOT touch the
-        live-preview panel's grid/single-image visibility -- see _set_view
-        below for that. The two used to share detection_state as one flag;
+        live-preview panel's grid/single-image visibility -- that's driven
+        directly by the live-view panel's own dropdown instead. The two
+        used to share detection_state as one flag;
         that was a bug (the Capture tab's "sanity check" checkbox forced the
         grid open even during capture work), and a later attempt to key
         visibility off app_state["mode"] instead was ALSO wrong (mode stays
@@ -1228,20 +1338,8 @@ def main():
             for cam_id in cam_ids:
                 viser_mgr.hide_board_pose(cam_id)
 
-    def _set_view(mode):
-        """Shared by both tabs' "Live view shows" dropdowns -- the ONLY
-        thing that decides grid vs. single-camera in the live-preview panel
-        (see show_grid in the main loop). Kept in sync the same way as
-        _set_detection's pair of checkboxes.
-        """
-        view_state["mode"] = mode
-        calibration_view_dropdown.value = mode
-        capture_view_dropdown.value = mode
-
     capture_detection_checkbox.on_update(lambda _: _set_detection(capture_detection_checkbox.value))
     calibration_detection_checkbox.on_update(lambda _: _set_detection(calibration_detection_checkbox.value))
-    capture_view_dropdown.on_update(lambda _: _set_view(capture_view_dropdown.value))
-    calibration_view_dropdown.on_update(lambda _: _set_view(calibration_view_dropdown.value))
 
     if action == "load_and_capture":
         # Skip the button click entirely -- "Load & start capture" already
@@ -1388,6 +1486,13 @@ def main():
         """
         if capture_state["session_ts"] is None:
             capture_state["session_ts"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_dir = os.path.join(cfg["capture"]["dir"], capture_state["session_ts"])
+            os.makedirs(session_dir, exist_ok=True)
+            with open(os.path.join(session_dir, "session_meta.json"), "w", encoding="utf-8") as f:
+                json.dump({
+                    "session_ts": capture_state["session_ts"],
+                    "session_name": capture_state["session_name"],
+                }, f, indent=2)
 
         connected_sessions = [sessions[cam_id] for cam_id in cam_ids if sessions[cam_id].connected]
 
@@ -1615,6 +1720,19 @@ def main():
                 row["label_md"].content = f"Take {take['take_n']}: {length_str} -- {status_str}"
                 row["play_btn"].visible = status["status"] == "done"
 
+            # Same status refresh for the Viewer tab's past-session takes --
+            # length was already computed once at startup (see viewer_tab
+            # above), only postprocess status can still change live.
+            for take_dir, take_n, length_str, label_md in viewer_take_rows:
+                status = postprocess.read_status(take_dir)
+                status_str = {
+                    "queued": "queued for postprocessing",
+                    "processing": "processing...",
+                    "done": "postprocessed",
+                    "failed": f"postprocessing failed ({status.get('error', 'unknown error')})",
+                }.get(status["status"], status["status"])
+                label_md.content = f"Take {take_n}: {length_str} -- {status_str}"
+
             now = time.monotonic()
 
             # CPU sampling (once/sec -- psutil.cpu_percent must only ever be
@@ -1652,9 +1770,9 @@ def main():
                 previews_on = not perf_state["throttled"]
 
             # Which live-preview view is showing -- a direct, explicit
-            # choice (view_state["mode"], set by the "Live view shows"
-            # dropdown mirrored on both main_panel tabs -- see _set_view),
-            # not inferred from detection_state or app_state["mode"]. Both
+            # choice (view_state["mode"], set by the live-view panel's own
+            # "Live view shows" dropdown), not inferred from detection_state
+            # or app_state["mode"]. Both
             # of those were tried and both were wrong: neither one actually
             # tracks which main_panel tab the operator is looking at, since
             # viser exposes no way to detect that from Python at all.
