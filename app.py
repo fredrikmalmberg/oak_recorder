@@ -6,12 +6,38 @@ close together can brown out whichever one boots last), then lets the
 operator load a saved calibration, run a live one, or continue uncalibrated
 -- all without re-booting cameras between those choices.
 
+Boot is NOT one blocking pre-loop: sessions (one AppCameraSession per
+discovered device, all connected=False) are created up front, and the
+calibration picker is shown immediately -- it needs nothing but each
+device's ID (already known from dai.Device.getAllAvailableDevices(), no
+connection required). Actually connecting each camera (the slow,
+staggered part) happens as a small step_boot() call, one camera at a
+time, interleaved into whatever loop is currently running: the picker's
+own wait loop while the operator is deciding, then the main tick loop
+once it starts. This is deliberately NOT a background thread: see
+"Single-thread dai-access rule" below.
+
 Boot order is NOT random: camera_boot_stats.rank_boot_order sorts known
 troublesome cameras (by past failure count, from logs/camera_boot_log.jsonl)
 to the FRONT of the queue, since historical data showed failures cluster
 almost entirely at the LAST boot position -- a camera with a bad track
 record should never be the one left competing against every other
 already-connected camera for power.
+
+Single-thread dai-access rule: every dai/depthai call, for every camera,
+for this app's entire life, happens on main()'s one thread -- step_boot,
+session.poll(), session.reconnect(), all of it -- never a background
+thread. This isn't arbitrary caution: Luxonis's own guidance (their
+forum, "depthai-core thread safety specifically on dai::Device") is that
+a Device object "isn't fully thread-safe," and the pattern they actually
+recommend for multiple devices is one thread PER DEVICE for that
+device's whole life, never handing a Device off between threads. This
+app already satisfies a stricter version of that (one thread, period,
+for every device) -- session.reconnect() already proves a brand-new
+dai.Device connection works fine when it happens inline on this thread,
+interleaved with poll() calls on other sessions; step_boot() is the same
+pattern applied to first connect. Do not move boot (or anything else
+that touches a session) onto a separate thread.
 
 Calibration mode reuses calibrate.py's engine directly (build_board,
 CameraCalibState, process_detection, PoseGraph, world alignment, intrinsics
@@ -26,8 +52,8 @@ say. Two reasons: building a second dai.Pipeline on an already-used,
 already-stopped dai.Device was found to crash depthai 3.7.1 natively
 (confirmed via isolated hardware testing), and swapping pipelines the
 "safe" way (close+reopen every device) reintroduces the exact same
-multi-camera boot/brownout risk this module's own boot_cameras step exists
-to harden against -- reproduced live (the same historically-bad camera
+multi-camera boot/brownout risk step_boot's stagger exists to harden
+against -- reproduced live (the same historically-bad camera
 failed to reconnect) before this design was simplified to avoid it
 entirely. So entering capture mode is instant: a take just starts writing
 the already-running stream to disk. See README.md's "Capture mode" section
@@ -124,8 +150,9 @@ def list_sessions(cfg):
 
 
 def session_display_name(cfg, session_ts):
-    """session_meta.json's session_name if the operator typed one at boot
-    (see boot_cameras/_do_start_take), else just the session_ts itself.
+    """session_meta.json's session_name if the operator typed one in the
+    calibration picker (see show_calibration_picker/_do_start_take), else
+    just the session_ts itself.
     """
     meta_path = os.path.join(cfg["capture"]["dir"], session_ts, "session_meta.json")
     if os.path.isfile(meta_path):
@@ -333,7 +360,7 @@ def pick_middle_camera(cam_positions):
     return items[median_idx][0]
 
 
-def build_camera_grid_html(cam_ids, latest_preview_frames, metrics=None):
+def build_camera_grid_html(cam_ids, latest_preview_frames, metrics=None, connected=None):
     """2-column CSS grid of base64-embedded JPEG thumbnails, each camera's
     status lines baked in as plain text underneath -- the only way to get
     both a real multi-column layout AND per-camera-positioned text out of
@@ -344,16 +371,21 @@ def build_camera_grid_html(cam_ids, latest_preview_frames, metrics=None):
     (already undistorted per-camera if that toggle is on, already
     coverage-overlaid in calibrate mode). metrics is an optional
     {cam_id: [line, ...]} of plain-text status lines -- HTML-escaped here
-    so callers don't have to.
+    so callers don't have to. connected is an optional {cam_id: bool} --
+    a frameless cell shows "booting..." instead of "no signal" for any
+    cam_id explicitly marked not-yet-connected there, so boot progress
+    (see step_boot) reads as ongoing rather than as a dead camera.
     """
     metrics = metrics or {}
+    connected = connected or {}
     cells = []
     for cam_id in cam_ids:
         frame = latest_preview_frames.get(cam_id)
         if frame is None:
+            label = "booting..." if not connected.get(cam_id, True) else "no signal"
             image_html = (
                 '<div style="aspect-ratio:16/9;background:#333;color:#aaa;'
-                'display:flex;align-items:center;justify-content:center">no signal</div>'
+                f'display:flex;align-items:center;justify-content:center">{label}</div>'
             )
         else:
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -673,81 +705,14 @@ class AppCameraSession:
 
 
 # ==============================================================================
-# Boot: connect every discovered camera once, with live per-device status in
-# a modal. Order is deterministic -- see camera_boot_stats.rank_boot_order --
-# not random, with a stagger between connects (same rationale as capture.py's
-# main() for the stagger; see module docstring above for the ordering).
-# ==============================================================================
-def boot_cameras(viser_mgr, cfg):
-    device_infos = dai.Device.getAllAvailableDevices()
-    if not device_infos:
-        raise RuntimeError("No OAK devices discovered.")
-    device_infos = camera_boot_stats.rank_boot_order(device_infos)
-
-    session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sessions = {}
-    with viser_mgr.server.gui.add_modal("Booting OAK cameras...") as modal:
-        viser_mgr.server.gui.add_markdown(f"Found {len(device_infos)} device(s). Cameras with a "
-                                           f"worse track record boot first (see camera_boot_stats.py).")
-        # Pre-filled with the same timestamp format already used elsewhere
-        # as an implicit session name -- editable while the cameras boot,
-        # read once at the end (see the return below). This is a display
-        # name only; the recordings/<session_ts>/ folder itself keeps the
-        # timestamp naming (see session_meta.json in _do_start_take).
-        session_name_input = viser_mgr.server.gui.add_text("Session name", initial_value=session_ts)
-        status_rows = {
-            info.deviceId: viser_mgr.server.gui.add_markdown(f"`{info.deviceId}` -- waiting...")
-            for info in device_infos
-        }
-
-        CONNECT_STAGGER_S = 1.5
-        for i, info in enumerate(device_infos):
-            if i > 0:
-                time.sleep(CONNECT_STAGGER_S)
-            status_rows[info.deviceId].content = f"`{info.deviceId}` -- connecting..."
-            cam_id = f"cam{i}"
-            sess = AppCameraSession(cam_id, info, session_ts, i, cfg)
-            try:
-                sess.connect()
-                sess.start_calibration_pipeline()
-                sessions[cam_id] = sess
-                status_rows[info.deviceId].content = (
-                    f"`{info.deviceId}` -- **{cam_id}**, USB {sess.usb_speed.name}"
-                )
-            except Exception as exc:
-                status_rows[info.deviceId].content = f"`{info.deviceId}` -- **FAILED**: {exc}"
-                print(f"[Error] {cam_id} ({info.deviceId}) failed to boot: {exc}")
-
-        # Skip the click-through entirely when every discovered device
-        # booted AND is running USB3 ("SuperSpeed" -- dai.UsbSpeed.SUPER/
-        # SUPER_PLUS, the same check_usb_speed.py/capture.py already use to
-        # flag a USB2-class bottleneck risk): nothing to read, nothing to
-        # decide. A boot failure (sessions shorter than device_infos) or
-        # any USB2-class camera still needs the operator's eyes before
-        # proceeding, so those cases keep the button + wait unchanged.
-        all_healthy = len(sessions) == len(device_infos) and all(
-            sess.usb_speed in (dai.UsbSpeed.SUPER, dai.UsbSpeed.SUPER_PLUS)
-            for sess in sessions.values()
-        )
-        if not all_healthy:
-            close_btn = viser_mgr.server.gui.add_button("Continue")
-            done = threading.Event()
-            close_btn.on_click(lambda _: done.set())
-            # Wait for the operator to actually click through -- important
-            # when there's a failure to read, and `with modal:` itself does
-            # NOT close the modal on exit (it only stops routing new GUI
-            # elements into it), so without an explicit close() below the
-            # modal would stay on screen forever regardless of this wait.
-            done.wait()
-    modal.close()
-    return sessions, session_name_input.value
-
-
-# ==============================================================================
-# Calibration picker: load / start new / continue uncalibrated.
+# Calibration picker: load / start new / continue uncalibrated. Shown
+# immediately (device IDs only, no connection needed) -- see main() for
+# where sessions/cam_ids get built and step_boot for the actual staggered
+# per-camera connect this picker's wait loop drives in the background.
 # ==============================================================================
 def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrinsics_cache, image_size,
-                             alignment_detector, alignment_board_points_3d):
+                             alignment_detector, alignment_board_points_3d, step_boot, drain_boot_failures,
+                             all_booted, session_ts):
     """intrinsics_cache/image_size let this show, per booted camera, whether
     its intrinsics are already cached AND resolution-matched -- the exact
     same condition make_calib_state checks before treating a camera as
@@ -761,6 +726,14 @@ def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrin
     Loops (rather than returning immediately) so "Load & start capture"'s
     floor-board pre-flight check (verify_floor_board) can send the operator
     back to this same picker on Cancel instead of aborting the app.
+
+    Shown before any camera is necessarily connected -- every device's
+    intrinsics-cache/mismatch status only needs device_id (known instantly),
+    but "Load & start capture" needs a live camera for its floor-board
+    check, so those buttons stay disabled until all_booted() (see
+    step_boot/main()). The wait for a click is a short-timeout poll, not a
+    hard block, specifically so step_boot() keeps making progress and the
+    "Connected cameras" list keeps refreshing while the operator decides.
     """
     calib_files = list_available_calibrations(cfg)
     active_device_ids = {sessions[cam_id].device_id for cam_id in cam_ids}
@@ -768,30 +741,43 @@ def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrin
     matching_files = [p for p in calib_files if match_info[p][0]]
     mismatched_files = [p for p in calib_files if not match_info[p][0]]
 
+    def _camera_status_line(cam_id):
+        session = sessions[cam_id]
+        if session.usb_speed is None:
+            return f"- **{cam_id}** (`{session.device_id}`): _booting..._"
+        entry = intrinsics_cache.get(session.device_id)
+        if entry is None:
+            status = "_no cached intrinsics_"
+        elif entry["image_width"] != image_size[0] or entry["image_height"] != image_size[1]:
+            status = (f"_cached intrinsics are for {entry['image_width']}x{entry['image_height']}, "
+                      f"this run is {image_size[0]}x{image_size[1]} -- will recalibrate_")
+        else:
+            status = f"**intrinsics cached** ({entry['reprojection_error_px']:.3f}px reproj)"
+        return f"- **{cam_id}** (`{session.device_id}`, USB {session.usb_speed.name}): {status}"
+
+    session_name_value = session_ts
+
     while True:
+        load_and_capture_buttons = []
         with viser_mgr.server.gui.add_modal("Calibration") as modal:
             with viser_mgr.server.gui.add_folder("Get started"):
                 start_btn = viser_mgr.server.gui.add_button("Start new calibration", color="green")
                 start_btn.on_click(lambda _: cmd_queue.put(("start_calibration", None)))
                 skip_btn = viser_mgr.server.gui.add_button("Continue uncalibrated", color="red")
                 skip_btn.on_click(lambda _: cmd_queue.put(("uncalibrated", None)))
+            # Pre-filled with the timestamp format already used elsewhere as
+            # an implicit session name -- editable, read once a choice is
+            # made (see the return below). Display name only; the
+            # recordings/<session_ts>/ folder itself keeps the timestamp
+            # naming (see session_meta.json in _do_start_take).
+            session_name_input = viser_mgr.server.gui.add_text(
+                "Session name", initial_value=session_name_value,
+            )
             viser_mgr.server.gui.add_divider()
 
-            camera_lines = []
-            for cam_id in cam_ids:
-                session = sessions[cam_id]
-                entry = intrinsics_cache.get(session.device_id)
-                if entry is None:
-                    status = "_no cached intrinsics_"
-                elif entry["image_width"] != image_size[0] or entry["image_height"] != image_size[1]:
-                    status = (f"_cached intrinsics are for {entry['image_width']}x{entry['image_height']}, "
-                              f"this run is {image_size[0]}x{image_size[1]} -- will recalibrate_")
-                else:
-                    status = f"**intrinsics cached** ({entry['reprojection_error_px']:.3f}px reproj)"
-                camera_lines.append(
-                    f"- **{cam_id}** (`{session.device_id}`, USB {session.usb_speed.name}): {status}"
-                )
-            viser_mgr.server.gui.add_markdown("**Connected cameras:**\n\n" + "\n".join(camera_lines))
+            camera_status_md = viser_mgr.server.gui.add_markdown(
+                "**Connected cameras:**\n\n" + "\n".join(_camera_status_line(c) for c in cam_ids)
+            )
 
             if matching_files:
                 for path in matching_files:
@@ -802,8 +788,11 @@ def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrin
                     )
                     load_btn = viser_mgr.server.gui.add_button("Load")
                     load_btn.on_click(lambda _, p=path: cmd_queue.put(("load_calibration", p)))
-                    capture_btn = viser_mgr.server.gui.add_button("Load & start capture")
+                    capture_btn = viser_mgr.server.gui.add_button(
+                        "Load & start capture", disabled=not all_booted(),
+                    )
                     capture_btn.on_click(lambda _, p=path: cmd_queue.put(("load_and_capture", p)))
+                    load_and_capture_buttons.append(capture_btn)
             elif not mismatched_files:
                 viser_mgr.server.gui.add_markdown("_No saved calibrations found in "
                                                    f"`{cfg['output']['dir']}`._")
@@ -818,7 +807,21 @@ def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrin
                     + "\n".join(lines)
                 )
 
-        choice = cmd_queue.get()  # blocks the setup thread until the operator picks one
+        choice = None
+        while choice is None:
+            step_boot()
+            drain_boot_failures()
+            camera_status_md.content = (
+                "**Connected cameras:**\n\n" + "\n".join(_camera_status_line(c) for c in cam_ids)
+            )
+            booted = all_booted()
+            for btn in load_and_capture_buttons:
+                btn.disabled = not booted
+            try:
+                choice = cmd_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+        session_name_value = session_name_input.value
         modal.close()
 
         if choice[0] == "load_and_capture":
@@ -832,10 +835,10 @@ def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrin
                 alignment_detector, alignment_board_points_3d, cfg,
             )
             if proceed:
-                return choice
+                return choice[0], choice[1], session_name_value
             continue  # Cancel -- re-show the picker
 
-        return choice
+        return choice[0], choice[1], session_name_value
 
 
 # ==============================================================================
@@ -861,15 +864,77 @@ def main():
     viser_mgr = calibrate.ViserManager(cfg)
     print(f"[Viser] http://localhost:{viser_mgr.server.get_port()}")
 
-    try:
-        sessions, session_name = boot_cameras(viser_mgr, cfg)
-    except RuntimeError as exc:
-        print(f"[Error] {exc}")
+    # Device IDs only, no connection -- fast. sessions is pre-populated for
+    # every DISCOVERED device (all connected=False), not just ones that end
+    # up connecting successfully, so the calibration picker (and everything
+    # downstream) can show/gate on "still booting" instead of a camera
+    # simply not existing yet. See module docstring's "Single-thread
+    # dai-access rule" for why boot happens as step_boot() below rather
+    # than a background thread.
+    device_infos = dai.Device.getAllAvailableDevices()
+    if not device_infos:
+        print("[Error] No OAK devices discovered.")
         return
-    if not sessions:
-        print("[Error] No cameras booted successfully -- nothing to do.")
-        return
+    device_infos = camera_boot_stats.rank_boot_order(device_infos)
+    session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sessions = {
+        f"cam{i}": AppCameraSession(f"cam{i}", info, session_ts, i, cfg)
+        for i, info in enumerate(device_infos)
+    }
     cam_ids = list(sessions.keys())
+
+    CONNECT_STAGGER_S = 1.5
+    boot_state = {
+        "next_index": 0,
+        "last_attempt_mono": -CONNECT_STAGGER_S,  # so cam0 boots on the very first step_boot() call
+        "attempted": set(),   # cam_ids that have had a first boot attempt (see Pass 1's reconnect guard)
+        "failures": [],       # (cam_id, device_id, error_str), drained into modals by drain_boot_failures
+    }
+
+    def step_boot():
+        """At most one camera's connect+pipeline-start per call, staggered
+        by CONNECT_STAGGER_S -- same brownout-avoidance stagger this used
+        to run as one blocking pre-loop (see module docstring), just spread
+        across many small steps on this same thread instead. Called from
+        both the calibration picker's wait loop and the main tick loop, so
+        boot keeps progressing regardless of which screen is showing. A
+        no-op once every camera has had its first attempt.
+        """
+        if boot_state["next_index"] >= len(cam_ids):
+            return
+        now = time.monotonic()
+        if now - boot_state["last_attempt_mono"] < CONNECT_STAGGER_S:
+            return
+        cam_id = cam_ids[boot_state["next_index"]]
+        sess = sessions[cam_id]
+        boot_state["attempted"].add(cam_id)
+        try:
+            sess.connect()
+            sess.start_calibration_pipeline()
+            if sess.usb_speed not in (dai.UsbSpeed.SUPER, dai.UsbSpeed.SUPER_PLUS):
+                boot_state["failures"].append(
+                    (cam_id, sess.device_id, f"USB {sess.usb_speed.name} (expected SuperSpeed)")
+                )
+        except Exception as exc:
+            boot_state["failures"].append((cam_id, sess.device_id, str(exc)))
+            print(f"[Error] {cam_id} ({sess.device_id}) failed to boot: {exc}")
+        boot_state["next_index"] += 1
+        boot_state["last_attempt_mono"] = now
+
+    def all_booted():
+        return boot_state["next_index"] >= len(cam_ids)
+
+    def drain_boot_failures():
+        """One dismiss-only modal per failure -- non-blocking, doesn't stop
+        boot or whatever screen is currently showing. Called from the same
+        two places as step_boot.
+        """
+        while boot_state["failures"]:
+            cam_id, device_id, error = boot_state["failures"].pop(0)
+            with viser_mgr.server.gui.add_modal(f"{cam_id} failed to boot") as fail_modal:
+                viser_mgr.server.gui.add_markdown(f"`{device_id}`\n\n{error}")
+                ok_btn = viser_mgr.server.gui.add_button("OK")
+            ok_btn.on_click(lambda _, m=fail_modal: m.close())
 
     # Loaded here (rather than in the "Persistent state" block below) so the
     # calibration picker can show, per camera, whether its intrinsics are
@@ -877,9 +942,10 @@ def main():
     intrinsics_cache = calibrate.load_intrinsics_cache(cfg) if cfg["intrinsics_cache"]["enabled"] else {}
 
     setup_queue = queue.Queue()
-    action, action_arg = show_calibration_picker(
+    action, action_arg, session_name = show_calibration_picker(
         viser_mgr, cfg, setup_queue, sessions, cam_ids, intrinsics_cache, image_size,
-        alignment_detector, alignment_board_points_3d,
+        alignment_detector, alignment_board_points_3d, step_boot, drain_boot_failures,
+        all_booted, session_ts,
     )
 
     # ── Persistent state, shared by whichever mode is active ──────────────────
@@ -1110,7 +1176,9 @@ def main():
 
     preview_panel = viser_mgr.server.gui.add_panel()
     with preview_panel.add_tab("Live view"):
-        grid_html = viser_mgr.server.gui.add_html(build_camera_grid_html(cam_ids, latest_preview_frames))
+        grid_html = viser_mgr.server.gui.add_html(build_camera_grid_html(
+            cam_ids, latest_preview_frames, connected={c: sessions[c].connected for c in cam_ids},
+        ))
         preview_toggle_checkbox = viser_mgr.server.gui.add_checkbox(
             "Live previews", initial_value=preview_toggle_state["on"],
         )
@@ -1582,7 +1650,7 @@ def main():
 
     def _do_start_take():
         """Blocking (runs on the main loop thread, see module docstring's
-        single-thread-dai-access invariant), but cheap: there is only ever
+        "Single-thread dai-access rule"), but cheap: there is only ever
         one pipeline (see AppCameraSession.start_calibration_pipeline) --
         capture mode never swaps to a different one, so no camera is
         reconnected or rebooted when entering capture mode. Every take just
@@ -1791,9 +1859,11 @@ def main():
                 # tanks recording fps ~5x) -- unlike the auto-off-during-a-
                 # take above, this additionally blocks *starting* a take at
                 # all while the operator has deliberately left detection on.
-                capture_btn.disabled = detection_state["enabled"]
+                capture_btn.disabled = detection_state["enabled"] or not all_booted()
                 capture_status_md.content = (
-                    "_Turn off ChArUco detection to capture._" if detection_state["enabled"] else "_Idle._"
+                    "_Turn off ChArUco detection to capture._" if detection_state["enabled"]
+                    else "_Waiting for cameras to finish booting..._" if not all_booted()
+                    else "_Idle._"
                 )
 
             # Every take this session, oldest first -- length, and whether
@@ -1881,6 +1951,13 @@ def main():
             show_grid = ui_mode_state["current"] == "Calibration"
             show_single = ui_mode_state["current"] == "Capture"
 
+            # Keep making progress on any camera that hasn't had its first
+            # boot attempt yet -- a no-op once all_booted() (see step_boot's
+            # own docstring). Also true if the operator picked a picker
+            # option before boot finished.
+            step_boot()
+            drain_boot_failures()
+
             # Pass 1: fetch/decode every camera's latest frame. decode_preview
             # is per-camera: every camera while the grid is showing (it
             # needs all of them), the single selected camera while Capture's
@@ -1892,6 +1969,15 @@ def main():
                 session = sessions[cam_id]
                 if not session.connected:
                     calib_states[cam_id].connected = False
+                    if cam_id not in boot_state["attempted"]:
+                        # Still waiting its turn in the staggered initial
+                        # boot (step_boot above) -- the generic reconnect
+                        # retry below is for a camera that WAS connected and
+                        # dropped, not this one; retrying it here too would
+                        # boot several cameras back-to-back in one tick and
+                        # reintroduce the exact brownout risk the stagger
+                        # exists to avoid.
+                        continue
                     if now - last_reconnect_attempt[cam_id] >= runtime_cfg["reconnect_retry_interval_s"]:
                         last_reconnect_attempt[cam_id] = now
                         try:
@@ -2230,7 +2316,10 @@ def main():
             # False.
             if show_grid and now - grid_state["last_update_mono"] >= 0.15:
                 grid_state["last_update_mono"] = now
-                grid_html.content = build_camera_grid_html(cam_ids, latest_preview_frames, per_cam_metrics)
+                grid_html.content = build_camera_grid_html(
+                    cam_ids, latest_preview_frames, per_cam_metrics,
+                    connected={c: sessions[c].connected for c in cam_ids},
+                )
 
             if preview_toggle_state["on"] and capture_preview["selected"] is not None:
                 capture_preview_status_md.content = "\n\n".join(
