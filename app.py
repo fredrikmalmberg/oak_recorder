@@ -39,6 +39,52 @@ interleaved with poll() calls on other sessions; step_boot() is the same
 pattern applied to first connect. Do not move boot (or anything else
 that touches a session) onto a separate thread.
 
+This boundary is unchanged by calibration mode's per-camera
+calibrate.DetectionWorker background threads (see main()'s calib_workers):
+each camera's raw JPEG bytes are extracted from its dai queue message on
+this main thread (AppCameraSession.poll(want_raw_bytes=True), a cheap
+buffer copy, not a decode) -- only THEN, with no dai object involved at
+all, do they cross into a worker thread for decode+ChArUco-detect+PnP-solve.
+Workers never touch a dai.Device/pipeline/queue, and never touch a
+CameraCalibState either (that stays exclusively main-thread-owned, read
+AND written only here) -- every work item and result crossing the queue
+boundary is a plain, self-contained snapshot (bytes/numpy arrays), so no
+dai object or viser/GUI object is ever reachable from a second thread.
+The periodic cv2.calibrateCamera pass gets the same treatment on its own
+per-camera calibrate.RecalibrationWorker thread (main()'s recalib_workers)
+-- it's expensive enough on its own (~200-400ms at realistic sample counts)
+that running it inline, even throttled to one camera per tick, was
+measured to reproduce the same main-thread-blocking symptom the detection
+move was meant to fix. Same rule: no dai/viser object crosses the boundary,
+only a plain snapshot (K/dist copies, a shallow list copy of accumulated
+sample arrays), and CameraCalibState stays main-thread-owned.
+
+PoseGraph.solve() (specifically _optimize_component's scipy.optimize.
+least_squares) gets the same treatment on its own calibrate.PoseGraphWorker
+thread (main()'s pose_graph_worker -- one, not per-camera, since there's
+only one pose graph) -- measured live at ~120-160ms EVERY tick once the
+graph's chain-consistency error crosses threshold, same symptom again.
+Same rule: the worker only ever sees a snapshot of pose_graph.observations;
+the real PoseGraph instance stays main-thread-owned.
+
+One deliberate exception to "every dai call happens on main()'s thread":
+AppCameraSession.start_calibration_pipeline registers a q_full.addCallback
+(_on_full_arrival) -- this is depthai's OWN internal delivery mechanism,
+not a thread this app spawns, and it fires the instant a message is
+delivered rather than whenever this app's own tick-loop polling gets
+around to it (measured on real hardware: ~15ms tighter on average, and
+free of the systematic per-camera bias from this app's fixed cam0->cam6
+polling order). Verified empirically before use, not assumed: an isolated
+test against a real camera confirmed addCallback does NOT consume the
+message (tryGet()/get() afterward still see it, so this can't race or
+steal frames from the existing poll()-based flow) and always fired at or
+before the same frame's tryGet()-visible arrival, never after. The
+callback itself is deliberately minimal -- one time.time() read, one
+thread-safe queue.Queue put, no dai calls, no decoding -- so it can never
+block or back up depthai's own delivery pipeline; see
+_pop_full_arrival_ts for how the main thread matches a callback-captured
+timestamp back to a specific dequeued message.
+
 Calibration mode reuses calibrate.py's engine directly (build_board,
 CameraCalibState, process_detection, PoseGraph, world alignment, intrinsics
 cache, and the whole ViserManager) rather than reimplementing any of it --
@@ -454,6 +500,7 @@ class AppCameraSession:
         self.control_queue = None
         self.last_frame_full = None
         self.last_frame_full_ts = None
+        self.last_frame_full_bytes = None  # raw JPEG bytes, see poll()'s want_raw_bytes
         self.last_frame_preview = None
         self.connected = False
         self.fps = None  # exponentially-smoothed full-frame arrival rate, see poll()
@@ -469,6 +516,16 @@ class AppCameraSession:
         self.sync_device_ts_s = None
         self.sync_host_offset_s = None
         self.preview_updated = False  # set each poll() call, see poll()'s decode_preview
+        # (seq, host_ts_s) pairs fed by _on_full_arrival, a q_full callback
+        # that fires on depthai's own internal thread the instant a message
+        # is delivered -- see start_calibration_pipeline and
+        # _pop_full_arrival_ts for why this exists (measured ~15ms tighter,
+        # on average, than timestamping after this session's own tryGet()
+        # notices the frame, and free of this app's fixed per-camera
+        # polling-order bias). queue.Queue is thread-safe by design, so no
+        # extra locking needed for this producer(callback thread)/
+        # consumer(main thread) hand-off.
+        self._full_arrival_queue = queue.Queue()
 
     def connect(self):
         self.device, self.usb_speed = capture.connect_device_with_retry(
@@ -500,7 +557,47 @@ class AppCameraSession:
         )
         self.q_full = full_endpoint.createOutputQueue(maxSize=8, blocking=False)
         self.q_preview = preview_endpoint.createOutputQueue(maxSize=2, blocking=False)
+        self.q_full.addCallback(self._on_full_arrival)
         self.pipeline.start()
+
+    def _on_full_arrival(self, _queue_name, msg):
+        """q_full callback -- runs on depthai's OWN internal delivery thread
+        (confirmed via isolated hardware test: not this session's main
+        thread, and does NOT consume the message -- tryGet()/get() still see
+        it afterward, so this is purely an additional notification, not a
+        second consumer racing the real one). Deliberately minimal (one
+        time.time() read, one thread-safe queue put, no dai calls, no
+        decoding) so it can never back up depthai's own delivery pipeline
+        for this or any other camera. See _pop_full_arrival_ts for how the
+        main thread matches this back up to a specific dequeued message.
+        """
+        self._full_arrival_queue.put((msg.getSequenceNum(), time.time()))
+
+    def _pop_full_arrival_ts(self, seq):
+        """Host arrival time for full-res frame `seq`, from the callback
+        above, instead of timestamping whenever this session's own poll()/
+        capture_sync_calibration() happens to notice the frame via tryGet()/
+        get() -- which, measured live, lags the true arrival by ~15ms on
+        average (more under load) and carries a systematic per-camera bias
+        from main()'s fixed cam0->cam6 polling order. Bounded search (a
+        stale entry can accumulate here if q_full itself drops a frame
+        before this session dequeues it, e.g. during the pre-take flush in
+        capture_sync_calibration) rather than an unbounded loop; falls back
+        to time.time() if the callback hasn't caught up yet (should be rare
+        to never, given the callback consistently fired first/simultaneously
+        in testing) rather than block or misattribute a different frame's
+        timestamp.
+        """
+        for _ in range(64):
+            try:
+                entry_seq, entry_ts = self._full_arrival_queue.get_nowait()
+            except queue.Empty:
+                break
+            if entry_seq == seq:
+                return entry_ts
+            if entry_seq > seq:
+                break  # shouldn't happen -- lost race, fall back below
+        return time.time()
 
     def set_exposure(self, shutter_us, iso):
         """Live exposure change -- initialControl (set at pipeline build time)
@@ -558,13 +655,21 @@ class AppCameraSession:
         frame), and sidesteps the untested long-idle-drift question the
         README's persistent-streams note flags for an open pipeline sitting
         idle between takes -- each take gets a fresh offset instead.
+
+        host_ts_s comes from the same q_full arrival-callback path poll()
+        uses (_pop_full_arrival_ts), not a time.time() read taken right
+        after this method's own blocking get() -- even that tight a
+        measurement was ~15ms looser (median, on real hardware) than the
+        callback, which fires on depthai's own delivery thread the instant
+        the message arrives rather than whenever this method's own get()
+        call happens to unblock.
         """
         while self.q_full.tryGet() is not None:
             pass
         while self.q_preview.tryGet() is not None:
             pass
         msg = self.q_full.get(timeout=5.0)
-        host_ts_s = time.time()
+        host_ts_s = self._pop_full_arrival_ts(msg.getSequenceNum())
         ts = msg.getTimestamp()
         if ts is None:
             raise RuntimeError(f"{self.cam_label}: sync-calibration frame missing device timestamp")
@@ -592,7 +697,7 @@ class AppCameraSession:
             self.writer.stop()
             self.writer = None
 
-    def poll(self, decode_full=True, decode_preview=True, record=False):
+    def poll(self, decode_full=True, decode_preview=True, record=False, want_raw_bytes=False):
         """Same shape as calibrate.CalibCameraSession.poll(), plus fps tracking
         (exponential smoothing on full-frame arrival interval, same pattern
         oak_camera.py/capture.py use).
@@ -607,6 +712,16 @@ class AppCameraSession:
         last_frame_full is left at its previous value when skipped (stale,
         not cleared) since callers that need it check decode_full themselves
         before reading it.
+
+        want_raw_bytes=True (calibrate mode only -- see main()'s Pass 1)
+        extracts the raw JPEG bytes (calibrate._packet_bytes, a cheap buffer
+        copy, NOT a decode) into last_frame_full_bytes and returns without
+        touching decode_full/cv2.imdecode at all -- the decode itself moves
+        to a per-camera calibrate.DetectionWorker background thread instead,
+        since it and everything downstream of it (ChArUco detection, PnP
+        solve) has no dai.Device dependency (see module docstring). Ignored
+        when record=True and already recording, same precedence decode_full
+        has below.
 
         decode_preview=False skips decoding/exposing the preview frame (and
         the exposure-metadata read that comes with it) -- used by capture
@@ -625,22 +740,35 @@ class AppCameraSession:
         """
         self.preview_updated = False
         preview_msg = self.q_preview.tryGet()
-        if preview_msg is not None and decode_preview:
-            self.last_frame_preview = preview_msg.getCvFrame()
+        if preview_msg is not None:
             # Actual applied exposure (as opposed to what was last *requested*
             # via set_exposure) -- ImgFrame reports the real per-frame value,
             # confirmed live to update within a handful of frames of a
             # set_exposure() call. Used to give the exposure modal real
-            # confirmation feedback instead of a fire-and-forget send.
+            # confirmation feedback instead of a fire-and-forget send. This is
+            # a cheap metadata read on the already-dequeued message -- no
+            # decode involved -- so it must run every tick a message arrives,
+            # NOT only when decode_preview is True: decode_preview is a
+            # display-only concern (Capture mode only decodes the ONE
+            # selected camera's preview for showing on screen), and gating
+            # this metadata read on it too meant every OTHER camera's
+            # actual_shutter_us/actual_iso silently froze at whatever they
+            # were the last time that camera's preview happened to be on
+            # screen -- confirmed live: changing exposure visibly changed
+            # every camera's brightness, but only the one selected camera's
+            # reported values (and therefore the Camera Settings panel, and
+            # each take's logged iso/shutter_us) ever updated to match.
             self.actual_shutter_us = round(preview_msg.getExposureTime().total_seconds() * 1_000_000)
             self.actual_iso = preview_msg.getSensitivity()
-            self.preview_updated = True
+            if decode_preview:
+                self.last_frame_preview = preview_msg.getCvFrame()
+                self.preview_updated = True
 
         full_msg = self.q_full.tryGet()
         if full_msg is None:
             return False
 
-        self.last_frame_full_ts = time.time()
+        self.last_frame_full_ts = self._pop_full_arrival_ts(full_msg.getSequenceNum())
         now_mono = time.monotonic()
         if self._fps_prev_mono is not None:
             inst = 1.0 / max(now_mono - self._fps_prev_mono, 1e-6)
@@ -656,6 +784,10 @@ class AppCameraSession:
                 f"{self.last_frame_full_ts:.9f} {full_msg.getSequenceNum()} "
                 f"{device_ts_s:.9f} {len(data)}\n"
             )
+            return True
+
+        if want_raw_bytes:
+            self.last_frame_full_bytes = calibrate._packet_bytes(full_msg)
             return True
 
         if not decode_full:
@@ -950,7 +1082,48 @@ def main():
 
     # ── Persistent state, shared by whichever mode is active ──────────────────
     calib_states = {cam_id: calibrate.CameraCalibState(cam_id, image_size, cfg) for cam_id in cam_ids}
+    # Bumped every time calib_states[cam_id] is reassigned (start_calibration,
+    # start_new_calibration_live, "reset"/"uncache" commands) -- lets Pass 2
+    # discard a DetectionWorker result computed against a since-discarded
+    # CameraCalibState (in flight when the reset happened) instead of
+    # applying a stale detection to the fresh one. See calib_workers below.
+    calib_epoch = {cam_id: 0 for cam_id in cam_ids}
+    # One background thread per camera, for the app's whole life -- has no
+    # dai dependency and holds no CameraCalibState reference (see
+    # calibrate.DetectionWorker), so it's independent of both step_boot()
+    # and every calib_states reset above; started once, unconditionally.
+    calib_workers = {cam_id: calibrate.DetectionWorker(cam_id, cfg) for cam_id in cam_ids}
+    for worker in calib_workers.values():
+        worker.start()
+    # Same background-thread treatment for the periodic cv2.calibrateCamera
+    # pass (measured at ~200-400ms for 30-60 samples, growing with sample
+    # count) -- inline on the main thread this reproduces the exact
+    # "drags fps down" symptom DetectionWorker was built to avoid, even
+    # throttled to one camera per tick (tried live: didn't help, since total
+    # calibrateCamera cost is unchanged by throttling, only its
+    # distribution). recalib_in_flight tracks which cameras currently have
+    # an outstanding job, so Pass 2 never submits a second one for the same
+    # camera before the first's result is applied -- see RecalibrationWorker.
+    recalib_workers = {cam_id: calibrate.RecalibrationWorker(cam_id) for cam_id in cam_ids}
+    for worker in recalib_workers.values():
+        worker.start()
+    recalib_in_flight = set()
     pose_graph = calibrate.PoseGraph(cfg)
+    # PoseGraph.solve() itself (specifically _optimize_component's
+    # scipy.optimize.least_squares) gets the same background-thread
+    # treatment -- measured live at ~120-160ms EVERY tick once the graph's
+    # chain-consistency error crosses threshold, which reproduced the exact
+    # "drags fps down" symptom the other two workers above were built to
+    # avoid. One worker (not per-camera -- there's only one pose graph);
+    # pose_solve_in_flight is the single-job-at-a-time gate, mirroring
+    # recalib_in_flight; pose_graph_epoch is the single-pose-graph
+    # equivalent of calib_epoch, bumped whenever pose_graph itself is
+    # reset (clear_extrinsics_for), so a solve result computed against a
+    # since-cleared graph gets discarded instead of resurrecting stale poses.
+    pose_graph_worker = calibrate.PoseGraphWorker(cfg)
+    pose_graph_worker.start()
+    pose_graph_epoch = {"v": 0}
+    pose_solve_in_flight = False
     pose_result = None
     world_align = {"pending": False, "R": None, "t": None}
     # app_state["mode"]: "calibrate" (live engine running), "loaded" (static
@@ -977,6 +1150,8 @@ def main():
             )
             for cam_id in cam_ids
         }
+        for cam_id in cam_ids:
+            calib_epoch[cam_id] += 1
         print("[Calibration] Live calibration started.")
     else:
         print("[Calibration] Continuing uncalibrated.")
@@ -1063,6 +1238,28 @@ def main():
         world_align["pending"] = True
         print("[Align] Waiting for a fresh detection of the alignment board "
               "(any one camera) to set the world's origin and down direction...")
+
+    def _world_align_status_text():
+        """Live status line shown under the "Set down direction from board"
+        button -- without this, an armed request that can never resolve (most
+        commonly: right after "Start new calibration" wipes pose_graph/
+        pose_result, so no camera has a solved extrinsic pose yet) looks
+        identical to the button silently doing nothing. See module docstring/
+        request_world_alignment for why a solved pose is required at all.
+        """
+        if app_state["mode"] != "calibrate":
+            return ("_Only available during a live calibration session -- "
+                    "click 'Start new calibration' first._")
+        if world_align["pending"]:
+            if not detection_state["enabled"]:
+                return "_Armed, but ChArUco detection is off -- turn detection back on to resolve it._"
+            if pose_result is None or not pose_result["poses"]:
+                return ("_Armed -- waiting for a solved camera pose. Show the MAIN "
+                        "calibration board to 2+ cameras first, then the alignment board._")
+            return "_Armed -- show the alignment board to any posed camera to set the world's origin/down direction._"
+        if world_align["R"] is not None:
+            return "_Down direction/origin already set._"
+        return "_Not armed. Click the button, then show the alignment board._"
 
     # Lets the operator pause the expensive part of Pass 2 (both the full-res
     # JPEG decode and ChArUco detection -- see poll()'s decode_full param,
@@ -1239,6 +1436,7 @@ def main():
             )
 
             viser_mgr.add_world_alignment_button(request_world_alignment)
+            align_status_md = viser_mgr.server.gui.add_markdown(_world_align_status_text())
 
             save_button = viser_mgr.server.gui.add_button("Save now", color="green")
             save_button.on_click(lambda _: cmd_queue.put("save"))
@@ -1557,6 +1755,7 @@ def main():
         if target == "all":
             pose_graph = calibrate.PoseGraph(cfg)
             pose_result = None
+            pose_graph_epoch["v"] += 1
             world_align["pending"] = False
             world_align["R"] = None
             world_align["t"] = None
@@ -1572,6 +1771,8 @@ def main():
             stale = [key for key in pose_graph.observations if target in key]
             for key in stale:
                 del pose_graph.observations[key]
+            if stale:
+                pose_graph_epoch["v"] += 1
             viser_mgr.remove_camera_pose(target)
             if stale:
                 print(f"[Reset] {target}: {len(stale)} pose-graph edge(s) cleared.")
@@ -1617,6 +1818,7 @@ def main():
             calib_states[cam_id] = calibrate.make_calib_state(
                 cam_id, image_size, cfg, sessions[cam_id].device_id, intrinsics_cache,
             )
+            calib_epoch[cam_id] += 1
             viser_mgr.hide_board_pose(cam_id)
         clear_extrinsics_for("all")
         mode_md.content = "Mode: **calibrate**"
@@ -1779,6 +1981,7 @@ def main():
                                 calib_states[cam_id] = calibrate.make_calib_state(
                                     cam_id, image_size, cfg, sessions[cam_id].device_id, intrinsics_cache,
                                 )
+                                calib_epoch[cam_id] += 1
                                 print(f"[Reset] {cam_id} calibration state cleared.")
                         clear_extrinsics_for(target)
                     elif cmd.startswith("uncache"):
@@ -1798,6 +2001,7 @@ def main():
                                       f"(backed up to {backup_path}).")
                             if cam_id in calib_states:
                                 calib_states[cam_id] = calibrate.CameraCalibState(cam_id, image_size, cfg)
+                                calib_epoch[cam_id] += 1
                                 print(f"[Reset] {cam_id} calibration state cleared (intrinsics uncached).")
                         if evicted and cfg["intrinsics_cache"]["enabled"]:
                             calibrate._atomic_write_json(cfg["intrinsics_cache"]["path"], intrinsics_cache)
@@ -2000,17 +2204,30 @@ def main():
                 # "starting" phase transition below) specifically so this
                 # can't silently keep running during a recording.
                 recording_now = capture_state["phase"] == "recording" and session.recording_active
+                # "loaded" mode's inline sanity-check detection still decodes
+                # here (app.py:2197ish, out of scope for the worker-thread
+                # move -- it's cheap relative to calibrate mode's
+                # process_detection/maybe_recalibrate accumulation cost, see
+                # module docstring); "calibrate" mode instead hands off raw
+                # bytes to that camera's calibrate.DetectionWorker below, so
+                # decode+detect happens off this thread.
                 need_full_decode = (
                     not recording_now
                     and detection_state["enabled"]
-                    and app_state["mode"] in ("loaded", "calibrate")
+                    and app_state["mode"] == "loaded"
+                )
+                need_raw_bytes = (
+                    not recording_now
+                    and detection_state["enabled"]
+                    and app_state["mode"] == "calibrate"
                 )
                 decode_this_preview = previews_on and (
                     show_grid or (show_single and cam_id == capture_preview["selected"])
                 )
                 try:
                     got_frame = session.poll(
-                        decode_full=need_full_decode, decode_preview=decode_this_preview, record=recording_now,
+                        decode_full=need_full_decode, decode_preview=decode_this_preview,
+                        record=recording_now, want_raw_bytes=need_raw_bytes,
                     )
                 except Exception as exc:
                     print(f"[Error] {cam_id} disconnected: {exc}")
@@ -2068,6 +2285,16 @@ def main():
                 if need_full_decode and got_frame and session.last_frame_full is not None:
                     fresh_frames[cam_id] = (session.last_frame_full, session.last_frame_full_ts)
 
+                if need_raw_bytes and got_frame and session.last_frame_full_bytes is not None:
+                    calib_workers[cam_id].submit(
+                        epoch=calib_epoch[cam_id],
+                        frame_ts=session.last_frame_full_ts,
+                        jpeg_bytes=session.last_frame_full_bytes,
+                        K=calib_states[cam_id].K.copy(),
+                        dist=calib_states[cam_id].dist.copy(),
+                        do_alignment=world_align["pending"],
+                    )
+
             if exposure_state["pending"]:
                 confirmed = all(
                     s.actual_shutter_us == exposure_state["shutter"] and s.actual_iso == exposure_state["iso"]
@@ -2091,21 +2318,33 @@ def main():
             pass2_t0 = time.perf_counter()
             last_pass2_cams = len(fresh_frames)
             if app_state["mode"] == "calibrate" and detection_state["enabled"]:
-                for cam_id, (frame, frame_ts) in fresh_frames.items():
+                # Decode+detect+PnP-solve for this mode runs on a per-camera
+                # calibrate.DetectionWorker background thread (submitted in
+                # Pass 1 above) -- this just drains whatever result is
+                # waiting and applies it, exactly like the old inline
+                # decode+detect body used to, just fed from a queue instead
+                # of computing the detection itself. A result whose epoch
+                # doesn't match calib_epoch[cam_id] was computed against a
+                # since-reset CameraCalibState (e.g. "Start new calibration"
+                # fired while it was in flight) and is discarded.
+                drained_count = 0
+                # Cameras whose last_edge_pose is genuinely fresh THIS tick
+                # -- see the pairwise correlation loop below, which must not
+                # re-add an edge observation built from a pair of
+                # last_edge_pose values neither of which actually changed
+                # since the last tick.
+                fresh_edge_cam_ids = set()
+                for cam_id in cam_ids:
+                    result = calib_workers[cam_id].try_get_result()
+                    if result is None or result["epoch"] != calib_epoch[cam_id]:
+                        continue
+                    drained_count += 1
                     state = calib_states[cam_id]
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    frame_ts = result["frame_ts"]
 
-                    if world_align["pending"]:
-                        align_detection = calibrate.detect_charuco(alignment_detector, gray)
-                        align_pose = None
-                        if align_detection is not None:
-                            a_corners2d, a_ids = align_detection
-                            if len(a_ids) >= cfg["quality_gates"]["min_corners"]:
-                                align_pose = calibrate.solve_board_pose(
-                                    alignment_board_points_3d[a_ids], a_corners2d, state.K, state.dist,
-                                )
-                        if align_pose is not None:
-                            a_R, a_t, _a_err = align_pose
+                    if result["did_alignment"]:
+                        if result["align_pose"] is not None:
+                            a_R, a_t, _a_err = result["align_pose"]
                             state.last_alignment_pose = (frame_ts, a_R, a_t)
                             if pose_result is not None and cam_id in pose_result["poses"]:
                                 T_cam_to_world = calibrate.invert_T(pose_result["poses"][cam_id])
@@ -2117,24 +2356,21 @@ def main():
                         else:
                             viser_mgr.hide_alignment_board_pose(cam_id)
 
-                    detection = calibrate.detect_charuco(detector, gray)
-                    if detection is None:
+                    if result["ids"] is None:
                         viser_mgr.hide_board_pose(cam_id)
                         continue
-                    corners2d, ids = detection
+                    corners2d, ids = result["corners2d"], result["ids"]
 
-                    pose, accepted = calibrate.process_detection(state, corners2d, ids, board_points_3d, gray, cfg)
-                    if accepted:
-                        was_converged = state.converged
-                        calibrate.maybe_recalibrate(state, cfg)
-                        if cfg["intrinsics_cache"]["enabled"] and state.converged and not was_converged:
-                            calibrate.upsert_intrinsics_cache(cfg, sessions[cam_id].device_id, state, intrinsics_cache)
-                    if pose is None:
+                    if result["pose"] is not None:
+                        R, t, err = result["pose"]
+                        calibrate.accept_sample(state, corners2d, ids, board_points_3d, R, t, cfg)
+                    if result["pose"] is None:
                         viser_mgr.hide_board_pose(cam_id)
                         continue
-                    R, t, err = pose
+                    R, t, err = result["pose"]
                     state.last_detection_ts = frame_ts
                     state.last_edge_pose = (frame_ts, R, t, err)
+                    fresh_edge_cam_ids.add(cam_id)
                     state.last_warned_no_detection = False
 
                     if pose_result is not None and cam_id in pose_result["poses"]:
@@ -2143,12 +2379,68 @@ def main():
                     else:
                         viser_mgr.hide_board_pose(cam_id)
 
+                # cv2.calibrateCamera itself runs on a per-camera
+                # RecalibrationWorker background thread -- submitting a job
+                # is cheap (a list copy, no cv2 call), so every due camera
+                # can be submitted the same tick; recalib_in_flight is the
+                # only thing preventing a camera being submitted twice
+                # before its previous result is applied.
+                for cam_id in cam_ids:
+                    state = calib_states[cam_id]
+                    if cam_id not in recalib_in_flight and calibrate.due_for_recalibrate(state, cfg):
+                        recalib_in_flight.add(cam_id)
+                        recalib_workers[cam_id].submit(
+                            epoch=calib_epoch[cam_id],
+                            object_points=list(state.object_points),
+                            image_points=list(state.image_points),
+                            image_size=state.image_size,
+                            K=state.K, dist=state.dist,
+                            has_intrinsics_estimate=state.has_intrinsics_estimate,
+                        )
+
+                for cam_id in cam_ids:
+                    result_msg = recalib_workers[cam_id].try_get_result()
+                    if result_msg is None:
+                        continue
+                    recalib_in_flight.discard(cam_id)
+                    if result_msg["epoch"] != calib_epoch[cam_id]:
+                        continue
+                    state = calib_states[cam_id]
+                    was_converged = state.converged
+                    calibrate.apply_recalibration_result(state, result_msg["result"], cfg)
+                    if cfg["intrinsics_cache"]["enabled"] and state.converged and not was_converged:
+                        calibrate.upsert_intrinsics_cache(cfg, sessions[cam_id].device_id, state, intrinsics_cache)
+
+                last_pass2_cams = drained_count
+
+                # Each camera's last_edge_pose PERSISTS across ticks (only
+                # overwritten when that camera's own DetectionWorker
+                # produces a fresh result -- see fresh_edge_cam_ids above),
+                # but this loop itself runs every tick. With independent
+                # per-camera async detection now decoupled from the tick
+                # rate, most ticks see NEITHER side of most pairs change --
+                # without the fresh_edge_cam_ids guard below, the exact
+                # same (cam_a, cam_b) observation (same timestamps, same
+                # R/t) would get added to pose_graph.observations again on
+                # every one of those ticks until one side finally refreshes,
+                # flooding the graph with duplicates of whatever detection
+                # happens to sit stale the longest and skewing
+                # aggregate_edges' mean toward it. Requiring at least one
+                # side to be fresh THIS tick restores the old synchronous
+                # code's implicit guarantee (every tick's data was
+                # genuinely new, since all cameras refreshed together) --
+                # reusing cam_a's still-timestamp-valid pose against a
+                # DIFFERENT, newly-fresh cam_b is still a legitimate distinct
+                # observation and stays allowed, only a bit-for-bit repeat
+                # of an already-recorded pair is excluded.
                 for i, cam_a in enumerate(cam_ids):
                     edge_a = calib_states[cam_a].last_edge_pose
                     if edge_a is None:
                         continue
                     ts_a, R_a, t_a, err_a = edge_a
                     for cam_b in cam_ids[i + 1:]:
+                        if cam_a not in fresh_edge_cam_ids and cam_b not in fresh_edge_cam_ids:
+                            continue
                         edge_b = calib_states[cam_b].last_edge_pose
                         if edge_b is None:
                             continue
@@ -2157,9 +2449,65 @@ def main():
                             pose_graph.add_observation(cam_a, R_a, t_a, err_a, cam_b, R_b, t_b, err_b)
 
                 if len(cam_ids) >= 2:
-                    pose_result = pose_graph.solve(cam_ids)
+                    # pose_graph.solve() itself runs on a background
+                    # PoseGraphWorker thread -- measured live at 120-160ms
+                    # EVERY tick once the graph's chain-consistency error
+                    # crosses naive_chain_error_threshold_deg (triggering
+                    # _optimize_component's scipy.optimize.least_squares),
+                    # which reproduced the exact "drags fps down" symptom
+                    # DetectionWorker/RecalibrationWorker were built to
+                    # avoid. Same split: main thread hands over a snapshot
+                    # of pose_graph.observations, applies the result once
+                    # ready. pose_solve_in_flight prevents submitting a
+                    # second job before the first's result is applied --
+                    # pose_result is left at its previous value (or None,
+                    # before the first solve ever completes) on ticks with
+                    # no fresh result, same "freeze, don't disappear"
+                    # precedent used elsewhere in this loop.
+                    if not pose_solve_in_flight:
+                        pose_solve_in_flight = True
+                        pose_graph_worker.submit(
+                            epoch=pose_graph_epoch["v"],
+                            observations_snapshot={k: list(v) for k, v in pose_graph.observations.items()},
+                            cam_ids=cam_ids,
+                        )
+                    # apply_world_alignment mutates pose_result["poses"] IN
+                    # PLACE and must only ever run once per FRESH, unaligned
+                    # solve (see its own docstring) -- re-running it on a
+                    # pose_result that's already been aligned (e.g. on a
+                    # tick where the worker hasn't produced a new result
+                    # yet, so pose_result is the same object as last tick)
+                    # would compose the realignment transform on top of
+                    # itself, visibly flip-flopping the displayed world
+                    # between single- and double-aligned every other tick.
+                    # So the standing-alignment re-apply below only runs
+                    # inside "a genuinely new result just arrived" -- never
+                    # unconditionally every tick like the old synchronous
+                    # code could get away with (it built a brand-new
+                    # pose_result every tick by construction).
+                    pg_result_msg = pose_graph_worker.try_get_result()
+                    if pg_result_msg is not None:
+                        pose_solve_in_flight = False
+                        if pg_result_msg["epoch"] == pose_graph_epoch["v"]:
+                            pose_result = pg_result_msg["result"]
+                            calibrate.apply_world_alignment(pose_result, world_align["R"], world_align["t"])
 
-                    if world_align["pending"]:
+                    # Unlike the re-apply above, this only READS pose_result
+                    # (world_align["R"]/["t"] start out None, so
+                    # apply_world_alignment no-ops until the block below
+                    # sets them) -- so it's safe, and worth doing, to check
+                    # every tick against whatever pose_result currently is
+                    # (this tick's fresh one, or the last fresh one), rather
+                    # than only on ticks with a brand-new solve. The
+                    # alignment-board detection itself is fleeting (2.0s
+                    # freshness window, calib_states[cam_id].
+                    # last_alignment_pose refreshed independently by
+                    # DetectionWorker) -- gating this check to "only as
+                    # often as a new pose-graph solve lands" meant missing
+                    # that window more often than necessary, measured live
+                    # to add several extra seconds to how long "Set down
+                    # direction from board" took to resolve.
+                    if world_align["pending"] and pose_result is not None:
                         now_wall = time.time()
                         for cam_id in cam_ids:
                             align_pose = calib_states[cam_id].last_alignment_pose
@@ -2173,6 +2521,15 @@ def main():
                                 T_cam_to_world, R_bc, t_bc,
                             )
                             world_align["pending"] = False
+                            # world_align["R"] was None on every prior tick
+                            # (that's what gated this block from running at
+                            # all until now), so pose_result -- however
+                            # stale its OBJECT reference is -- has never
+                            # been touched by apply_world_alignment before;
+                            # applying it here, once, right as R/t are set,
+                            # gives immediate visual feedback instead of
+                            # waiting for the next fresh solve.
+                            calibrate.apply_world_alignment(pose_result, world_align["R"], world_align["t"])
                             for c in cam_ids:
                                 viser_mgr.hide_alignment_board_pose(c)
                             viser_mgr.update_alignment_board_pose(
@@ -2183,11 +2540,10 @@ def main():
                             print(f"[Align] World origin/down direction set from {cam_id}'s "
                                   f"alignment-board detection.")
                             break
-                    calibrate.apply_world_alignment(pose_result, world_align["R"], world_align["t"])
 
                     for cam_id in cam_ids:
                         state = calib_states[cam_id]
-                        if cam_id in pose_result["poses"]:
+                        if pose_result is not None and cam_id in pose_result["poses"]:
                             T_cam_to_world = calibrate.invert_T(pose_result["poses"][cam_id])
                             viser_mgr.update_camera_pose(cam_id, T_cam_to_world, state.K, *state.image_size)
                             wire_frustum_click(cam_id)
@@ -2233,6 +2589,8 @@ def main():
             else:  # uncalibrated
                 for cam_id in cam_ids:
                     viser_mgr.mark_pose_unknown(cam_id)
+
+            align_status_md.content = _world_align_status_text()
 
             # Capture preview's "middle camera" -- re-picked every tick from
             # whatever poses currently exist (viser_mgr.frustums, populated
@@ -2349,6 +2707,19 @@ def main():
 
     finally:
         capture.close_recorders_parallel(list(sessions.values()))
+        # Mailbox queues, no backlog to drain (unlike postproc below) -- each
+        # worker.stop() is a stop-event set + a short bounded join.
+        for cam_id, worker in calib_workers.items():
+            worker.stop()
+            if worker.is_alive():
+                print(f"[Stop] {cam_id}'s detection worker didn't stop in time -- abandoning it.")
+        for cam_id, worker in recalib_workers.items():
+            worker.stop()
+            if worker.is_alive():
+                print(f"[Stop] {cam_id}'s recalibration worker didn't stop in time -- abandoning it.")
+        pose_graph_worker.stop()
+        if pose_graph_worker.is_alive():
+            print("[Stop] The pose-graph worker didn't stop in time -- abandoning it.")
         if app_state["mode"] == "calibrate":
             device_ids = {cam_id: sessions[cam_id].device_id for cam_id in cam_ids}
             calibrate.save_output(cam_ids, calib_states, pose_result, cfg, device_ids)

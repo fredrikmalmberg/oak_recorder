@@ -230,6 +230,7 @@ def align_session(
     rec_w=None,
     rec_h=None,
     align_host_only=False,
+    align_device_raw=False,
 ):
     session_dir, cameras = discover_session(session_dir)
 
@@ -246,7 +247,20 @@ def align_session(
         _w, _h, _fps, host_offset_s = parse_log_header(cam["log_path"])
         offsets[cam["label"]] = host_offset_s
 
-    if align_host_only:
+    if align_device_raw:
+        # Each camera's device_ts_s is that camera's own onboard clock,
+        # counting from an arbitrary per-device epoch set at boot (NOT a
+        # shared reference across cameras) -- unlike unified_device below,
+        # this deliberately does NOT add host_offset_s to bring them onto a
+        # common timeline, so cross-camera comparisons here reflect however
+        # far apart each device's own boot-time epoch happens to be, not
+        # true simultaneity. Diagnostic mode only: lets you see what
+        # alignment looks like with zero correction applied, for comparison
+        # against the corrected unified_device result.
+        time_key = "device_ts_s"
+        timebase = "device_raw"
+        use_unified = False
+    elif align_host_only:
         time_key = "host_ts_s"
         timebase = "host"
         use_unified = False
@@ -419,17 +433,16 @@ def align_session(
     cross_spread_max = float(max(cross_camera_spreads_ms)) if cross_camera_spreads_ms else 0.0
     cross_spread_p95 = percentile(cross_camera_spreads_ms, 95)
 
-    spread_key = (
-        "cross_camera_unified_spread_ms"
-        if use_unified
-        else "cross_camera_host_spread_ms"
-    )
-    overlap_start_key = (
-        "overlap_start_unified_s" if use_unified else "overlap_start_host_s"
-    )
-    overlap_end_key = (
-        "overlap_end_unified_s" if use_unified else "overlap_end_host_s"
-    )
+    # Keyed off timebase directly (not just the unified/not-unified split)
+    # so device_raw gets its own accurate report key instead of being
+    # lumped in with "host" -- they're different timebases with different
+    # meanings (see align_device_raw's docstring note above).
+    timebase_suffix = {
+        "unified_device": "unified", "host": "host", "host_legacy": "host", "device_raw": "device_raw",
+    }[timebase]
+    spread_key = f"cross_camera_{timebase_suffix}_spread_ms"
+    overlap_start_key = f"overlap_start_{timebase_suffix}_s"
+    overlap_end_key = f"overlap_end_{timebase_suffix}_s"
 
     report = {
         "session_dir": session_dir,
@@ -730,15 +743,26 @@ def main():
         help="Align on raw host receive timestamps (ignore device sync calibration)",
     )
     parser.add_argument(
+        "--align-device-raw",
+        action="store_true",
+        help=(
+            "Align on each camera's own raw device_ts_s, with NO host_offset_s "
+            "correction applied -- diagnostic only, since each device's clock "
+            "counts from its own arbitrary per-boot epoch, not a shared reference"
+        ),
+    )
+    parser.add_argument(
         "--align-raw",
         action="store_true",
         help="Skip alignment; build grid MP4 from raw MJPEG only",
     )
     args = parser.parse_args()
 
+    exclusive = [args.align_raw, args.align_host, args.align_device_raw]
+    if sum(exclusive) > 1:
+        parser.error("--align-raw, --align-host, and --align-device-raw are mutually exclusive")
+
     if args.align_raw:
-        if args.align_host:
-            parser.error("--align-raw cannot be combined with --align-host")
         mp4_path = export_raw_grid_mp4(args.session_dir, fps=args.fps)
         print(f"[Success] Grid mp4 saved: {mp4_path}")
         return
@@ -748,6 +772,7 @@ def main():
         align_threshold_ms=args.align_threshold_ms,
         fps=args.fps,
         align_host_only=args.align_host,
+        align_device_raw=args.align_device_raw,
     )
 
     if args.output_mp4 == "small":
