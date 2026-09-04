@@ -378,6 +378,48 @@ def passes_novelty_gate(state, R, t, cfg):
     return True
 
 
+def evaluate_detection(corners2d, ids, board_points_3d, K, dist, gray, cfg):
+    """Corner-count + blur quality gates and the PnP solve -- pure, takes
+    K/dist as plain arguments rather than a CameraCalibState, and mutates
+    nothing. Safe to call from any thread (see DetectionWorker in app.py's
+    calibrate-mode pipeline, which calls this off the main thread against a
+    snapshot of K/dist). Returns (R, t, err) or None.
+    """
+    qg = cfg["quality_gates"]
+    if len(ids) < qg["min_corners"]:
+        return None
+    if laplacian_sharpness(gray) < qg["blur_laplacian_var_min"]:
+        return None
+    obj = board_points_3d[ids]
+    return solve_board_pose(obj, corners2d, K, dist)
+
+
+def accept_sample(state, corners2d, ids, board_points_3d, R, t, cfg):
+    """Coverage/novelty/max-samples accumulation gates for an already-solved
+    detection -- mutates state (object_points/image_points/accepted_poses/
+    coverage/samples_since_calib), so callers must only ever call this from
+    whichever single thread owns that CameraCalibState (the main thread, for
+    app.py's calibrate mode -- see DetectionWorker's ownership note). Returns
+    whether the sample was accepted.
+    """
+    if state.intrinsics_locked:
+        return False
+    qg = cfg["quality_gates"]
+    if len(state.coverage.cells_touched(corners2d)) < qg["min_coverage_cells_per_frame"]:
+        return False
+    if not passes_novelty_gate(state, R, t, cfg):
+        return False
+    if state.sample_count() >= cfg["intrinsics"]["max_samples_per_camera"]:
+        return False
+    obj = board_points_3d[ids]
+    state.object_points.append(obj.astype(np.float32))
+    state.image_points.append(corners2d.astype(np.float32))
+    state.accepted_poses.append((R, t))
+    state.coverage.mark(corners2d)
+    state.samples_since_calib += 1
+    return True
+
+
 def process_detection(state, corners2d, ids, board_points_3d, gray, cfg):
     """Runs all quality gates; if the frame is accepted, adds it to the
     camera's intrinsic-calibration sample set and returns the board pose
@@ -385,62 +427,276 @@ def process_detection(state, corners2d, ids, board_points_3d, gray, cfg):
     that fail the intrinsic-sample gates can still be returned for extrinsics
     purposes as long as they clear the corner-count and blur gates, since more
     simultaneous-detection data only helps the pose graph.
+
+    Thin wrapper over evaluate_detection (pure) + accept_sample (state
+    mutation), kept as one call for callers that want detect+accept together
+    on a single thread (calibrate.py's own CLI main loop, hand_capture_live.py).
+    app.py's calibrate mode calls the two halves separately across a worker-
+    thread boundary instead -- see DetectionWorker.
     """
-    qg = cfg["quality_gates"]
-    if len(ids) < qg["min_corners"]:
-        return None, False
-
-    if laplacian_sharpness(gray) < qg["blur_laplacian_var_min"]:
-        return None, False
-
-    obj = board_points_3d[ids]
-    pose = solve_board_pose(obj, corners2d, state.K, state.dist)
+    pose = evaluate_detection(corners2d, ids, board_points_3d, state.K, state.dist, gray, cfg)
     if pose is None:
         return None, False
     R, t, err = pose
-
-    accepted = False
-    if not state.intrinsics_locked:
-        if len(state.coverage.cells_touched(corners2d)) >= qg["min_coverage_cells_per_frame"]:
-            if passes_novelty_gate(state, R, t, cfg):
-                ic = cfg["intrinsics"]
-                if state.sample_count() < ic["max_samples_per_camera"]:
-                    state.object_points.append(obj.astype(np.float32))
-                    state.image_points.append(corners2d.astype(np.float32))
-                    state.accepted_poses.append((R, t))
-                    state.coverage.mark(corners2d)
-                    state.samples_since_calib += 1
-                    accepted = True
-
+    accepted = accept_sample(state, corners2d, ids, board_points_3d, R, t, cfg)
     return (R, t, err), accepted
 
 
-def maybe_recalibrate(state, cfg):
+class DetectionWorker(threading.Thread):
+    """Per-camera background thread that does app.py calibrate-mode's
+    decode+detect+PnP-solve off the main dai-access thread -- see app.py's
+    module docstring "Single-thread dai-access rule" for why this only ever
+    starts downstream of raw JPEG bytes already being off a dai queue
+    (nothing in this class ever touches a dai.Device, a pipeline, or a
+    queue).
+
+    Deliberately owns nothing shared: it never reads or writes a
+    CameraCalibState. Every submitted work item is a self-contained snapshot
+    (JPEG bytes + a K/dist copy + an epoch token); every result is a
+    self-contained detection (corners/ids/pose only). This sidesteps the
+    accept/accumulate race entirely -- the caller (app.py's Pass 2) still
+    owns calling accept_sample/maybe_recalibrate itself once a result comes
+    back, exactly as process_detection did inline before.
+
+    Builds its OWN private detector/alignment_detector rather than sharing
+    the main thread's -- concurrent calls into one cv2.aruco.CharucoDetector
+    instance from multiple threads isn't something this codebase has
+    verified as safe, and build_board() is cheap enough to duplicate per
+    camera.
+
+    Both queues are maxsize=1 "mailboxes", not job queues: only the newest
+    submitted frame/result ever matters for a live calibration UI (an
+    operator moving the board makes older queued frames actively
+    misleading), so submitting/publishing always replaces whatever's
+    currently waiting rather than blocking or piling up a backlog -- see
+    _mailbox_put. This is deliberately different from capture.
+    BackgroundVideoWriter's queue, which drops-and-counts instead, because
+    every recorded frame matters there.
+    """
+
+    def __init__(self, cam_id, cfg):
+        super().__init__(daemon=True, name=f"DetectionWorker-{cam_id}")
+        self.cam_id = cam_id
+        self.cfg = cfg
+        _board, self.detector, self.board_points_3d = build_board(cfg)
+        _align_board, self.alignment_detector, self.alignment_board_points_3d = (
+            build_board(cfg, "alignment_board")
+        )
+        self.in_q = queue.Queue(maxsize=1)
+        self.out_q = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+
+    @staticmethod
+    def _mailbox_put(q, item):
+        try:
+            q.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass  # lost a race with the consumer taking the slot -- fine
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            pass  # lost a race with a new producer -- fine, it's newer than us anyway
+
+    def submit(self, epoch, frame_ts, jpeg_bytes, K, dist, do_alignment):
+        self._mailbox_put(self.in_q, {
+            "epoch": epoch, "frame_ts": frame_ts, "jpeg_bytes": jpeg_bytes,
+            "K": K, "dist": dist, "do_alignment": do_alignment,
+        })
+
+    def try_get_result(self):
+        """Non-blocking; returns the latest available result dict or None.
+        Call once per tick per camera from the main thread (app.py's Pass 2).
+        """
+        try:
+            return self.out_q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                item = self.in_q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            frame = cv2.imdecode(np.frombuffer(item["jpeg_bytes"], dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            result = {
+                "epoch": item["epoch"], "frame_ts": item["frame_ts"],
+                "corners2d": None, "ids": None, "pose": None,
+                "did_alignment": item["do_alignment"], "align_pose": None,
+            }
+            detection = detect_charuco(self.detector, gray)
+            if detection is not None:
+                corners2d, ids = detection
+                result["corners2d"], result["ids"] = corners2d, ids
+                result["pose"] = evaluate_detection(
+                    corners2d, ids, self.board_points_3d, item["K"], item["dist"], gray, self.cfg,
+                )
+
+            if item["do_alignment"]:
+                align_detection = detect_charuco(self.alignment_detector, gray)
+                if align_detection is not None:
+                    a_corners2d, a_ids = align_detection
+                    if len(a_ids) >= self.cfg["quality_gates"]["min_corners"]:
+                        result["align_pose"] = solve_board_pose(
+                            self.alignment_board_points_3d[a_ids], a_corners2d, item["K"], item["dist"],
+                        )
+
+            self._mailbox_put(self.out_q, result)
+
+    def stop(self):
+        self._stop_event.set()
+        self.join(timeout=2.0)
+
+
+def due_for_recalibrate(state, cfg):
+    """Cheap, pure eligibility check mirroring maybe_recalibrate's own early
+    guards -- lets a caller find which camera(s) are due for a recalibration
+    pass without paying cv2.calibrateCamera's cost (measured at ~200-400ms
+    for 30-60 samples, growing with sample count) just to find out. See
+    app.py's Pass 2 / RecalibrationWorker below.
+    """
     if state.intrinsics_locked:
-        return
+        return False
     ic = cfg["intrinsics"]
     if state.sample_count() < ic["min_samples_before_calibrate"]:
-        return
+        return False
     if state.samples_since_calib < ic["recalibrate_every_n_samples"]:
-        return
-    w, h = state.image_size
-    flags = cv2.CALIB_USE_INTRINSIC_GUESS if state.has_intrinsics_estimate else 0
+        return False
+    return True
+
+
+def compute_recalibration(object_points, image_points, image_size, K, dist, has_intrinsics_estimate):
+    """Pure cv2.calibrateCamera wrapper -- no state mutation, takes every
+    input as a plain argument (not a CameraCalibState), so it's safe to call
+    against a snapshot from any thread. Returns (K, dist, reproj_error) on
+    success, None on failure (mirrors maybe_recalibrate's own try/except).
+    See RecalibrationWorker, which calls this off the main thread.
+    """
+    w, h = image_size
+    flags = cv2.CALIB_USE_INTRINSIC_GUESS if has_intrinsics_estimate else 0
     try:
-        ret, K, dist, _, _ = cv2.calibrateCamera(
-            state.object_points, state.image_points, (w, h),
-            state.K.copy(), state.dist.copy(), flags=flags,
+        ret, K_out, dist_out, _, _ = cv2.calibrateCamera(
+            object_points, image_points, (w, h), K.copy(), dist.copy(), flags=flags,
         )
-    except cv2.error as exc:
-        print(f"[Calib] {state.cam_id}: calibrateCamera failed ({exc}); keeping previous estimate.")
+    except cv2.error:
+        return None
+    return K_out, dist_out.ravel(), float(ret)
+
+
+def apply_recalibration_result(state, result, cfg):
+    """Applies a compute_recalibration() return value (or None, on failure)
+    to state -- the state-mutating half maybe_recalibrate used to do inline
+    right after its own cv2.calibrateCamera call. Factored out so app.py's
+    async result-draining step (RecalibrationWorker) and the synchronous
+    maybe_recalibrate below share one implementation instead of drifting.
+    """
+    if result is None:
+        print(f"[Calib] {state.cam_id}: calibrateCamera failed; keeping previous estimate.")
         state.samples_since_calib = 0
         return
-    state.K, state.dist, state.reproj_error = K, dist.ravel(), float(ret)
+    ic = cfg["intrinsics"]
+    state.K, state.dist, state.reproj_error = result
     state.has_intrinsics_estimate = True
     state.samples_since_calib = 0
     state.converged = (
         state.reproj_error <= ic["reproj_error_threshold_px"]
         and state.coverage.ratio() >= ic["coverage_ratio_threshold"]
     )
+
+
+def maybe_recalibrate(state, cfg):
+    """Synchronous decide+compute+apply, all inline on the caller's own
+    thread -- used by calibrate.py's own CLI main loop and
+    hand_capture_live.py, neither of which has (or needs) app.py's
+    RecalibrationWorker infrastructure. app.py's calibrate mode does NOT
+    call this -- it calls due_for_recalibrate/compute_recalibration/
+    apply_recalibration_result split across a worker-thread boundary
+    instead, see RecalibrationWorker below.
+    """
+    if not due_for_recalibrate(state, cfg):
+        return
+    result = compute_recalibration(
+        state.object_points, state.image_points, state.image_size,
+        state.K, state.dist, state.has_intrinsics_estimate,
+    )
+    apply_recalibration_result(state, result, cfg)
+
+
+class RecalibrationWorker(threading.Thread):
+    """Per-camera background thread for calibrate mode's periodic
+    cv2.calibrateCamera pass (measured at ~200-400ms for 30-60 samples,
+    growing with sample count). Running this inline on the main thread --
+    even throttled to one camera per tick -- still blocks the tick loop for
+    that long every time it fires, which reproduces the exact "drags fps
+    down" symptom DetectionWorker was built to avoid, just from
+    calibrateCamera instead of decode+ChArUco-detect. This worker removes
+    it from the main thread's critical path the same way DetectionWorker
+    does: the main thread hands over an immutable SNAPSHOT (K/dist/
+    has_intrinsics_estimate copied; object_points/image_points shallow-
+    copied -- individual sample arrays are only ever appended by
+    accept_sample, never mutated in place, so a shallow list copy is
+    race-free even while the original list keeps growing) and applies the
+    result itself once it's ready, via apply_recalibration_result -- every
+    CameraCalibState mutation still happens exclusively on the main thread,
+    same ownership rule DetectionWorker follows.
+
+    Unlike DetectionWorker's per-frame mailbox, a recalibration request must
+    never be silently dropped/replaced -- each one represents real
+    accumulated sample work, not a stale camera frame. So this deliberately
+    does NOT use DetectionWorker's replace-latest queues: the caller (see
+    app.py's recalib_in_flight tracking) is responsible for never calling
+    submit() again for a camera whose previous job hasn't produced a result
+    yet, and both queues stay maxsize=1 plain FIFO (one job at a time,
+    enforced by the caller, not by this class).
+    """
+
+    def __init__(self, cam_id):
+        super().__init__(daemon=True, name=f"RecalibrationWorker-{cam_id}")
+        self.cam_id = cam_id
+        self.in_q = queue.Queue(maxsize=1)
+        self.out_q = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+
+    def submit(self, epoch, object_points, image_points, image_size, K, dist, has_intrinsics_estimate):
+        self.in_q.put_nowait({
+            "epoch": epoch, "object_points": object_points, "image_points": image_points,
+            "image_size": image_size, "K": K.copy(), "dist": dist.copy(),
+            "has_intrinsics_estimate": has_intrinsics_estimate,
+        })
+
+    def try_get_result(self):
+        """Non-blocking; returns {"epoch", "result"} or None. Call once per
+        tick per camera from the main thread (app.py's Pass 2)."""
+        try:
+            return self.out_q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                item = self.in_q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            result = compute_recalibration(
+                item["object_points"], item["image_points"], item["image_size"],
+                item["K"], item["dist"], item["has_intrinsics_estimate"],
+            )
+            self.out_q.put({"epoch": item["epoch"], "result": result})
+
+    def stop(self):
+        self._stop_event.set()
+        self.join(timeout=2.0)
 
 
 # ==============================================================================
@@ -808,6 +1064,11 @@ class PoseGraph:
             method = "naive_chain"
             if ec["use_pose_graph_optimization"] and chain_err > ec["naive_chain_error_threshold_deg"]:
                 poses = self._optimize_component(g, edges, comp, ref, poses)
+                # Recompute against the OPTIMIZED poses -- otherwise this stays the
+                # pre-optimization value, which is >naive_chain_error_threshold_deg
+                # by construction (that's what triggered optimization) and tells you
+                # nothing about how good the final result actually is.
+                chain_err = self._chain_consistency_error_deg(g, edges, poses, comp)
                 method = "graph_optimization"
 
             for cam in comp:
@@ -817,6 +1078,71 @@ class PoseGraph:
             result["chain_consistency_error_deg"][ref] = chain_err
             result["method"][ref] = method
         return result
+
+
+class PoseGraphWorker(threading.Thread):
+    """Single background thread for PoseGraph.solve() -- there's exactly one
+    pose graph for the whole app (unlike DetectionWorker/RecalibrationWorker,
+    which are one-per-camera), so this is one worker, not a per-camera pool.
+
+    solve() -- specifically _optimize_component's scipy.optimize.
+    least_squares -- was measured live at ~120-160ms, firing on EVERY tick
+    once the graph's chain-consistency error crosses
+    naive_chain_error_threshold_deg (realistic well before every camera's
+    intrinsics have converged). Running it inline on the main thread
+    reproduces the exact "drags fps down" symptom DetectionWorker/
+    RecalibrationWorker were built to avoid. Same split as those: the main
+    thread hands over an immutable SNAPSHOT of pose_graph.observations (a
+    shallow copy of the dict and each edge-key's list -- individual
+    observation dicts are only ever appended by add_observation, never
+    mutated in place, so this is race-free even while the original keeps
+    growing) and applies the result itself once ready. The real PoseGraph
+    instance (including .observations) stays exclusively main-thread-owned;
+    this worker only ever sees a copy, and builds its own throwaway
+    PoseGraph (reusing the class's own, unmodified .solve() -- no separate
+    pure-function extraction needed, since PoseGraph's solve/aggregate_edges/
+    _chain_pose/etc. already don't read anything but the observations/cfg
+    they're handed) to call it against that copy.
+
+    One job at a time (see app.py's pose_solve_in_flight) -- like
+    RecalibrationWorker, a submitted job must never be silently dropped (it
+    represents real accumulated observations, not a stale camera frame), so
+    this uses plain maxsize=1 queues, not DetectionWorker's replace-latest
+    mailbox.
+    """
+
+    def __init__(self, cfg):
+        super().__init__(daemon=True, name="PoseGraphWorker")
+        self.cfg = cfg
+        self.in_q = queue.Queue(maxsize=1)
+        self.out_q = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+
+    def submit(self, epoch, observations_snapshot, cam_ids):
+        self.in_q.put_nowait({"epoch": epoch, "observations": observations_snapshot, "cam_ids": list(cam_ids)})
+
+    def try_get_result(self):
+        """Non-blocking; returns {"epoch", "result"} or None. Call once per
+        tick from the main thread (app.py's Pass 2)."""
+        try:
+            return self.out_q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                item = self.in_q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            temp_graph = PoseGraph(self.cfg)
+            temp_graph.observations = item["observations"]
+            result = temp_graph.solve(item["cam_ids"])
+            self.out_q.put({"epoch": item["epoch"], "result": result})
+
+    def stop(self):
+        self._stop_event.set()
+        self.join(timeout=2.0)
 
 
 def draw_coverage_overlay(frame, coverage):
