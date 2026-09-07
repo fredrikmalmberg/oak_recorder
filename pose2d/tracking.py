@@ -11,6 +11,7 @@ this uses each hand's own 21-landmark bounding box instead of an
 independent second detector's box -- a real but weaker signal, noted as a
 known limitation of this pass).
 """
+import copy
 import os
 
 import numpy as np
@@ -173,19 +174,65 @@ def flag_body_pose_untrusted(
     return flags
 
 
+def _swap_landmark_confidence(lc_left, lc_right, swap_flags):
+    """Mirrors hand_multiview.apply_swap_corrections' per-(cam,frame) dict-
+    swap logic, but for an OPTIONAL 5th piece of data (per-landmark
+    confidence) that function's fixed signature doesn't carry -- keeps
+    landmark_confidence describing the SAME physical hand as the
+    (already swap-corrected) landmarks it accompanies. No-ops when either
+    side is None (the detector has no per-landmark confidence at all, e.g.
+    MediaPipe Hands).
+    """
+    if lc_left is None or lc_right is None:
+        return lc_left, lc_right
+    new_left = copy.deepcopy(lc_left)
+    new_right = copy.deepcopy(lc_right)
+    for cam_id, by_frame in swap_flags.items():
+        for fk, flagged in by_frame.items():
+            if not flagged:
+                continue
+            l_val = lc_left.get(cam_id, {}).get(fk)
+            r_val = lc_right.get(cam_id, {}).get(fk)
+            if r_val is not None:
+                new_left.setdefault(cam_id, {})[fk] = r_val
+            else:
+                new_left.get(cam_id, {}).pop(fk, None)
+            if l_val is not None:
+                new_right.setdefault(cam_id, {})[fk] = l_val
+            else:
+                new_right.get(cam_id, {}).pop(fk, None)
+    return new_left, new_right
+
+
 def run_tracking(
     take_dir, extraction, width, height,
     velocity_thresh_px=200.0, swap_margin_px=20.0, occlusion_iou_thresh=OCCLUSION_IOU_THRESH,
     body_wrist_bbox_margin_px=BODY_WRIST_BBOX_MARGIN_PX,
     body_trust_max_wrist_dist_px=BODY_TRUST_MAX_WRIST_DIST_PX, penalty_factor=0.01,
+    penalize_occlusion=True,
 ):
     """Applies the full check/correction/penalty chain to one take's
     extraction() output. Returns (landmarks_left, confidence_left,
     landmarks_right, confidence_right, landmarks_body, confidence_body,
-    diagnostics) -- the first six are the corrected/penalized versions
-    (deep-copied, extraction's own output is never mutated); diagnostics is
-    a plain-JSON-serializable summary + per-frame flag dict for the grid
-    video and for reporting.
+    diagnostics, landmark_confidence_left, landmark_confidence_right,
+    landmark_confidence_body) -- the first six are the corrected/penalized
+    versions (deep-copied, extraction's own output is never mutated);
+    diagnostics is a plain-JSON-serializable summary + per-frame flag dict
+    for the grid video and for reporting. The last three are per-landmark
+    confidence (e.g. DWPose's per-keypoint SimCC scores), passed through
+    swap-corrected the same way landmarks/confidence are -- None for any
+    part the detector doesn't provide per-landmark confidence for (e.g.
+    MediaPipe Hands only ever has one whole-hand score).
+
+    penalize_occlusion=False skips applying the confidence penalty for
+    occlusion_flags/single_hand_occlusion_flags specifically (swap/velocity/
+    body-untrusted penalties still apply) -- the flags are still computed
+    and included in diagnostics (so OCC/OCC1H? tags and the gray-tile-when-
+    unused logic in the grid video still work), just not used to gray out
+    the skeleton color via confidence. Useful when a detector (e.g. DWPose)
+    handles occlusion well enough that the penalty just hides the very
+    thing you're trying to visually inspect -- whether it's actually mixing
+    up hands during close contact.
     """
     cam_ids = extraction["cam_ids"]
     landmarks_left = extraction["landmarks_left"]
@@ -196,6 +243,9 @@ def run_tracking(
     confidence_body = extraction["confidence_body"]
     landmarks_body_hand_left = extraction["landmarks_body_hand_left"]
     landmarks_body_hand_right = extraction["landmarks_body_hand_right"]
+    landmark_confidence_left = extraction.get("landmark_confidence_left")
+    landmark_confidence_right = extraction.get("landmark_confidence_right")
+    landmark_confidence_body = extraction.get("landmark_confidence_body")
 
     frame_keys = hmv.discover_frames(take_dir, cam_ids[0])
 
@@ -209,6 +259,9 @@ def run_tracking(
     }
     landmarks_left, confidence_left, landmarks_right, confidence_right, n_swaps_corrected = (
         hmv.apply_swap_corrections(landmarks_left, confidence_left, landmarks_right, confidence_right, swap_flags)
+    )
+    landmark_confidence_left, landmark_confidence_right = _swap_landmark_confidence(
+        landmark_confidence_left, landmark_confidence_right, swap_flags,
     )
 
     velocity_left = hmv.detect_high_velocity_frames(
@@ -230,17 +283,22 @@ def run_tracking(
     )
 
     confidence_left, n_pen_l_vel = hmv.apply_confidence_penalty(confidence_left, velocity_left, penalty_factor)
-    confidence_left, n_pen_l_occ = hmv.apply_confidence_penalty(confidence_left, occlusion_flags, penalty_factor)
-    confidence_left, n_pen_l_occ1h = hmv.apply_confidence_penalty(
-        confidence_left, single_hand_occlusion_flags, penalty_factor
-    )
+    confidence_right, n_pen_r_vel = hmv.apply_confidence_penalty(confidence_right, velocity_right, penalty_factor)
+    if penalize_occlusion:
+        confidence_left, n_pen_l_occ = hmv.apply_confidence_penalty(confidence_left, occlusion_flags, penalty_factor)
+        confidence_left, n_pen_l_occ1h = hmv.apply_confidence_penalty(
+            confidence_left, single_hand_occlusion_flags, penalty_factor
+        )
+        confidence_right, n_pen_r_occ = hmv.apply_confidence_penalty(
+            confidence_right, occlusion_flags, penalty_factor
+        )
+        confidence_right, n_pen_r_occ1h = hmv.apply_confidence_penalty(
+            confidence_right, single_hand_occlusion_flags, penalty_factor
+        )
+    else:
+        n_pen_l_occ = n_pen_l_occ1h = n_pen_r_occ = n_pen_r_occ1h = 0
     confidence_left, n_pen_l_body = hmv.apply_confidence_penalty(
         confidence_left, body_untrusted_flags, penalty_factor
-    )
-    confidence_right, n_pen_r_vel = hmv.apply_confidence_penalty(confidence_right, velocity_right, penalty_factor)
-    confidence_right, n_pen_r_occ = hmv.apply_confidence_penalty(confidence_right, occlusion_flags, penalty_factor)
-    confidence_right, n_pen_r_occ1h = hmv.apply_confidence_penalty(
-        confidence_right, single_hand_occlusion_flags, penalty_factor
     )
     confidence_right, n_pen_r_body = hmv.apply_confidence_penalty(
         confidence_right, body_untrusted_flags, penalty_factor
@@ -281,4 +339,5 @@ def run_tracking(
     return (
         landmarks_left, confidence_left, landmarks_right, confidence_right,
         landmarks_body, confidence_body, diagnostics,
+        landmark_confidence_left, landmark_confidence_right, landmark_confidence_body,
     )
