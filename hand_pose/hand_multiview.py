@@ -287,6 +287,93 @@ def extract_hand_landmarks_for_session(
     return landmarks, confidence
 
 
+def extract_hand_landmarks_for_session_multicam(
+    session_dir, calib, cam_ids=None,
+    max_num_hands=1, min_detection_confidence=0.2, min_tracking_confidence=0.5,
+    force=False,
+):
+    """Same as extract_hand_landmarks_for_session, but undistorts each
+    camera's frames with ITS OWN K/dist instead of one shared K/dist for the
+    whole session. extract_hand_landmarks_for_session's single-K/dist design
+    exists for the h5 rig, where only averaged intrinsics are available (see
+    average_intrinsics) -- this rig has real per-camera calibration
+    (calibrate.load_calibration_output), so reusing the single-K/dist path
+    here would throw away precision for no reason.
+
+    calib: dict[cam_id] -> {'K', 'dist', ...} (load_calibration_output's
+    schema; 'width'/'height' are NOT trusted here -- each camera's own image
+    size is read from its actual aligned frames, matching how the
+    single-K/dist version derives its undistort-map size). Cameras absent
+    from calib are skipped.
+    """
+    aligned_dir = os.path.join(session_dir, 'aligned')
+    landmarks_path = os.path.join(aligned_dir, 'landmarks.json')
+    confidence_path = os.path.join(aligned_dir, 'confidence.json')
+
+    if not force and os.path.exists(landmarks_path) and os.path.exists(confidence_path):
+        with open(landmarks_path, 'r') as f:
+            landmarks = json.load(f)
+        with open(confidence_path, 'r') as f:
+            confidence = json.load(f)
+        print(f'Loaded cached landmarks/confidence from {aligned_dir}')
+        return landmarks, confidence
+
+    if cam_ids is None:
+        cam_ids = discover_cameras(session_dir)
+    cam_ids = [c for c in cam_ids if c in calib]
+    frames_by_cam = discover_all_frames(session_dir, cam_ids)
+
+    undistort_maps = {}
+    for cam_id in cam_ids:
+        if not frames_by_cam[cam_id]:
+            continue
+        w, h = get_image_size(session_dir, cam_id, frames_by_cam[cam_id][0])
+        c = calib[cam_id]
+        undistort_maps[cam_id] = build_undistort_maps(c['K'], c['dist'], w, h)
+
+    hands = mp.solutions.hands.Hands(
+        max_num_hands=max_num_hands,
+        min_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=min_tracking_confidence,
+    )
+
+    landmarks = {}
+    confidence = {}
+    try:
+        for cam_id in cam_ids:
+            if cam_id not in undistort_maps:
+                continue
+            landmarks[cam_id] = {}
+            confidence[cam_id] = {}
+            map1, map2 = undistort_maps[cam_id]
+            for frame_file in frames_by_cam[cam_id]:
+                frame_path = os.path.join(session_dir, 'aligned', cam_id, frame_file)
+                image = cv2.imread(frame_path)
+                if image is None:
+                    continue
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image = undistort_fast(image, map1, map2)
+                results = hands.process(image)
+                if results.multi_hand_landmarks:
+                    hand_landmarks = results.multi_hand_landmarks[0]
+                    landmarks[cam_id][frame_file] = {
+                        str(i): [lm.x, lm.y, lm.z] for i, lm in enumerate(hand_landmarks.landmark)
+                    }
+                if results.multi_handedness:
+                    confidence[cam_id][frame_file] = float(
+                        results.multi_handedness[0].classification[0].score
+                    )
+    finally:
+        hands.close()
+
+    with open(landmarks_path, 'w') as f:
+        json.dump(landmarks, f)
+    with open(confidence_path, 'w') as f:
+        json.dump(confidence, f)
+    print(f'Saved landmarks/confidence to {aligned_dir}')
+    return landmarks, confidence
+
+
 # ---------------------------------------------------------------------------
 # Detection sampling / overlay sanity-check plots
 # ---------------------------------------------------------------------------
@@ -955,6 +1042,180 @@ def ransac_select_cameras_sequence(
     return selection
 
 
+def _neighbor_frame_key(frame_key, offset):
+    """frame_key like '000042.jpg', offset e.g. -1/0/+1 -> the neighboring
+    slot's frame_key (zero-padded, same width), or None if that would go
+    negative. Frame keys are align_session.py's own %06d.jpg slot naming.
+    """
+    if offset == 0:
+        return frame_key
+    stem, ext = os.path.splitext(frame_key)
+    try:
+        idx = int(stem)
+    except ValueError:
+        return None
+    neighbor_idx = idx + offset
+    if neighbor_idx < 0:
+        return None
+    return f'{neighbor_idx:0{len(stem)}d}{ext}'
+
+
+def ransac_select_cameras_sequence_multi_offset(
+    landmarks, confidence, projection_matrices, width, height,
+    frame_offsets=(-1, 0, 1), reference_landmark_id=0, min_cameras=2,
+    reproj_thresh_px=15.0, hysteresis_inlier_margin=0, hysteresis_err_factor=1.5,
+    min_confidence=0.5,
+):
+    """Like ransac_select_cameras_sequence, but additionally considers each
+    camera's landmark at frame offsets around its nominal aligned slot (e.g.
+    frame_offsets=(-1, 0, 1) tries the previous/same/next slot for every
+    camera -- "all cameras x3"). align_session.py's per-slot matching isn't
+    perfect: a camera's true nearest frame can land one slot off from its
+    assigned reference-timeline slot (a dropped frame, a near-tie match, a
+    blue-placeholder neighbor) -- this lets the existing geometric
+    inlier-counting logic pick whichever offset fits best instead of forcing
+    exact-slot equality.
+
+    Candidate ids are (cam_id, offset) tuples; the winning inlier set may
+    contain at most ONE offset per PHYSICAL camera (an offset never changes
+    a camera's pose, so two offsets of the same camera voting "independently"
+    would double-count one physical observation) -- enforced by keeping only
+    the lower-reprojection-error offset whenever a camera appears twice in a
+    candidate inlier set.
+
+    Returns the same schema as ransac_select_cameras_sequence, i.e.
+    dict[frame_key] -> {'cameras': [cam_id, ...] (physical, offset stripped),
+    'mean_reproj_err': float, 'n_inliers': int}, plus 'offsets':
+    dict[cam_id] -> offset actually used that frame -- tally this across a
+    take to see whether any camera systematically prefers a non-zero offset
+    (a quantitative signature of residual per-camera slot bias).
+    """
+    cam_ids = list(projection_matrices.keys())
+    all_frames = sorted({frame for cam_id in cam_ids for frame in landmarks.get(cam_id, {})})
+    lm_key = str(reference_landmark_id)
+    selection = {}
+    prev_cameras = None  # list of (cam_id, offset), already deduped by camera
+
+    def dedupe_by_camera(candidates, errs):
+        best = {}
+        for cand in candidates:
+            cam_id = cand[0]
+            if cam_id not in best or errs[cand] < errs[best[cam_id]]:
+                best[cam_id] = cand
+        return list(best.values())
+
+    for frame in all_frames:
+        gated = []
+        pixel_by_cand = {}
+        for cam_id in cam_ids:
+            for offset in frame_offsets:
+                nbr = _neighbor_frame_key(frame, offset)
+                if nbr is None:
+                    continue
+                obs = landmarks.get(cam_id, {}).get(nbr, {}).get(lm_key)
+                if obs is None:
+                    continue
+                if confidence is not None and confidence.get(cam_id, {}).get(nbr, 0) < min_confidence:
+                    continue
+                cand = (cam_id, offset)
+                gated.append(cand)
+                pixel_by_cand[cand] = (obs[0] * width, obs[1] * height)
+
+        if len({cam_id for cam_id, _ in gated}) < min_cameras:
+            prev_cameras = None
+            continue
+
+        proj_by_cand = {cand: projection_matrices[cand[0]] for cand in gated}
+
+        best_inliers, best_err = None, None
+        for cand_a, cand_b in itertools.combinations(gated, 2):
+            if cand_a[0] == cand_b[0]:
+                continue  # two offsets of the same physical camera -- not a valid seed pair
+            X = triangulate_dlt(
+                {cand_a: pixel_by_cand[cand_a], cand_b: pixel_by_cand[cand_b]},
+                {cand_a: proj_by_cand[cand_a], cand_b: proj_by_cand[cand_b]},
+            )
+            if X is None:
+                continue
+            errs = {c: _reproj_error_px(X, proj_by_cand[c], pixel_by_cand[c]) for c in gated}
+            inliers = dedupe_by_camera([c for c in gated if errs[c] < reproj_thresh_px], errs)
+            if len(inliers) < min_cameras:
+                continue
+            mean_err = float(np.mean([errs[c] for c in inliers]))
+            if (best_inliers is None or len(inliers) > len(best_inliers)
+                    or (len(inliers) == len(best_inliers) and mean_err < best_err)):
+                best_inliers, best_err = inliers, mean_err
+
+        if best_inliers is None:
+            prev_cameras = None
+            continue
+
+        chosen, chosen_err = best_inliers, best_err
+        if prev_cameras is not None:
+            prev_avail = [c for c in prev_cameras if c in gated]
+            if len(prev_avail) >= min_cameras:
+                X_prev = triangulate_dlt(
+                    {c: pixel_by_cand[c] for c in prev_avail},
+                    {c: proj_by_cand[c] for c in prev_avail},
+                )
+                if X_prev is not None:
+                    errs_prev = {c: _reproj_error_px(X_prev, proj_by_cand[c], pixel_by_cand[c]) for c in gated}
+                    prev_inliers = dedupe_by_camera([c for c in gated if errs_prev[c] < reproj_thresh_px], errs_prev)
+                    if len(prev_inliers) >= min_cameras:
+                        prev_mean_err = float(np.mean([errs_prev[c] for c in prev_inliers]))
+                        if (len(prev_inliers) >= len(best_inliers) - hysteresis_inlier_margin
+                                and prev_mean_err <= best_err * hysteresis_err_factor):
+                            chosen, chosen_err = prev_inliers, prev_mean_err
+
+        selection[frame] = {
+            'cameras': [c[0] for c in chosen],
+            'mean_reproj_err': chosen_err,
+            'n_inliers': len(chosen),
+            'offsets': {c[0]: c[1] for c in chosen},
+        }
+        prev_cameras = chosen
+
+    return selection
+
+
+def triangulate_sequence_ransac_multi_offset(
+    landmarks, projection_matrices, width, height, landmark_ids, camera_selection,
+    landmark_confidence=None,
+):
+    """Like triangulate_sequence_ransac, but for selections produced by
+    ransac_select_cameras_sequence_multi_offset: each selected camera may
+    have been chosen at a neighboring frame slot (sel['offsets'][cam_id]), so
+    every landmark for that camera is read from that neighbor frame, not
+    `frame` itself.
+    """
+    reconstruction = {}
+    for frame, sel in camera_selection.items():
+        cams = sel['cameras']
+        offsets = sel.get('offsets', {})
+        frame_points = {}
+        for lm_id in landmark_ids:
+            lm_key = str(lm_id)
+            points_2d, weights = {}, {}
+            for cam_id in cams:
+                nbr = _neighbor_frame_key(frame, offsets.get(cam_id, 0))
+                if nbr is None:
+                    continue
+                obs = landmarks.get(cam_id, {}).get(nbr, {}).get(lm_key)
+                if obs is None:
+                    continue
+                points_2d[cam_id] = (obs[0] * width, obs[1] * height)
+                weights[cam_id] = (
+                    landmark_confidence.get(cam_id, {}).get(nbr, {}).get(lm_key, 1.0)
+                    if landmark_confidence is not None else 1.0
+                )
+            xyz = triangulate_dlt_weighted(points_2d, projection_matrices, weights)
+            if xyz is not None:
+                frame_points[lm_key] = xyz.tolist()
+        if frame_points:
+            reconstruction[frame] = frame_points
+    return reconstruction
+
+
 def triangulate_sequence_ransac(
     landmarks, projection_matrices, width, height, landmark_ids, camera_selection,
     landmark_confidence=None,
@@ -1621,7 +1882,9 @@ def add_skeleton_frame(
 
 
 def run_skeleton_player(server, reconstruction, fps=15.0):
-    frame_keys = sorted(reconstruction.keys(), key=int)
+    # os.path.splitext handles both the h5 pipeline's bare-integer frame keys
+    # ('42') and align_session.py's file-based ones ('000042.jpg') the same way.
+    frame_keys = sorted(reconstruction.keys(), key=lambda k: int(os.path.splitext(k)[0]))
     if not frame_keys:
         print('No reconstructed frames to play.')
         return
