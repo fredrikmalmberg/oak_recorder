@@ -125,6 +125,43 @@ def parse_log_header(log_path):
     return rec_w, rec_h, fps, host_offset_s
 
 
+def parse_legacy_log_header(log_path):
+    """Mirrors parse_log_header, but for a TEMPORARY frame_timestamps_legacy_
+    <cam>.log sibling (see AppCameraSession's cfg["debug"]["legacy_timestamp_
+    compare"] in calibrate.DEFAULT_CONFIG) -- reads legacy_host_offset_s=
+    instead of host_offset_s=.
+    """
+    legacy_host_offset_s = None
+    with open(log_path, encoding="utf-8") as f:
+        for line in f:
+            if not line.startswith("#"):
+                break
+            if line.startswith("# sync_calibration"):
+                m = re.search(r"legacy_host_offset_s=([-\d.]+)", line)
+                if m:
+                    legacy_host_offset_s = float(m.group(1))
+    return legacy_host_offset_s
+
+
+def parse_legacy_timestamp_log(log_path):
+    """Returns dict[seq] -> legacy_host_ts_s from a frame_timestamps_legacy_
+    <cam>.log sibling -- only 2 fields per line (legacy_host_ts_s
+    sequence_num), unlike the main log's 4, so this doesn't reuse
+    parse_timestamp_log.
+    """
+    legacy_by_seq = {}
+    with open(log_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            legacy_by_seq[int(parts[1])] = parse_host_ts_s(parts[0])
+    return legacy_by_seq
+
+
 def parse_timestamp_log(log_path, host_offset_s=None):
     entries = []
     with open(log_path, encoding="utf-8") as f:
@@ -231,6 +268,7 @@ def align_session(
     rec_h=None,
     align_host_only=False,
     align_device_raw=False,
+    align_legacy_host_ts=False,
 ):
     session_dir, cameras = discover_session(session_dir)
 
@@ -247,7 +285,35 @@ def align_session(
         _w, _h, _fps, host_offset_s = parse_log_header(cam["log_path"])
         offsets[cam["label"]] = host_offset_s
 
-    if align_device_raw:
+    legacy_offsets, legacy_by_seq = {}, {}
+    if align_legacy_host_ts:
+        # TEMPORARY, see cfg["debug"]["legacy_timestamp_compare"]: rebuilds
+        # the unified_device timebase from the pre-addCallback host-
+        # timestamp method instead, for a direct comparison against the
+        # real (addCallback-based) unified_device result on identical
+        # recorded motion -- device_ts_s is unaffected either way (same
+        # msg.getTimestamp() read regardless of host method), only the
+        # host_ts_s side (per-frame and the one-shot offset anchor) differs.
+        for cam in cameras:
+            legacy_log_path = os.path.join(
+                session_dir, f"frame_timestamps_legacy_{cam['label']}.log",
+            )
+            if not os.path.isfile(legacy_log_path):
+                raise FileNotFoundError(
+                    f"--legacy-host-ts requires {legacy_log_path} -- was "
+                    f"cfg['debug']['legacy_timestamp_compare'] enabled for this recording?"
+                )
+            legacy_offsets[cam["label"]] = parse_legacy_log_header(legacy_log_path)
+            legacy_by_seq[cam["label"]] = parse_legacy_timestamp_log(legacy_log_path)
+        missing = [label for label, off in legacy_offsets.items() if off is None]
+        if missing:
+            raise ValueError(f"Missing legacy_host_offset_s in legacy log header for {', '.join(missing)}")
+
+    if align_legacy_host_ts:
+        time_key = "unified_ts_s"
+        timebase = "legacy_unified"
+        use_unified = True
+    elif align_device_raw:
         # Each camera's device_ts_s is that camera's own onboard clock,
         # counting from an arbitrary per-device epoch set at boot (NOT a
         # shared reference across cameras) -- unlike unified_device below,
@@ -281,10 +347,23 @@ def align_session(
     parsed = {
         cam["label"]: parse_timestamp_log(
             cam["log_path"],
-            host_offset_s=offsets[cam["label"]] if use_unified else None,
+            host_offset_s=offsets[cam["label"]] if (use_unified and not align_legacy_host_ts) else None,
         )
         for cam in cameras
     }
+    if align_legacy_host_ts:
+        # device_ts_s (already parsed above) is identical either way -- only
+        # host_ts_s (per-frame, for reporting) and unified_ts_s (recomputed
+        # from the legacy one-shot offset) get overridden here.
+        for cam in cameras:
+            label = cam["label"]
+            offset = legacy_offsets[label]
+            by_seq = legacy_by_seq[label]
+            for entry in parsed[label]:
+                legacy_host_ts = by_seq.get(entry["seq"])
+                if legacy_host_ts is not None:
+                    entry["host_ts_s"] = legacy_host_ts
+                entry["unified_ts_s"] = entry["device_ts_s"] + offset
     for cam in cameras:
         label = cam["label"]
         if not parsed[label]:
@@ -309,7 +388,8 @@ def align_session(
     print(f"[Alignment] Cameras: {', '.join(cam_labels)}")
     print(f"[Alignment] Slot times: {num_slots} reference frames from {ref_label}")
     if use_unified:
-        for label, off in offsets.items():
+        report_offsets = legacy_offsets if align_legacy_host_ts else offsets
+        for label, off in report_offsets.items():
             print(f"[Alignment]   {label}: host_offset_s={off:.9f}")
     print(
         f"[Alignment] Timeline: {num_slots} slots @ {fps:.1f} FPS "
@@ -439,6 +519,7 @@ def align_session(
     # meanings (see align_device_raw's docstring note above).
     timebase_suffix = {
         "unified_device": "unified", "host": "host", "host_legacy": "host", "device_raw": "device_raw",
+        "legacy_unified": "legacy_unified",
     }[timebase]
     spread_key = f"cross_camera_{timebase_suffix}_spread_ms"
     overlap_start_key = f"overlap_start_{timebase_suffix}_s"
@@ -460,7 +541,7 @@ def align_session(
             "p95": cross_spread_p95,
             "fully_matched_slots": len(cross_camera_spreads_ms),
         },
-        "host_offsets_s": offsets if use_unified else {},
+        "host_offsets_s": (legacy_offsets if align_legacy_host_ts else offsets) if use_unified else {},
         "cameras": {},
         "warnings": [],
     }
@@ -588,6 +669,8 @@ def print_alignment_report(report):
         label = "unified" if timebase == "unified_device" else "host"
         if timebase == "host_legacy":
             label = "host (legacy)"
+        if timebase == "legacy_unified":
+            label = "unified (legacy host-ts)"
         print(
             f"[Alignment] Cross-camera {label} spread: "
             f"mean {spread.get('mean', 0):.1f}ms | "
@@ -756,11 +839,24 @@ def main():
         action="store_true",
         help="Skip alignment; build grid MP4 from raw MJPEG only",
     )
+    parser.add_argument(
+        "--legacy-host-ts",
+        action="store_true",
+        help=(
+            "TEMPORARY: rebuild the unified_device timebase using the pre-addCallback "
+            "host-timestamp method (frame_timestamps_legacy_<cam>.log) instead of the "
+            "current addCallback-based one, for a direct comparison on identical "
+            "recorded motion. Requires the recording to have been made with "
+            "cfg['debug']['legacy_timestamp_compare'] enabled."
+        ),
+    )
     args = parser.parse_args()
 
-    exclusive = [args.align_raw, args.align_host, args.align_device_raw]
+    exclusive = [args.align_raw, args.align_host, args.align_device_raw, args.legacy_host_ts]
     if sum(exclusive) > 1:
-        parser.error("--align-raw, --align-host, and --align-device-raw are mutually exclusive")
+        parser.error(
+            "--align-raw, --align-host, --align-device-raw, and --legacy-host-ts are mutually exclusive"
+        )
 
     if args.align_raw:
         mp4_path = export_raw_grid_mp4(args.session_dir, fps=args.fps)
@@ -773,6 +869,7 @@ def main():
         fps=args.fps,
         align_host_only=args.align_host,
         align_device_raw=args.align_device_raw,
+        align_legacy_host_ts=args.legacy_host_ts,
     )
 
     if args.output_mp4 == "small":

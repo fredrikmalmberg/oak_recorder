@@ -516,6 +516,15 @@ class AppCameraSession:
         self.sync_device_ts_s = None
         self.sync_host_offset_s = None
         self.preview_updated = False  # set each poll() call, see poll()'s decode_preview
+        # TEMPORARY: addCallback-vs-legacy timestamp comparison, see
+        # cfg["debug"]["legacy_timestamp_compare"] in calibrate.DEFAULT_CONFIG.
+        # legacy_log_file mirrors log_file but logs the pre-addCallback
+        # timestamp method instead, on the same frames, so the two can be
+        # compared on identical motion. Off (None) unless the flag is set.
+        self.legacy_ts_debug = bool(cfg.get("debug", {}).get("legacy_timestamp_compare"))
+        self.legacy_log_file = None
+        self.legacy_sync_host_ts_s = None
+        self._pending_legacy_host_ts_s = None  # this poll()'s legacy read, consumed by the log write below
         # (seq, host_ts_s) pairs fed by _on_full_arrival, a q_full callback
         # that fires on depthai's own internal thread the instant a message
         # is delivered -- see start_calibration_pipeline and
@@ -646,6 +655,29 @@ class AppCameraSession:
         for line in header_extra_lines:
             self.log_file.write(f"# {line}\n")
         self.log_file.write("# frame_log: host_ts_s sequence_num device_timestamp_s bytes\n")
+
+        # TEMPORARY, see cfg["debug"]["legacy_timestamp_compare"]: a sibling
+        # log of the pre-addCallback timestamp method, on the same frames
+        # (joined by sequence_num), for a direct addCallback-vs-legacy
+        # comparison via align_session.py --legacy-host-ts.
+        if self.legacy_ts_debug:
+            legacy_log_path = os.path.join(
+                os.path.dirname(log_path), f"frame_timestamps_legacy_{self.cam_label}.log",
+            )
+            self.legacy_log_file = open(legacy_log_path, "w", encoding="utf-8")
+            self.legacy_log_file.write(
+                "# TEMPORARY debug log for addCallback vs legacy timestamp comparison -- safe to delete\n"
+            )
+            self.legacy_log_file.write(f"# camera={self.cam_label} device_id={self.device_id}\n")
+            if self.legacy_sync_host_ts_s is not None:
+                legacy_offset_s = self.legacy_sync_host_ts_s - self.sync_device_ts_s
+                self.legacy_log_file.write(
+                    f"# sync_calibration legacy_host_ts_s={self.legacy_sync_host_ts_s:.9f} "
+                    f"device_ts_s={self.sync_device_ts_s:.9f} "
+                    f"legacy_host_offset_s={legacy_offset_s:.9f}\n"
+                )
+            self.legacy_log_file.write("# frame_log: legacy_host_ts_s sequence_num\n")
+
         self.recording_active = True
 
     def capture_sync_calibration(self, take_dir):
@@ -669,6 +701,11 @@ class AppCameraSession:
         while self.q_preview.tryGet() is not None:
             pass
         msg = self.q_full.get(timeout=5.0)
+        # TEMPORARY, see cfg["debug"]["legacy_timestamp_compare"]: the exact
+        # pre-addCallback read point (a time.time() taken right where this
+        # blocking get() unblocks) for a legacy one-shot host_offset_s.
+        if self.legacy_ts_debug:
+            self.legacy_sync_host_ts_s = time.time()
         host_ts_s = self._pop_full_arrival_ts(msg.getSequenceNum())
         ts = msg.getTimestamp()
         if ts is None:
@@ -693,6 +730,9 @@ class AppCameraSession:
         if self.log_file is not None:
             self.log_file.close()
             self.log_file = None
+        if self.legacy_log_file is not None:
+            self.legacy_log_file.close()
+            self.legacy_log_file = None
         if self.writer is not None:
             self.writer.stop()
             self.writer = None
@@ -768,6 +808,12 @@ class AppCameraSession:
         if full_msg is None:
             return False
 
+        # TEMPORARY: this is the exact spot (right after tryGet() confirms a
+        # frame, before anything else) the pre-addCallback code read its
+        # timestamp from -- see cfg["debug"]["legacy_timestamp_compare"].
+        if self.legacy_ts_debug:
+            self._pending_legacy_host_ts_s = time.time()
+
         self.last_frame_full_ts = self._pop_full_arrival_ts(full_msg.getSequenceNum())
         now_mono = time.monotonic()
         if self._fps_prev_mono is not None:
@@ -784,6 +830,10 @@ class AppCameraSession:
                 f"{self.last_frame_full_ts:.9f} {full_msg.getSequenceNum()} "
                 f"{device_ts_s:.9f} {len(data)}\n"
             )
+            if self.legacy_ts_debug and self.legacy_log_file is not None:
+                self.legacy_log_file.write(
+                    f"{self._pending_legacy_host_ts_s:.9f} {full_msg.getSequenceNum()}\n"
+                )
             return True
 
         if want_raw_bytes:

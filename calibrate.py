@@ -141,6 +141,17 @@ DEFAULT_CONFIG = {
     "viser": {
         "port": 8080,
     },
+    "debug": {
+        # TEMPORARY, for comparing the addCallback-based host-arrival
+        # timestamp (app.py's AppCameraSession._pop_full_arrival_ts)
+        # against the pre-addCallback method (a plain time.time() read
+        # taken right after tryGet() notices a frame) on identical
+        # recorded/calibrated motion -- see AppCameraSession.poll/
+        # capture_sync_calibration/begin_recording and align_session.py's
+        # --legacy-host-ts. Safe to remove, along with the code that reads
+        # it, once that comparison is done.
+        "legacy_timestamp_compare": False,
+    },
 }
 
 
