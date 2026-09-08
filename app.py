@@ -1325,6 +1325,14 @@ def main():
     # flag; see _set_detection.
     detection_state = {"enabled": True}
 
+    # Per-camera calibration enable/disable -- lets an operator exclude a
+    # specific camera's detections from the shared pose_graph extrinsics
+    # solve while diagnosing a "jumping" board pose (one bad camera's edges
+    # can drag around the shared solve's T_cam_to_world for EVERY camera,
+    # not just its own marker -- see the "{cam_id} enabled" checkbox and
+    # the "set_enabled" cmd_queue handler below). Absent key == enabled.
+    camera_enabled = {cam_id: True for cam_id in cam_ids}
+
     # Per-camera undistort, set all at once via the "Undistort all cameras"
     # checkbox in the live-preview panel (there's no per-camera control
     # anymore -- see _set_undistort_all). Absent key == off, same as
@@ -1496,6 +1504,10 @@ def main():
             for cam_id in cam_ids:
                 reset_btn = viser_mgr.server.gui.add_button(f"Reset {cam_id}")
                 reset_btn.on_click(lambda _, c=cam_id: cmd_queue.put(f"reset {c}"))
+                enabled_cb = viser_mgr.server.gui.add_checkbox(f"{cam_id} enabled", initial_value=True)
+                enabled_cb.on_update(
+                    lambda _, c=cam_id, cb=enabled_cb: cmd_queue.put(f"set_enabled {c} {'1' if cb.value else '0'}")
+                )
 
             viser_mgr.server.gui.add_divider()
 
@@ -2056,6 +2068,15 @@ def main():
                         if evicted and cfg["intrinsics_cache"]["enabled"]:
                             calibrate._atomic_write_json(cfg["intrinsics_cache"]["path"], intrinsics_cache)
                         clear_extrinsics_for(target)
+                    elif cmd.startswith("set_enabled"):
+                        parts = cmd.split()
+                        target, flag = parts[1], parts[2]
+                        camera_enabled[target] = (flag == "1")
+                        if not camera_enabled[target] and target in calib_states:
+                            calib_states[target].last_edge_pose = None
+                            viser_mgr.hide_board_pose(target)
+                        print(f"[Command] {target} calibration "
+                              f"{'enabled' if camera_enabled[target] else 'disabled'}.")
                     else:
                         print(f"[Command] Unrecognized: {cmd!r}")
 
@@ -2335,7 +2356,8 @@ def main():
                 if need_full_decode and got_frame and session.last_frame_full is not None:
                     fresh_frames[cam_id] = (session.last_frame_full, session.last_frame_full_ts)
 
-                if need_raw_bytes and got_frame and session.last_frame_full_bytes is not None:
+                if (need_raw_bytes and got_frame and session.last_frame_full_bytes is not None
+                        and camera_enabled.get(cam_id, True)):
                     calib_workers[cam_id].submit(
                         epoch=calib_epoch[cam_id],
                         frame_ts=session.last_frame_full_ts,
@@ -2385,6 +2407,9 @@ def main():
                 # since the last tick.
                 fresh_edge_cam_ids = set()
                 for cam_id in cam_ids:
+                    if not camera_enabled.get(cam_id, True):
+                        viser_mgr.hide_board_pose(cam_id)
+                        continue
                     result = calib_workers[cam_id].try_get_result()
                     if result is None or result["epoch"] != calib_epoch[cam_id]:
                         continue
@@ -2700,17 +2725,31 @@ def main():
                             extra.append(f"no detection for {silent_for:.0f}s")
                     elif state.connected:
                         extra.append("never detected the board yet")
+                    if not camera_enabled.get(cam_id, True):
+                        extra.append("disabled (excluded from calibration)")
                 operational = []
                 if cam_id in undistort_missing_intrinsics:
                     line = "undistort: enabled but no usable intrinsics -- showing raw frame"
                     extra.append(line)
                     operational.append(line)
                 per_cam_operational[cam_id] = operational
-                reproj = f"{state.reproj_error:.3f} px" if state.has_intrinsics_estimate else "n/a"
+                # Latest live board detection's reprojection error (px + mm),
+                # not the intrinsics calibration's aggregate RMS -- see
+                # state.reproj_error above for that (shown separately when
+                # intrinsics_locked). mm uses the pinhole small-angle
+                # approximation (mm = px * depth / focal_length_px), reusing
+                # the K/t already solved for this detection.
+                if state.last_edge_pose is not None:
+                    _, _, edge_t, edge_err = state.last_edge_pose
+                    f_avg = (state.K[0, 0] + state.K[1, 1]) / 2.0
+                    mm_err = edge_err * (edge_t[2] / f_avg) * 1000.0
+                    reproj = f"{edge_err:.3f} px ({mm_err:.2f} mm)"
+                else:
+                    reproj = "n/a"
                 per_cam_metrics[cam_id] = [
                     f"samples for int: {state.sample_count()}",
                     f"samples for ext: {pose_graph.sample_count_for(cam_id)}",
-                    f"reproj error: {reproj}",
+                    f"board reproj error: {reproj}",
                     f"converged: {'yes' if state.converged else 'no'}",
                     *extra,
                 ]
