@@ -1809,6 +1809,20 @@ BODY_CONNECTIONS_COCO = [
     (11, 13), (13, 15), (12, 14), (14, 16),    # legs
 ]
 
+# Same topology with knees/ankles (ids 13-16) dropped -- hips (11-12) are
+# kept as part of the upper body/torso -- for skeletons triangulated with
+# pose2d.triangulation.LANDMARK_IDS_BODY (upper body, ids 0-12).
+# draw_hand_skeleton/add_skeleton_frame already skip connections referencing
+# an absent landmark, so BODY_CONNECTIONS_COCO would silently degrade to
+# this same set on its own -- this exists to make that explicit rather than
+# relying on the missing ids to quietly drop out.
+BODY_CONNECTIONS_COCO_UPPER = [
+    (0, 1), (0, 2), (1, 3), (2, 4),          # face: nose-eyes-ears
+    (5, 6),                                    # shoulders
+    (5, 7), (7, 9), (6, 8), (8, 10),           # arms
+    (5, 11), (6, 12), (11, 12),                # torso
+]
+
 
 def start_viser_server(port=None):
     return viser.ViserServer(port=port) if port is not None else viser.ViserServer()

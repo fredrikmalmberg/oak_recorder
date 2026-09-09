@@ -31,7 +31,17 @@ from hand_pose import hand_multiview as hmv  # noqa: E402
 LANDMARK_IDS_HAND = list(range(21))
 REFERENCE_LANDMARK_ID_HAND = 0  # wrist
 
-LANDMARK_IDS_BODY = list(range(17))  # COCO-17
+LANDMARK_IDS_BODY = list(range(13))  # COCO-17's upper body: nose/eyes/ears/shoulders/elbows/wrists/hips.
+# Only knees/ankles (ids 13-16) are excluded -- hips (11-12) are kept as
+# part of the upper body/torso. Legs are irrelevant for sign-language
+# content and a source of unreliable detections (occluded by a desk,
+# cropped out of frame) that add nothing but noise here. Confirmed via
+# experiment that this doesn't change RANSAC camera selection for a take
+# already dominated by good shoulder visibility (see extraction.py's
+# confidence_body, which the same experiment showed excludes legs from its
+# gating mean too), but there's no upside to triangulating/reporting them
+# either, and it removes a class of bad data by construction rather than
+# relying on that experiment's result holding for every future take.
 REFERENCE_LANDMARK_ID_BODY = 5  # left_shoulder -- more consistently in-frame than hips for a torso-framed signer
 
 DEFAULT_CALIB_PATH = os.path.join("output", "calibration", "20260903_153052_7cam.json")

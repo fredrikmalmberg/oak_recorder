@@ -23,6 +23,15 @@ POSE_LEFT_WRIST = 15
 POSE_RIGHT_WRIST = 16
 MIN_WRIST_VISIBILITY = 0.3
 
+# COCO-17 ids 13-16 (knees/ankles -- hips 11/12 are kept as part of the
+# upper body/torso) -- excluded from confidence_body's mean below so a
+# poorly-visible/occluded leg (a desk, out of frame -- not meaningful for
+# sign-language content anyway) doesn't drag down the whole-frame confidence
+# used to gate camera selection for the landmarks that actually matter (see
+# pose2d.triangulation.LANDMARK_IDS_BODY, which excludes the same ids from
+# triangulation itself).
+BODY_LEG_COCO_IDS = {"13", "14", "15", "16"}
+
 # COCO_id -> BlazePose_id. Ported from hand_pose/h5_hand_extraction.py:31-34.
 BLAZEPOSE_TO_COCO17 = {
     0: 0, 1: 2, 2: 5, 3: 7, 4: 8, 5: 11, 6: 12, 7: 13, 8: 14,
@@ -191,8 +200,9 @@ def extract_pose2d_for_take(
                     body_lms, body_lm_conf = _extract_body_landmarks(pose_landmarks)
                     landmarks_body[cam_id][frame_file] = body_lms
                     landmark_confidence_body[cam_id][frame_file] = body_lm_conf
+                    upper_body_conf = [v for k, v in body_lm_conf.items() if k not in BODY_LEG_COCO_IDS]
                     confidence_body[cam_id][frame_file] = float(
-                        sum(body_lm_conf.values()) / len(body_lm_conf)
+                        sum(upper_body_conf) / len(upper_body_conf)
                     )
                     landmarks_body_hand_left[cam_id][frame_file] = _extract_sparse_hand_points(
                         pose_landmarks, LEFT_HAND_POSE_IDS

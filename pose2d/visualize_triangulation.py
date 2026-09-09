@@ -45,7 +45,7 @@ VIEWER_FOV_DEFAULT_DEG = 50
 PART_STYLE = {
     "left": {"connections": hmv.HAND_CONNECTIONS, "point_color": (0, 200, 255), "bone_color": (0, 160, 220)},
     "right": {"connections": hmv.HAND_CONNECTIONS, "point_color": (255, 160, 0), "bone_color": (220, 120, 0)},
-    "body": {"connections": hmv.BODY_CONNECTIONS_COCO, "point_color": (255, 255, 255), "bone_color": (200, 200, 200)},
+    "body": {"connections": hmv.BODY_CONNECTIONS_COCO_UPPER, "point_color": (255, 255, 255), "bone_color": (200, 200, 200)},
 }
 
 
