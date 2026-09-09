@@ -1906,6 +1906,11 @@ def main():
             "fps": cfg["camera"]["fps"],
             "resolution": [cfg["camera"]["record_width"], cfg["camera"]["record_height"]],
             "mjpeg_quality": cfg["camera"]["mjpeg_quality"],
+            # What timing-related raw data this take has, independent of how
+            # it's later aligned (align_session.py's `timebase` records the
+            # latter) -- see alignment_improvements.md.
+            "depthai_version": dai.__version__ if dai is not None else None,
+            "legacy_timestamp_compare_debug": bool(cfg.get("debug", {}).get("legacy_timestamp_compare")),
             "cameras": cameras_meta,
         }
         with open(os.path.join(take_dir, "take_meta.json"), "w", encoding="utf-8") as f:

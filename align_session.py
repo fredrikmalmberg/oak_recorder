@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import glob
+from collections import OrderedDict
 from datetime import datetime
 
 import cv2
@@ -230,8 +231,20 @@ def nearest_entry(entries, slot_t, time_key="unified_ts_s"):
     return entries[best], abs(times[best] - slot_t)
 
 
+MJPEG_FRAME_CACHE_SIZE = 4
+
+
 def read_mjpeg_frame(video_path, frame_idx, cache, cap_holder):
+    """cache is an OrderedDict used as a small LRU -- frames are only ever
+    reused when an adjacent slot happens to match the same source frame
+    (e.g. a camera running slower than the reference), so a handful of
+    entries is enough; caching every decoded frame for the whole take (the
+    previous behavior) held every full-resolution (3840x2160) frame in
+    memory for the entire run -- tens of GB for a long, multi-camera take,
+    confirmed to OOM-kill the process on a 754-frame/7-camera take.
+    """
     if frame_idx in cache:
+        cache.move_to_end(frame_idx)
         return cache[frame_idx]
     if cap_holder[0] is None:
         cap_holder[0] = cv2.VideoCapture(video_path)
@@ -243,6 +256,8 @@ def read_mjpeg_frame(video_path, frame_idx, cache, cap_holder):
     if not ok or frame is None:
         return None
     cache[frame_idx] = frame
+    if len(cache) > MJPEG_FRAME_CACHE_SIZE:
+        cache.popitem(last=False)
     return frame
 
 
@@ -269,8 +284,21 @@ def align_session(
     align_host_only=False,
     align_device_raw=False,
     align_legacy_host_ts=False,
+    align_unified_legacy=False,
 ):
     session_dir, cameras = discover_session(session_dir)
+
+    # What raw timing data this take was recorded with (depthai version,
+    # whether the legacy-timestamp debug logging was on) -- written by
+    # app.py's write_take_meta() at record time. Older takes predate this
+    # field, so both come back None when take_meta.json is missing/lacks it.
+    take_meta_path = os.path.join(session_dir, "take_meta.json")
+    depthai_version, legacy_timestamp_compare_debug = None, None
+    if os.path.isfile(take_meta_path):
+        with open(take_meta_path, encoding="utf-8") as f:
+            take_meta = json.load(f)
+        depthai_version = take_meta.get("depthai_version")
+        legacy_timestamp_compare_debug = take_meta.get("legacy_timestamp_compare_debug")
 
     header_w, header_h, header_fps, _ = parse_log_header(cameras[0]["log_path"])
     rec_w = rec_w or header_w or 3840
@@ -314,15 +342,9 @@ def align_session(
         timebase = "legacy_unified"
         use_unified = True
     elif align_device_raw:
-        # Each camera's device_ts_s is that camera's own onboard clock,
-        # counting from an arbitrary per-device epoch set at boot (NOT a
-        # shared reference across cameras) -- unlike unified_device below,
-        # this deliberately does NOT add host_offset_s to bring them onto a
-        # common timeline, so cross-camera comparisons here reflect however
-        # far apart each device's own boot-time epoch happens to be, not
-        # true simultaneity. Diagnostic mode only: lets you see what
-        # alignment looks like with zero correction applied, for comparison
-        # against the corrected unified_device result.
+        # Explicit, redundant-with-default alias for the else branch below
+        # (kept as its own flag for scripts/callers that want to state this
+        # choice explicitly rather than relying on it being the default).
         time_key = "device_ts_s"
         timebase = "device_raw"
         use_unified = False
@@ -330,18 +352,37 @@ def align_session(
         time_key = "host_ts_s"
         timebase = "host"
         use_unified = False
-    elif all(offset is not None for offset in offsets.values()):
-        time_key = "unified_ts_s"
-        timebase = "unified_device"
-        use_unified = True
+    elif align_unified_legacy:
+        if all(offset is not None for offset in offsets.values()):
+            time_key = "unified_ts_s"
+            timebase = "unified_device"
+            use_unified = True
+        else:
+            missing = [label for label, off in offsets.items() if off is None]
+            print(
+                "[Alignment] WARNING: missing sync_calibration in "
+                f"{', '.join(missing)}; falling back to raw host timestamps"
+            )
+            time_key = "host_ts_s"
+            timebase = "host_legacy"
+            use_unified = False
     else:
-        missing = [label for label, off in offsets.items() if off is None]
-        print(
-            "[Alignment] WARNING: missing sync_calibration in "
-            f"{', '.join(missing)}; falling back to raw host timestamps"
-        )
-        time_key = "host_ts_s"
-        timebase = "host_legacy"
+        # Default: trust each camera's own device_ts_s (msg.getTimestamp())
+        # directly, with NO host_offset_s correction. depthai continuously
+        # syncs each connected device's clock to the HOST's own clock
+        # domain via its own built-in mechanism (an NTP-style round-trip
+        # exchange, re-run every ~5s by default, sub-millisecond claimed
+        # accuracy) -- so device_ts_s should already be comparable across
+        # every camera connected to this same host without any further
+        # correction. This supersedes the old default (--align-unified-legacy,
+        # below), which derived a per-take host_offset_s from one blocking
+        # frame read; that anchor bakes in that one frame's specific
+        # capture-to-host-arrival latency as a hidden constant for the
+        # whole take (see alignment_improvements.md) rather than relying on
+        # depthai's own continuous, averaged sync. Kept available via
+        # --align-unified-legacy for comparison/fallback.
+        time_key = "device_ts_s"
+        timebase = "device_raw"
         use_unified = False
 
     parsed = {
@@ -415,7 +456,7 @@ def align_session(
         out_dirs[cam["label"]] = out_dir
 
     blue = make_blue_frame(rec_w, rec_h)
-    decode_cache = {cam["label"]: {} for cam in cameras}
+    decode_cache = {cam["label"]: OrderedDict() for cam in cameras}
     cap_holders = {cam["label"]: [None] for cam in cameras}
     slot_matches = {cam["label"]: [] for cam in cameras}
     matched_total = 0
@@ -528,6 +569,8 @@ def align_session(
     report = {
         "session_dir": session_dir,
         "timebase": timebase,
+        "depthai_version": depthai_version,
+        "legacy_timestamp_compare_debug": legacy_timestamp_compare_debug,
         "fps": fps,
         "rec_w": rec_w,
         "rec_h": rec_h,
@@ -830,8 +873,22 @@ def main():
         action="store_true",
         help=(
             "Align on each camera's own raw device_ts_s, with NO host_offset_s "
-            "correction applied -- diagnostic only, since each device's clock "
-            "counts from its own arbitrary per-boot epoch, not a shared reference"
+            "correction applied. This is now also the DEFAULT (this flag just "
+            "states it explicitly) -- depthai continuously syncs each device's "
+            "clock to the host's own clock domain via its own built-in mechanism, "
+            "so device_ts_s should already be comparable across cameras on the "
+            "same host without further correction. See --align-unified-legacy for "
+            "the old default behavior."
+        ),
+    )
+    parser.add_argument(
+        "--align-unified-legacy",
+        action="store_true",
+        help=(
+            "Use the OLD default behavior: a per-take host_offset_s derived from "
+            "one blocking anchor frame (host_ts_s - device_ts_s), added to every "
+            "frame's device_ts_s. Superseded by trusting device_ts_s directly (the "
+            "new default) -- see alignment_improvements.md. Kept for comparison."
         ),
     )
     parser.add_argument(
@@ -852,10 +909,12 @@ def main():
     )
     args = parser.parse_args()
 
-    exclusive = [args.align_raw, args.align_host, args.align_device_raw, args.legacy_host_ts]
+    exclusive = [args.align_raw, args.align_host, args.align_device_raw,
+                 args.legacy_host_ts, args.align_unified_legacy]
     if sum(exclusive) > 1:
         parser.error(
-            "--align-raw, --align-host, --align-device-raw, and --legacy-host-ts are mutually exclusive"
+            "--align-raw, --align-host, --align-device-raw, --legacy-host-ts, and "
+            "--align-unified-legacy are mutually exclusive"
         )
 
     if args.align_raw:
@@ -870,6 +929,7 @@ def main():
         align_host_only=args.align_host,
         align_device_raw=args.align_device_raw,
         align_legacy_host_ts=args.legacy_host_ts,
+        align_unified_legacy=args.align_unified_legacy,
     )
 
     if args.output_mp4 == "small":
