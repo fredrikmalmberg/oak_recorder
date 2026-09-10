@@ -32,14 +32,15 @@ class FitParams:
     usefully support anyway.
     """
 
-    def __init__(self, nf, num_betas=20):
+    def __init__(self, nf, num_betas=20, device=None):
         self.nf = nf
-        self.betas = torch.nn.Parameter(torch.zeros(1, num_betas))
-        self.global_orient = torch.nn.Parameter(torch.zeros(nf, 3))
-        self.transl = torch.nn.Parameter(torch.zeros(nf, 3))
-        self.body_pose = torch.nn.Parameter(torch.zeros(nf, 21, 3))
-        self.lhand_pose = torch.nn.Parameter(torch.zeros(nf, 15, 3))
-        self.rhand_pose = torch.nn.Parameter(torch.zeros(nf, 15, 3))
+        device = device or torch.device("cpu")
+        self.betas = torch.nn.Parameter(torch.zeros(1, num_betas, device=device))
+        self.global_orient = torch.nn.Parameter(torch.zeros(nf, 3, device=device))
+        self.transl = torch.nn.Parameter(torch.zeros(nf, 3, device=device))
+        self.body_pose = torch.nn.Parameter(torch.zeros(nf, 21, 3, device=device))
+        self.lhand_pose = torch.nn.Parameter(torch.zeros(nf, 15, 3, device=device))
+        self.rhand_pose = torch.nn.Parameter(torch.zeros(nf, 15, 3, device=device))
 
     def forward_batch(self, model):
         betas = self.betas.expand(self.nf, -1)
@@ -53,21 +54,22 @@ class FitParams:
         needs each bone's length under the CURRENT shape hypothesis with no
         pose distortion (see losses.shape3d_loss's docstring).
         """
-        zero1 = torch.zeros(1, 3)
+        device = self.betas.device
+        zero1 = torch.zeros(1, 3, device=device)
         return smplx_model.forward(
-            model, self.betas, zero1, torch.zeros(1, 21, 3),
-            torch.zeros(1, 15, 3), torch.zeros(1, 15, 3), zero1,
+            model, self.betas, zero1, torch.zeros(1, 21, 3, device=device),
+            torch.zeros(1, 15, 3, device=device), torch.zeros(1, 15, 3, device=device), zero1,
         )
 
     def as_dict(self):
         """axis-angle numpy arrays, ready for np.savez -- see fit_take.py."""
         return {
-            "betas": self.betas.detach().numpy(),
-            "global_orient": self.global_orient.detach().numpy(),
-            "transl": self.transl.detach().numpy(),
-            "body_pose": self.body_pose.detach().numpy(),
-            "lhand_pose": self.lhand_pose.detach().numpy(),
-            "rhand_pose": self.rhand_pose.detach().numpy(),
+            "betas": self.betas.detach().cpu().numpy(),
+            "global_orient": self.global_orient.detach().cpu().numpy(),
+            "transl": self.transl.detach().cpu().numpy(),
+            "body_pose": self.body_pose.detach().cpu().numpy(),
+            "lhand_pose": self.lhand_pose.detach().cpu().numpy(),
+            "rhand_pose": self.rhand_pose.detach().cpu().numpy(),
         }
 
 
@@ -120,7 +122,7 @@ def _check_up_axis(params, model):
     head = output.joints[:, JOINT_NAMES.index("head"), :].mean(dim=0)
     up_vec = head - pelvis
     up_vec = up_vec / up_vec.norm()
-    z_axis = torch.tensor([0.0, 0.0, 1.0])
+    z_axis = torch.tensor([0.0, 0.0, 1.0], device=up_vec.device)
     cos_angle = torch.clamp((up_vec * z_axis).sum(), -1.0, 1.0)
     angle_deg = float(torch.rad2deg(torch.acos(cos_angle)).item())
     if angle_deg > 30.0:
@@ -254,6 +256,7 @@ def multi_stage_optimize(
     use_silhouette=False, silhouette_weight=0.1, silhouette_cams=None,
     silhouette_masks=None, silhouette_valid=None, silhouette_n_samples=1500,
     silhouette_sigma_px=1.0, use_silhouette_shape=False,
+    device=None,
 ):
     """Runs all 5 stages in sequence, returns (FitParams, full_log_dict).
     full_log_dict is written verbatim to optimization_log.json by
@@ -305,10 +308,13 @@ def multi_stage_optimize(
     same batch (a validated real IoU signal, just lower-fidelity -- ~0.35-
     0.4 vs. ~0.5+ on the same test frame) and keep a full stage tractable.
     """
+    device = device or torch.device("cpu")
     nf = target_points_np.shape[0]
-    target_points = torch.as_tensor(target_points_np, dtype=torch.float32)
-    confidence = torch.as_tensor(confidence_np, dtype=torch.float32)
+    target_points = torch.as_tensor(target_points_np, dtype=torch.float32, device=device)
+    confidence = torch.as_tensor(confidence_np, dtype=torch.float32, device=device)
     body_mask, hand_mask = build_masks(full_layout)
+    body_mask = body_mask.to(device)
+    hand_mask = hand_mask.to(device)
     layout_index_by_local_id = build_layout_index_by_local_id(full_layout)
 
     gmm = pose_prior.load_gmm_prior(gmm_prior_path) if pose_prior_backend == "gmm" else None
@@ -321,10 +327,12 @@ def multi_stage_optimize(
             raise ValueError("use_silhouette/use_silhouette_shape=True requires silhouette_cams/_masks/_valid "
                               "(see silhouette.load_silhouette_data).")
         face_idx, bary = sil.build_surface_samples(
-            model.faces, model.v_template.detach().numpy(), n_samples=silhouette_n_samples,
+            model.faces, model.v_template.detach().cpu().numpy(), n_samples=silhouette_n_samples,
         )
+        face_idx = face_idx.to(device)
+        bary = bary.to(device)
 
-    params = FitParams(nf, num_betas=num_betas)
+    params = FitParams(nf, num_betas=num_betas, device=device)
     log = {"stages": {}, "pose_prior_backend": pose_prior_backend, "use_silhouette": use_silhouette,
            "use_silhouette_shape": use_silhouette_shape,
            "silhouette_weight": silhouette_weight if (use_silhouette or use_silhouette_shape) else None,

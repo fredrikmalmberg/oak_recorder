@@ -102,6 +102,125 @@ def extract_masks_for_take(take_dir, calib, cam_ids=None, force=False):
     return written
 
 
+SAM2_CKPT = "/home/fmalmb/CODE/sam2/checkpoints/sam2.1_hiera_large.pt"
+SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l"
+SAM2_SYSPATH = "/home/fmalmb/CODE/sam2"
+
+
+def _sam2_prompt_from_mask(mask_dir, frame_files, min_coverage=0.02):
+    """Find the first frame with an existing mask and return (frame_idx, click_xy).
+
+    The click is the centroid of the mask — the person's position varies per camera
+    so a fixed center-frame click doesn't work. Using the existing MediaPipe mask
+    centroid as the SAM2 starting point is fine: SAM2 produces its own higher-quality,
+    temporally-consistent mask; MediaPipe only tells us *where* to click.
+
+    Falls back to the midpoint of the first frame if no mask has sufficient coverage.
+    """
+    for i, ff in enumerate(frame_files):
+        mask_path = os.path.join(mask_dir, ff)
+        m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            continue
+        binary = m > 127
+        if binary.mean() < min_coverage:
+            continue
+        # Centroid of the mask
+        ys, xs = np.where(binary)
+        cx, cy = float(xs.mean()), float(ys.mean())
+        return i, np.array([[cx, cy]], dtype=np.float32)
+    return 0, None  # fallback: caller will use frame-center
+
+
+def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"):
+    """Like extract_masks_for_take but uses SAM2 video predictor for higher-quality,
+    temporally-consistent person masks.
+
+    For the initial click prompt, uses the centroid of the first existing MediaPipe
+    mask in aligned/masks/<cam_id>/ with >2% coverage — the person's position varies
+    across cameras, so a fixed center-click doesn't work. If no prior mask exists,
+    falls back to frame-center (adequate when the person is roughly centered).
+
+    Propagates bidirectionally from the prompt frame to cover all frames.
+
+    Writes to the same aligned/masks/<cam_id>/<frame_file> schema as
+    extract_masks_for_take -- the rest of the pipeline reads from the same path.
+
+    Requires SAM2 installed at SAM2_SYSPATH and checkpoint at SAM2_CKPT.
+    """
+    import sys
+    if SAM2_SYSPATH not in sys.path:
+        sys.path.insert(0, SAM2_SYSPATH)
+    import torch
+    from sam2.build_sam import build_sam2_video_predictor
+
+    out_root = os.path.join(take_dir, "aligned", "masks")
+    if cam_ids is None:
+        cam_ids = hmv.discover_cameras(take_dir)
+    cam_ids = [c for c in cam_ids if c in calib]
+
+    predictor = build_sam2_video_predictor(SAM2_CONFIG, ckpt_path=SAM2_CKPT, device=device)
+
+    written = {cid: {} for cid in cam_ids}
+    for cam_id in cam_ids:
+        frame_files = hmv.discover_frames(take_dir, cam_id)
+        if not frame_files:
+            continue
+        cam_out_dir = os.path.join(out_root, cam_id)
+        os.makedirs(cam_out_dir, exist_ok=True)
+
+        if not force and all(os.path.exists(os.path.join(cam_out_dir, ff)) for ff in frame_files):
+            for ff in frame_files:
+                written[cam_id][ff] = os.path.join(cam_out_dir, ff)
+            print(f"  {cam_id}: {len(frame_files)} SAM2 masks already cached, skipping.")
+            continue
+
+        frame_dir = os.path.join(take_dir, "aligned", cam_id)
+        first_img = cv2.imread(os.path.join(frame_dir, frame_files[0]))
+        if first_img is None:
+            print(f"  {cam_id}: could not read first frame, skipping.")
+            continue
+        h, w = first_img.shape[:2]
+
+        prompt_frame_idx, prompt_pt = _sam2_prompt_from_mask(cam_out_dir, frame_files)
+        if prompt_pt is None:
+            prompt_pt = np.array([[w / 2.0, h / 2.0]], dtype=np.float32)
+        print(f"  {cam_id}: prompt click at ({prompt_pt[0,0]:.0f},{prompt_pt[0,1]:.0f}) "
+              f"on frame {prompt_frame_idx} ({frame_files[prompt_frame_idx]})")
+
+        cam_masks = {}
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            inference_state = predictor.init_state(video_path=frame_dir)
+            try:
+                predictor.add_new_points_or_box(
+                    inference_state, frame_idx=prompt_frame_idx, obj_id=1,
+                    points=prompt_pt, labels=np.array([1], dtype=np.int32),
+                )
+                # Propagate forward from prompt frame
+                for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
+                    inference_state, start_frame_idx=prompt_frame_idx, reverse=False
+                ):
+                    cam_masks[frame_idx] = (mask_logits[0, 0] > 0).cpu().numpy().astype(np.uint8) * 255
+                # Propagate backward to cover frames before the prompt
+                if prompt_frame_idx > 0:
+                    for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
+                        inference_state, start_frame_idx=prompt_frame_idx, reverse=True
+                    ):
+                        cam_masks[frame_idx] = (mask_logits[0, 0] > 0).cpu().numpy().astype(np.uint8) * 255
+            finally:
+                predictor.reset_state(inference_state)
+
+        for frame_idx, mask_u8 in cam_masks.items():
+            ff = frame_files[frame_idx]
+            mask_path = os.path.join(cam_out_dir, ff)
+            cv2.imwrite(mask_path, mask_u8)
+            written[cam_id][ff] = mask_path
+
+        print(f"  {cam_id}: {len(cam_masks)} SAM2 masks written to {cam_out_dir}")
+
+    return written
+
+
 def summarize_mask_coverage(take_dir, written, threshold=127):
     """Sanity check per the approved plan's Phase 2 verification: spot-check
     that mask pixel-coverage fraction per frame is plausible (a person
@@ -251,13 +370,20 @@ def main():
     parser.add_argument("take_dir")
     parser.add_argument("--calib", default=os.path.join("output", "calibration", "20260903_153052_7cam.json"))
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--sam2", action="store_true",
+                         help="Use SAM2 video predictor instead of MediaPipe SelfieSegmentation. "
+                              "Requires SAM2 installed at %(default)s.",
+                         default=False)
     parser.add_argument("--grid-video", action="store_true",
                          help="Also render aligned/masks/mask_grid_video.mp4 for visual inspection.")
     parser.add_argument("--fps", type=float, default=15.0)
     args = parser.parse_args()
 
     calib = calibrate.load_calibration_output(args.calib)
-    written = extract_masks_for_take(args.take_dir, calib, force=args.force)
+    if args.sam2:
+        written = extract_masks_sam2(args.take_dir, calib, force=args.force)
+    else:
+        written = extract_masks_for_take(args.take_dir, calib, force=args.force)
     summarize_mask_coverage(args.take_dir, written)
     if args.grid_video:
         render_mask_grid_video(args.take_dir, calib, fps=args.fps)

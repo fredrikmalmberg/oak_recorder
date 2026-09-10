@@ -53,8 +53,9 @@ def summarize_fit_quality(params, model, full_layout, target_points, confidence)
     with torch.no_grad():
         output = params.forward_batch(model)
         pred = smplx_model.predict_all_points(output, full_layout)
-    tp = torch.as_tensor(target_points, dtype=torch.float32)
-    conf = torch.as_tensor(confidence, dtype=torch.float32)
+    device = params.betas.device
+    tp = torch.as_tensor(target_points, dtype=torch.float32, device=device)
+    conf = torch.as_tensor(confidence, dtype=torch.float32, device=device)
     body_mask, hand_mask = opt.build_masks(full_layout)
 
     def unweighted_rms(mask):
@@ -82,7 +83,8 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
             gmm_prior_path=pose_prior.DEFAULT_GMM_PATH, hand_reg_weight=0.0001,
             use_silhouette=False, silhouette_weight=0.1, calib_path=None,
             silhouette_out_size=(32, 18), silhouette_n_samples=1500,
-            silhouette_sigma_px=1.0, use_silhouette_shape=False):
+            silhouette_sigma_px=1.0, use_silhouette_shape=False,
+            use_sam2=False):
     if pose_prior_weight is None:
         # See pose_prior.DEFAULT_POSE_PRIOR_WEIGHTS's comment -- "l2" and
         # "gmm" live on very different absolute scales, so there is no
@@ -107,20 +109,31 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
     print(f"Fitting frames [{start}:{end}) of {nf_total} total "
           f"({(confidence > 0).mean():.1%} confident observations in this range).")
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
     print(f"Loading SMPL-X model from {model_path} (gender={gender}, num_betas={num_betas})...")
     model = smplx_model.load_layer(model_path, gender=gender, num_betas=num_betas)
+    model = model.to(device)
 
     silhouette_kwargs = {}
     if use_silhouette or use_silhouette_shape:
         import sys
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         import calibrate  # noqa: E402
+        from smplx_fit import segmentation as seg
 
         print(f"Loading calibration from {calib_path} and cached Phase 2 masks for silhouette fitting...")
         calib = calibrate.load_calibration_output(calib_path)
         cam_ids = [c for c in hmv.discover_cameras(take_dir) if c in calib]
+
+        if use_sam2:
+            print("Generating SAM2 masks (will skip cameras that already have masks)...")
+            seg.extract_masks_sam2(take_dir, calib, cam_ids=cam_ids, force=False)
+
         sil_cams, sil_masks, sil_valid = sil.load_silhouette_data(
             take_dir, calib, cam_ids, frame_keys, out_size=silhouette_out_size,
+            device=device,
         )
         n_pairs = sum(int(v.sum()) for v in sil_valid.values())
         print(f"  silhouette: {len(sil_cams)}/{len(cam_ids)} cameras have cached masks "
@@ -138,6 +151,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         max_outer_iters=max_outer_iters, num_betas=num_betas,
         pose_prior_backend=pose_prior_backend, gmm_prior_path=gmm_prior_path,
         pose_prior_weight=pose_prior_weight, hand_reg_weight=hand_reg_weight,
+        device=device,
         **silhouette_kwargs,
     )
     elapsed = time.time() - t0
@@ -217,6 +231,11 @@ def main():
     parser.add_argument("--calib", dest="calib_path", default=None,
                          help="Calibration output JSON (calibrate.load_calibration_output's schema). "
                               "Required when --use-silhouette or --use-silhouette-shape is passed.")
+    parser.add_argument("--use-sam2", action="store_true",
+                         help="Before silhouette fitting, generate/update masks using SAM2 video predictor "
+                              "instead of relying on pre-cached MediaPipe masks. Only runs on cameras that "
+                              "don't already have masks (unless --force is also passed). "
+                              "Implies --use-silhouette or --use-silhouette-shape.")
     parser.add_argument("--silhouette-weight", type=float, default=0.1)
     parser.add_argument("--silhouette-out-size", default="32x18",
                          help="WxH of the downsampled render used for the silhouette comparison (default: "
@@ -237,6 +256,7 @@ def main():
         silhouette_weight=args.silhouette_weight,
         calib_path=args.calib_path, silhouette_out_size=(sil_w, sil_h),
         silhouette_n_samples=args.silhouette_n_samples, silhouette_sigma_px=args.silhouette_sigma_px,
+        use_sam2=args.use_sam2,
     )
 
 

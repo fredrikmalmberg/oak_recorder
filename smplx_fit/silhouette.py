@@ -169,7 +169,7 @@ def render_silhouette(uv, image_size, out_size=(128, 128), sigma_px=1.0, valid_m
     return occupancy
 
 
-def load_silhouette_data(take_dir, calib, cam_ids, frame_keys, out_size=(64, 36)):
+def load_silhouette_data(take_dir, calib, cam_ids, frame_keys, out_size=(64, 36), device=None):
     """Precomputes, ONCE before optimization starts, everything the
     per-iteration silhouette term needs: each camera's (K, R, t, image
     size) and a (n_frames, out_h, out_w) tensor of that camera's cached
@@ -208,40 +208,102 @@ def load_silhouette_data(take_dir, calib, cam_ids, frame_keys, out_size=(64, 36)
         if not cam_valid.any():
             continue  # no masks cached for this camera at all -- skip it entirely
         cams[cam_id] = (c["K"], c["R"], c["t"], (w, h))
-        masks[cam_id] = torch.as_tensor(cam_masks)
+        masks[cam_id] = torch.as_tensor(cam_masks, device=device)
         valid[cam_id] = cam_valid
     return cams, masks, valid
 
 
 def compute_silhouette_term(vertices_batch, faces, face_idx, bary, cams, masks, valid, sigma_px=2.0):
-    """The per-(frame, camera) driver called from optimize.py's stage loss
-    closures: samples the current batch's mesh surface once per frame (out
-    of the loop below, since sampling doesn't depend on the camera), then
-    projects+renders+compares against that camera's cached mask for every
-    valid (frame, camera) pair. vertices_batch: (n_frames, V, 3) --
-    `params.forward_batch(model).vertices` for whatever frames are in the
-    current optimization batch. cams/masks/valid: from load_silhouette_data,
-    which the caller must have built with frame_keys in the SAME order as
-    vertices_batch's frame axis. Returns (mean_loss_over_valid_pairs, n_pairs)
-    -- n_pairs lets the caller log how much real signal actually went into
-    this term (e.g. a take with sparse mask coverage should show a small
-    n_pairs, not silently look identical to full coverage).
+    """Vectorized (camera × frame) silhouette loss with automatic frame
+    chunking to stay within VRAM bounds.
+
+    The dominant memory cost is the 5-D distance grid (nc, chunk, out_h,
+    out_w, N). At default settings (nc=7, out_h=18, out_w=32, N=1500) this
+    is ~23 MB per frame, so the chunk size is auto-capped at ~86 frames to
+    stay under a 2 GB budget. For the 40-frame test slice this means no
+    chunking; for the full 786-frame take, ~9 chunks of ~87 frames.
+
+    When chunking, each chunk is wrapped in torch.utils.checkpoint so only
+    one chunk's activations are live at a time during backward (~2x the
+    chunk's forward memory, not all-chunks combined). This trades ~2x
+    compute for bounded VRAM regardless of take length.
+
+    vertices_batch: (n_frames, V, 3). cams/masks/valid: from
+    load_silhouette_data, frame axis must match vertices_batch. Returns
+    (mean_loss_over_valid_pairs, n_pairs).
     """
-    pts = sample_surface_points(vertices_batch, faces, face_idx, bary)  # (n_frames, N, 3)
-    nf = vertices_batch.shape[0]
-    total = torch.zeros((), dtype=vertices_batch.dtype, device=vertices_batch.device)
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+    device = vertices_batch.device
+    dtype = vertices_batch.dtype
+    pts = sample_surface_points(vertices_batch, faces, face_idx, bary)  # (nf, N, 3)
+    nf, N = pts.shape[0], pts.shape[1]
+
+    cam_ids_list = list(cams.keys())
+    nc = len(cam_ids_list)
+    if nc == 0:
+        return torch.zeros((), dtype=dtype, device=device), 0
+
+    K_t = torch.stack([
+        torch.as_tensor(np.asarray(cams[c][0]), dtype=dtype, device=device)
+        for c in cam_ids_list
+    ])  # (nc, 3, 3)
+    R_t = torch.stack([
+        torch.as_tensor(np.asarray(cams[c][1]), dtype=dtype, device=device)
+        for c in cam_ids_list
+    ])  # (nc, 3, 3)
+    t_t = torch.stack([
+        torch.as_tensor(np.asarray(cams[c][2]), dtype=dtype, device=device).reshape(3)
+        for c in cam_ids_list
+    ])  # (nc, 3)
+    image_sizes = [cams[c][3] for c in cam_ids_list]
+    out_h, out_w = masks[cam_ids_list[0]].shape[1:]
+    masks_stack = torch.stack([masks[c].to(device) for c in cam_ids_list])  # (nc, nf, out_h, out_w)
+    valid_np = np.stack([valid[c] for c in cam_ids_list])  # (nc, nf) bool
+
+    scale = torch.tensor(
+        [[out_w / W, out_h / H] for W, H in image_sizes],
+        dtype=dtype, device=device,
+    )  # (nc, 2)
+
+    # Auto chunk size: cap 5-D distance grid at ~2 GB
+    elems_per_frame = nc * out_h * out_w * N
+    chunk_size = max(1, min(nf, int(2e9 / 4 / elems_per_frame)))
+    use_ckpt = nf > chunk_size  # only checkpoint when actually splitting
+
+    # _occ captures R_t/K_t/t_t/scale/N/nc/out_h/out_w/sigma_px via closure;
+    # pts_chunk is the only gradient-tracking input.
+    def _occ(pts_chunk):
+        ch = pts_chunk.shape[0]
+        pts_exp = pts_chunk.unsqueeze(0).expand(nc, -1, -1, -1)
+        cam_pts = (torch.matmul(pts_exp, R_t.unsqueeze(1).permute(0, 1, 3, 2))
+                   + t_t[:, None, None, :])                              # (nc, ch, N, 3)
+        proj = torch.matmul(cam_pts, K_t.unsqueeze(1).permute(0, 1, 3, 2))
+        z_pos = cam_pts[..., 2] > 0
+        z = proj[..., 2].clamp(min=1e-6)
+        uv_s = (proj[..., :2] / z.unsqueeze(-1)) * scale[:, None, None, :]  # (nc, ch, N, 2)
+        gx = torch.arange(out_w, dtype=pts_chunk.dtype, device=pts_chunk.device)
+        gy = torch.arange(out_h, dtype=pts_chunk.dtype, device=pts_chunk.device)
+        u = uv_s[..., 0].reshape(nc, ch, 1, 1, N)
+        v = uv_s[..., 1].reshape(nc, ch, 1, 1, N)
+        sq_dist = ((gx.reshape(1, 1, 1, out_w, 1) - u) ** 2
+                   + (gy.reshape(1, 1, out_h, 1, 1) - v) ** 2)         # (nc, ch, oh, ow, N)
+        gauss = torch.exp(-0.5 * sq_dist / (sigma_px ** 2))
+        gauss = gauss * z_pos.reshape(nc, ch, 1, 1, N).to(pts_chunk.dtype)
+        return 1.0 - torch.prod(1.0 - gauss.clamp(max=1.0 - 1e-6), dim=-1)  # (nc, ch, oh, ow)
+
+    total = torch.zeros((), dtype=dtype, device=device)
     count = 0
-    for cam_id, (K, R, t, image_size) in cams.items():
-        cam_valid = valid[cam_id]
-        cam_masks = masks[cam_id].to(vertices_batch.device)
-        out_h, out_w = cam_masks.shape[1:]
-        for i in range(nf):
-            if not cam_valid[i]:
-                continue
-            uv, z = project_points(pts[i], K, R, t)
-            rendered = render_silhouette(uv, image_size, out_size=(out_w, out_h), sigma_px=sigma_px, valid_mask=z > 0)
-            total = total + losses.silhouette_loss(rendered, cam_masks[i])
-            count += 1
+    for f0 in range(0, nf, chunk_size):
+        pts_ch = pts[f0:f0 + chunk_size]
+        masks_ch = masks_stack[:, f0:f0 + chunk_size]
+        valid_ch = valid_np[:, f0:f0 + chunk_size]
+        occ = (torch_checkpoint(_occ, pts_ch, use_reentrant=False)
+               if use_ckpt else _occ(pts_ch))
+        per_pair = ((occ - masks_ch) ** 2).mean(dim=(-2, -1))
+        total = total + (per_pair * torch.as_tensor(valid_ch, dtype=dtype, device=device)).sum()
+        count += int(valid_ch.sum())
+
     if count == 0:
-        return torch.zeros((), dtype=vertices_batch.dtype, device=vertices_batch.device), 0
+        return torch.zeros((), dtype=dtype, device=device), 0
     return total / count, count
