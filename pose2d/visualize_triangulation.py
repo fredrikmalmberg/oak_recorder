@@ -31,12 +31,14 @@ import sys
 import time
 
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import calibrate  # noqa: E402
 
 from hand_pose import hand_multiview as hmv  # noqa: E402
 from pose2d import triangulation  # noqa: E402
+from smplx_fit import model as smplx_model  # noqa: E402
 
 VIEWER_FOV_MIN_DEG = 20
 VIEWER_FOV_MAX_DEG = 120
@@ -59,17 +61,72 @@ def load_reconstructions(take_dir, parts, use_smoothed, pose2d_dir="pose2d"):
     return out
 
 
-def run_multi_skeleton_player(server, reconstructions, fps=15.0):
+def load_smplx_mesh_sequence(npz_path, model_path, hide_lower_body=False):
+    """Loads a smplx_fit.fit_take output .npz and returns (vertices_by_frame,
+    faces) -- vertices_by_frame maps EXACTLY the frame_key strings the fit
+    covered (often a subset of the take, e.g. a --frames slice) to that
+    frame's (V, 3) vertex array; faces is the constant (F, 3) face-index
+    array shared by every frame.
+
+    One batched SMPLXLayer forward pass over every fitted frame at load
+    time, not per-tick during playback -- on CPU-only torch, one batched
+    call is far cheaper than replaying hundreds of individual forward
+    passes while scrubbing/playing.
+
+    hide_lower_body: drop legs/feet faces (smplx_model.upper_body_faces) --
+    useful since this pipeline supplies zero leg keypoints (see optimize.py's
+    known_limitations), so a fit's legs are held near-neutral by the pose
+    prior/silhouette term alone and can visually mislead if shown as if
+    they were as trustworthy as the rest of the mesh.
+    """
+    data = np.load(npz_path, allow_pickle=True)
+    frame_keys = [str(fk) for fk in data["frame_keys"]]
+    gender = str(data["gender"])
+    num_betas = int(data["num_betas"])
+    model = smplx_model.load_layer(model_path, gender=gender, num_betas=num_betas)
+
+    nf = len(frame_keys)
+    betas = torch.as_tensor(data["betas"], dtype=torch.float32).expand(nf, -1)
+    global_orient = torch.as_tensor(data["global_orient"], dtype=torch.float32)
+    transl = torch.as_tensor(data["transl"], dtype=torch.float32)
+    body_pose = torch.as_tensor(data["body_pose"], dtype=torch.float32)
+    lhand_pose = torch.as_tensor(data["lhand_pose"], dtype=torch.float32)
+    rhand_pose = torch.as_tensor(data["rhand_pose"], dtype=torch.float32)
+    with torch.no_grad():
+        output = smplx_model.forward(model, betas, global_orient, body_pose, lhand_pose, rhand_pose, transl)
+
+    vertices = output.vertices.numpy()
+    vertices_by_frame = {fk: vertices[i] for i, fk in enumerate(frame_keys)}
+    faces = smplx_model.upper_body_faces(model) if hide_lower_body else model.faces
+    return vertices_by_frame, faces
+
+
+def run_multi_skeleton_player(server, reconstructions, fps=15.0, smplx_mesh=None, frame_range=None):
     """reconstructions: dict[part_name] -> reconstruction dict (frame_key ->
     {lm_id: [x,y,z]}). All parts share one timeline -- the union of frame
     keys across parts, since each part's own RANSAC selection can succeed on
     a different subset of frames; a part with no data for the current frame
     just renders empty (add_skeleton_frame's own empty-point-cloud path).
+
+    smplx_mesh: optional (vertices_by_frame, faces) from
+    load_smplx_mesh_sequence -- both the skeleton and the mesh already live
+    in the same calibration/world frame by construction (both come from the
+    SAME triangulated keypoints), so no coordinate transform is needed
+    between them.
+
+    frame_range: optional (start, end) slice (Python slice semantics, same
+    convention as smplx_fit.fit_take's --frames) applied to the FULL take's
+    timeline -- e.g. to focus playback on exactly the slice a --smplx-npz
+    fit covers, instead of looping the whole take with the mesh only
+    visible for a brief window in the middle.
     """
     frame_keys = sorted(
         {fk for recon in reconstructions.values() for fk in recon},
         key=lambda k: int(os.path.splitext(k)[0]),
     )
+    if frame_range is not None:
+        start, end = frame_range
+        frame_keys = frame_keys[start:end]
     if not frame_keys:
         print("No reconstructed frames to play.")
         return
@@ -78,6 +135,20 @@ def run_multi_skeleton_player(server, reconstructions, fps=15.0):
     stop_button = server.gui.add_button("Stop viewer")
     speed_slider = server.gui.add_slider("Playback Speed (FPS)", min=1, max=60, step=1, initial_value=fps)
     frame_slider = server.gui.add_slider("Timeline Frame", min=0, max=len(frame_keys) - 1, step=1, initial_value=0)
+
+    mesh_handle = None
+    show_mesh_checkbox = None
+    vertices_by_frame, faces = ({}, None) if smplx_mesh is None else smplx_mesh
+    if smplx_mesh is not None:
+        show_mesh_checkbox = server.gui.add_checkbox("Show SMPL-X mesh", initial_value=True)
+        first_verts = next(iter(vertices_by_frame.values()))
+        # Created ONCE here; mutated in place below (.vertices/.visible) --
+        # the same persisted-handle-mutation pattern calibrate.py's
+        # ViserManager._update_board_visual uses, meaningfully cheaper than
+        # re-uploading a ~20k-face mesh's full vertex+face buffer every tick.
+        mesh_handle = server.scene.add_mesh_simple(
+            "/smplx_mesh", vertices=first_verts, faces=faces, color=(180, 180, 220),
+        )
 
     state = {"playing": False, "running": True}
 
@@ -101,6 +172,13 @@ def run_multi_skeleton_player(server, reconstructions, fps=15.0):
                     server, recon.get(frame_key, {}), name_prefix=f"/skeleton/{part_name}",
                     connections=style["connections"], point_color=style["point_color"], bone_color=style["bone_color"],
                 )
+            if mesh_handle is not None:
+                verts = vertices_by_frame.get(frame_key)
+                if verts is not None and show_mesh_checkbox.value:
+                    mesh_handle.vertices = verts
+                    mesh_handle.visible = True
+                else:
+                    mesh_handle.visible = False
             if state["playing"]:
                 current_idx = (current_idx + 1) % len(frame_keys)
                 frame_slider.value = current_idx
@@ -147,7 +225,10 @@ def setup_app_style_scene(server):
     return floor_grid
 
 
-def launch_3d_viewer(take_dir, calib_path, parts, port, fps, use_smoothed, pose2d_dir="pose2d"):
+def launch_3d_viewer(
+    take_dir, calib_path, parts, port, fps, use_smoothed, pose2d_dir="pose2d",
+    smplx_npz=None, smplx_model_path=None, frame_range=None, smplx_hide_lower_body=False,
+):
     calib = calibrate.load_calibration_output(calib_path)
     reconstructions = load_reconstructions(take_dir, parts, use_smoothed, pose2d_dir=pose2d_dir)
 
@@ -159,12 +240,18 @@ def launch_3d_viewer(take_dir, calib_path, parts, port, fps, use_smoothed, pose2
         sample = calib[cam_ids[0]]
         hmv.add_camera_frustums(server, poses, sample["K"], sample["width"], sample["height"])
 
+    smplx_mesh = None
+    if smplx_npz is not None:
+        print(f"Loading SMPL-X fit from {smplx_npz}...")
+        smplx_mesh = load_smplx_mesh_sequence(smplx_npz, smplx_model_path, hide_lower_body=smplx_hide_lower_body)
+        print(f"SMPL-X mesh covers {len(smplx_mesh[0])} frame(s).")
+
     frame_counts = ", ".join(f"{p}={len(reconstructions[p])}" for p in parts)
     print(
         f"Viser server running -- open the printed URL in a browser to view. "
         f"parts: {frame_counts} ({'smoothed' if use_smoothed else 'raw'})."
     )
-    run_multi_skeleton_player(server, reconstructions, fps=fps)
+    run_multi_skeleton_player(server, reconstructions, fps=fps, smplx_mesh=smplx_mesh, frame_range=frame_range)
 
 
 def main():
@@ -179,11 +266,36 @@ def main():
         "--pose2d-dir", default="pose2d",
         help="Which detector's triangulation to view: 'pose2d' (MediaPipe, default) or 'pose2d_dwpose' (DWPose).",
     )
+    parser.add_argument(
+        "--smplx-npz", default=None,
+        help="Optional smplx_fit.fit_take output (smplx_params.npz) to render as a mesh alongside the skeleton.",
+    )
+    parser.add_argument(
+        "--smplx-model-path", default="models/SMPLX",
+        help="SMPL-X model directory (only used if --smplx-npz is given).",
+    )
+    parser.add_argument(
+        "--frames", default=None,
+        help="START:END (Python slice semantics, same convention as smplx_fit.fit_take's --frames) to "
+             "restrict playback to a sub-range of the take -- e.g. to focus on exactly the slice a "
+             "--smplx-npz fit covers instead of looping the whole take. Default: whole take.",
+    )
+    parser.add_argument(
+        "--smplx-hide-lower-body", action="store_true",
+        help="Drop the SMPL-X mesh's legs/feet faces -- this pipeline supplies zero leg keypoints, "
+             "so a fit's legs are held near-neutral by the pose prior/silhouette term alone, not "
+             "real data; hiding them avoids visually overclaiming their accuracy.",
+    )
     args = parser.parse_args()
     parts = [p.strip() for p in args.part.split(",") if p.strip()]
+    frame_range = None
+    if args.frames is not None:
+        start_s, end_s = args.frames.split(":")
+        frame_range = (int(start_s) if start_s else 0, int(end_s) if end_s else None)
     launch_3d_viewer(
         args.take_dir, args.calib, parts, args.port, args.fps, use_smoothed=not args.raw,
-        pose2d_dir=args.pose2d_dir,
+        pose2d_dir=args.pose2d_dir, smplx_npz=args.smplx_npz, smplx_model_path=args.smplx_model_path,
+        frame_range=frame_range, smplx_hide_lower_body=args.smplx_hide_lower_body,
     )
 
 
