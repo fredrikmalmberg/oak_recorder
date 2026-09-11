@@ -1,39 +1,10 @@
-"""Dependency-free silhouette rendering for Phase 3 of the EasyMoCap-
-inspired plan (see the approved plan / conversation history).
+"""Silhouette rendering for SMPL-X shape/pose optimization.
 
-PyTorch3D -- the standard differentiable mesh rasterizer, and what
-EasyMoCap itself uses for this -- was evaluated and rejected for this
-project: it ships no PyPI wheel and no win-64 conda package (confirmed by
-direct query against both index/channel this session), so the only path in
-is a from-source build via VS Build Tools with no CUDA toolkit present --
-exactly the fragile "historically common outcome on Windows" the plan
-flagged as the trigger to fall back rather than sink more effort into the
-install itself.
+Primary renderer: nvdiffrast (hardware rasterization with antialias for
+sub-pixel edge gradients, proper self-occlusion via depth buffer).
 
-This module implements the plan's documented fallback instead: a crude but
-fully-differentiable, dependency-free "soft splat" renderer --
-  1. Sample points across the mesh surface (fixed face indices + barycentric
-     weights, chosen ONCE at import time and reused every call -- only the
-     vertex positions vary per forward pass, so this stays a plain linear
-     combination of vertex positions, differentiable w.r.t. them).
-  2. Project each sample point into a camera view with the SAME K/R/t
-     projection convention this project already uses everywhere else for
-     reprojection (hand_pose.hand_multiview.build_projection_matrix; world
-     points project via x_cam = R @ X_world + t, matching calibrate.
-     load_calibration_output's schema).
-  3. Splat each projected point as a small soft 2D Gaussian into a
-     downsampled occupancy image, compared against a Phase 2 segmentation
-     mask via a pixel-wise loss.
-
-This is cruder than true triangle rasterization (a point cloud of surface
-samples, not a filled/occluded-aware silhouette -- notably, it does NOT
-handle self-occlusion: a sample point on the far side of a limb splats onto
-the image exactly as if it were visible, silently double-counting depth
-layers the mask can only see once). Acceptable for this project's
-documented purpose -- pulling body_pose's normally-unconstrained leg slots
-toward the signer's real stance via silhouette overlap, not a
-photorealistic renderer -- but NOT a drop-in substitute for PyTorch3D
-elsewhere.
+Fallback: soft-splat (point-cloud Gaussian, no occlusion handling,
+weaker gradients — kept for environments where nvdiffrast is unavailable).
 """
 import os
 
@@ -46,6 +17,48 @@ from smplx_fit import losses
 
 N_SURFACE_SAMPLES = 8000
 SAMPLE_SEED = 0
+
+# Lazily-initialised nvdiffrast CUDA context (one per process).
+_glctx = None
+
+
+def _get_nvdiffrast_ctx():
+    global _glctx
+    if _glctx is None:
+        import nvdiffrast.torch as dr
+        _glctx = dr.RasterizeCudaContext()
+    return _glctx
+
+
+def _verts_to_clip(verts_world, K, R, t, img_w, img_h, near=0.1, far=50.0):
+    """(B, V, 3) world-space → (B, V, 4) nvdiffrast clip-space.
+
+    Convention: x_cam = R @ X_world + t (matches calibrate schema).
+    OpenGL NDC: x ∈ [-1,1] left→right, y ∈ [-1,1] bottom→top.
+    """
+    device, dtype = verts_world.device, verts_world.dtype
+    R_t = torch.as_tensor(np.asarray(R), dtype=dtype, device=device)
+    t_v = torch.as_tensor(np.asarray(t), dtype=dtype, device=device)
+    K_t = torch.as_tensor(np.asarray(K), dtype=dtype, device=device)
+
+    cam = verts_world @ R_t.T + t_v          # (B, V, 3)
+    x_c, y_c, z_c = cam[..., 0], cam[..., 1], cam[..., 2]
+
+    fx, fy = float(K_t[0, 0]), float(K_t[1, 1])
+    cx, cy = float(K_t[0, 2]), float(K_t[1, 2])
+
+    # Multiply-through-w form so perspective divide gives correct NDC:
+    #   x_ndc = 2*u/W - 1   where u = fx*(x_c/z_c) + cx
+    # nvdiffrast rast_out has row 0 = y_ndc=-1 (OpenGL bottom stored first),
+    # so top-of-image must map to y_ndc=-1 (no y-flip here), giving row 0 =
+    # image top once we read the tensor as a normal image array.
+    x_clip = (2.0 * fx / img_w) * x_c + (2.0 * cx / img_w - 1.0) * z_c
+    y_clip = (2.0 * fy / img_h) * y_c + (2.0 * cy / img_h - 1.0) * z_c
+
+    # Linear depth: z_ndc = (2*z_c - far - near) / (far - near) ∈ [-1, 1]
+    z_clip = z_c * (2.0 * z_c - far - near) / (far - near)
+
+    return torch.stack([x_clip, y_clip, z_clip, z_c], dim=-1)  # (B, V, 4)
 
 
 def _face_areas(vertices_np, faces_np):
@@ -91,7 +104,8 @@ def sample_surface_points(vertices, faces, face_idx, bary):
     face_idx/bary: from build_surface_samples. Returns (B, n_samples, 3) or
     (n_samples, 3) sampled surface points, same batch-ness as `vertices`.
     """
-    faces_t = torch.as_tensor(np.asarray(faces), dtype=torch.int64, device=vertices.device)
+    faces_np = faces.cpu().numpy() if isinstance(faces, torch.Tensor) else np.asarray(faces)
+    faces_t = torch.as_tensor(faces_np, dtype=torch.int64, device=vertices.device)
     tri = faces_t[face_idx]  # (n_samples, 3)
     batched = vertices.dim() == 3
     v = vertices if batched else vertices.unsqueeze(0)
@@ -169,7 +183,7 @@ def render_silhouette(uv, image_size, out_size=(128, 128), sigma_px=1.0, valid_m
     return occupancy
 
 
-def load_silhouette_data(take_dir, calib, cam_ids, frame_keys, out_size=(64, 36), device=None):
+def load_silhouette_data(take_dir, calib, cam_ids, frame_keys, out_size=(64, 36), device=None, mask_subdir="masks"):
     """Precomputes, ONCE before optimization starts, everything the
     per-iteration silhouette term needs: each camera's (K, R, t, image
     size) and a (n_frames, out_h, out_w) tensor of that camera's cached
@@ -196,13 +210,19 @@ def load_silhouette_data(take_dir, calib, cam_ids, frame_keys, out_size=(64, 36)
             continue
         c = calib[cam_id]
         w, h = hmv.get_image_size(take_dir, cam_id, frame_keys[0])
+        # Build undistort maps once per camera. Masks are saved from distorted
+        # frames (SAM2/SAM3 runs on raw aligned frames) but projection uses K
+        # only (pinhole, no distortion) → undistorted pixel space. Remap each
+        # mask to undistorted space so both sides of the loss are consistent.
+        map1, map2 = hmv.build_undistort_maps(c["K"], c["dist"], w, h)
         cam_masks = np.zeros((len(frame_keys), out_h, out_w), dtype=np.float32)
         cam_valid = np.zeros(len(frame_keys), dtype=bool)
         for i, frame_key in enumerate(frame_keys):
-            mask_path = os.path.join(take_dir, "aligned", "masks", cam_id, frame_key)
+            mask_path = os.path.join(take_dir, "aligned", mask_subdir, cam_id, frame_key)
             m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if m is None:
                 continue
+            m = cv2.remap(m, map1, map2, interpolation=cv2.INTER_NEAREST)
             cam_masks[i] = cv2.resize(m, (out_w, out_h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
             cam_valid[i] = True
         if not cam_valid.any():
@@ -214,7 +234,66 @@ def load_silhouette_data(take_dir, calib, cam_ids, frame_keys, out_size=(64, 36)
 
 
 def compute_silhouette_term(vertices_batch, faces, face_idx, bary, cams, masks, valid, sigma_px=2.0):
-    """Vectorized (camera × frame) silhouette loss with automatic frame
+    """Silhouette loss.  Uses nvdiffrast hardware rasterizer when available
+    (proper occlusion + clean boundary gradients); falls back to soft-splat.
+    face_idx/bary are only used in the soft-splat path.
+    """
+    try:
+        return _compute_silhouette_nvdiffrast(vertices_batch, faces, cams, masks, valid)
+    except ImportError:
+        return _compute_silhouette_softsplat(
+            vertices_batch, faces, face_idx, bary, cams, masks, valid, sigma_px)
+
+
+def _compute_silhouette_nvdiffrast(vertices_batch, faces, cams, masks, valid):
+    """nvdiffrast-based silhouette: rasterize full mesh, antialias edges."""
+    import nvdiffrast.torch as dr
+    glctx = _get_nvdiffrast_ctx()
+
+    device = vertices_batch.device
+    dtype = vertices_batch.dtype
+    nf = vertices_batch.shape[0]
+
+    cam_ids_list = list(cams.keys())
+    nc = len(cam_ids_list)
+    if nc == 0:
+        return torch.zeros((), dtype=dtype, device=device), 0
+
+    out_h, out_w = masks[cam_ids_list[0]].shape[1:]
+    masks_stack = torch.stack([masks[c].to(device) for c in cam_ids_list])  # (nc, nf, oh, ow)
+    valid_np = np.stack([valid[c] for c in cam_ids_list])                   # (nc, nf) bool
+
+    faces_np = faces.cpu().numpy() if isinstance(faces, torch.Tensor) else np.asarray(faces)
+    tri = torch.as_tensor(faces_np, dtype=torch.int32, device=device)
+
+    # Build clip-space vertices for all (cam × frame) pairs → (nc*nf, V, 4)
+    all_pos = []
+    for cam_id in cam_ids_list:
+        K, R, t, (img_w, img_h) = cams[cam_id]
+        pos = _verts_to_clip(vertices_batch, K, R, t, img_w, img_h)  # (nf, V, 4)
+        all_pos.append(pos)
+    pos_all = torch.cat(all_pos, dim=0)  # (nc*nf, V, 4)
+
+    # Rasterize
+    rast_out, _ = dr.rasterize(glctx, pos_all, tri, resolution=[out_h, out_w])
+
+    # Silhouette: 1 where a triangle covers the pixel, else 0; antialias at edges
+    sil = (rast_out[..., 3:4] > 0).to(dtype)
+    sil = dr.antialias(sil, rast_out, pos_all, tri)   # (nc*nf, oh, ow, 1)
+    sil = sil[..., 0].view(nc, nf, out_h, out_w)
+
+    valid_t = torch.as_tensor(valid_np, dtype=dtype, device=device)  # (nc, nf)
+    per_pair = ((sil - masks_stack) ** 2).mean(dim=(-2, -1))         # (nc, nf)
+    total = (per_pair * valid_t).sum()
+    count = int(valid_np.sum())
+
+    if count == 0:
+        return torch.zeros((), dtype=dtype, device=device), 0
+    return total / count, count
+
+
+def _compute_silhouette_softsplat(vertices_batch, faces, face_idx, bary, cams, masks, valid, sigma_px=2.0):
+    """Soft-splat fallback. Vectorized (camera × frame) silhouette loss with automatic frame
     chunking to stay within VRAM bounds.
 
     The dominant memory cost is the 5-D distance grid (nc, chunk, out_h,

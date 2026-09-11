@@ -253,7 +253,7 @@ def multi_stage_optimize(
     max_outer_iters=10, rel_tol=1e-9, num_betas=20,
     pose_prior_backend="l2", gmm_prior_path=pose_prior.DEFAULT_GMM_PATH,
     pose_prior_weight=0.01, hand_reg_weight=0.0001,
-    use_silhouette=False, silhouette_weight=0.1, silhouette_cams=None,
+    use_silhouette=False, silhouette_weight=2.0, silhouette_cams=None,
     silhouette_masks=None, silhouette_valid=None, silhouette_n_samples=1500,
     silhouette_sigma_px=1.0, use_silhouette_shape=False,
     device=None,
@@ -472,19 +472,21 @@ def multi_stage_optimize(
     # much weaker gradient), while Adam's per-parameter adaptive step size
     # handles the scale mismatch fine.
     if use_silhouette_shape:
+        # Stage 3b: silhouette-only shape refinement.
+        # Stage 1 already fit betas to 3D keypoints; re-adding shape3d * 10000
+        # here dwarfs the silhouette signal (~10000:1 ratio) and prevents
+        # betas from moving. Use only silhouette + weak regularization so the
+        # boundary gradient can actually steer body shape.
         def stage3b_shape_loss():
-            rest_output = params.forward_rest_pose(model)
-            rest_points = smplx_model.predict_all_points(rest_output, full_layout)[0]
-            shape3d, _ = losses.shape3d_loss(target_points, confidence, rest_points, layout_index_by_local_id)
             reg_shape = losses.l2_regularization(params.betas)
             output = params.forward_batch(model)
             sil_loss, n_pairs = sil.compute_silhouette_term(
                 output.vertices, model.faces, face_idx, bary,
                 silhouette_cams, silhouette_masks, silhouette_valid, sigma_px=silhouette_sigma_px,
             )
-            total = shape3d * 10000.0 + reg_shape * 1.0 + sil_loss * silhouette_weight
+            total = reg_shape * 0.01 + sil_loss * silhouette_weight
             return total, {
-                "shape3d": float(shape3d.item()), "reg_shape": float(reg_shape.item()),
+                "reg_shape": float(reg_shape.item()),
                 "silhouette": float(sil_loss.item()), "silhouette_n_pairs": n_pairs,
             }
 

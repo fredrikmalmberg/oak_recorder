@@ -81,10 +81,10 @@ def summarize_fit_quality(params, model, full_layout, target_points, confidence)
 def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, max_outer_iters, force,
             pose_prior_backend="l2", pose_prior_weight=None,
             gmm_prior_path=pose_prior.DEFAULT_GMM_PATH, hand_reg_weight=0.0001,
-            use_silhouette=False, silhouette_weight=0.1, calib_path=None,
-            silhouette_out_size=(32, 18), silhouette_n_samples=1500,
+            use_silhouette=False, silhouette_weight=2.0, calib_path=None,
+            silhouette_out_size=(256, 144), silhouette_n_samples=1500,
             silhouette_sigma_px=1.0, use_silhouette_shape=False,
-            use_sam2=False):
+            use_sam2=False, mask_subdir="masks"):
     if pose_prior_weight is None:
         # See pose_prior.DEFAULT_POSE_PRIOR_WEIGHTS's comment -- "l2" and
         # "gmm" live on very different absolute scales, so there is no
@@ -133,7 +133,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
 
         sil_cams, sil_masks, sil_valid = sil.load_silhouette_data(
             take_dir, calib, cam_ids, frame_keys, out_size=silhouette_out_size,
-            device=device,
+            device=device, mask_subdir=mask_subdir,
         )
         n_pairs = sum(int(v.sum()) for v in sil_valid.values())
         print(f"  silhouette: {len(sil_cams)}/{len(cam_ids)} cameras have cached masks "
@@ -245,6 +245,9 @@ def main():
     parser.add_argument("--silhouette-sigma-px", type=float, default=1.0,
                          help="Gaussian splat radius in OUTPUT-GRID pixels (scale down if you shrink "
                               "--silhouette-out-size -- see silhouette.render_silhouette's docstring).")
+    parser.add_argument("--mask-subdir", default="masks",
+                         help="Subdirectory under aligned/ containing per-camera mask images "
+                              "(default: masks). Use masks_sam3 for SAM3 masks.")
     args = parser.parse_args()
     sil_w, sil_h = (int(x) for x in args.silhouette_out_size.lower().split("x"))
     run_fit(
@@ -256,7 +259,7 @@ def main():
         silhouette_weight=args.silhouette_weight,
         calib_path=args.calib_path, silhouette_out_size=(sil_w, sil_h),
         silhouette_n_samples=args.silhouette_n_samples, silhouette_sigma_px=args.silhouette_sigma_px,
-        use_sam2=args.use_sam2,
+        use_sam2=args.use_sam2, mask_subdir=args.mask_subdir,
     )
 
 

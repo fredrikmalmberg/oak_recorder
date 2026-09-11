@@ -110,13 +110,9 @@ SAM2_SYSPATH = "/home/fmalmb/CODE/sam2"
 def _sam2_prompt_from_mask(mask_dir, frame_files, min_coverage=0.02):
     """Find a stable mid-take frame with an existing mask and return (frame_idx, click_xy).
 
-    Starts searching from 1/3 into the take (not frame 0) to avoid the walk-in
-    period at the start where the person may not yet be centered in frame — which
-    causes SAM2 to lock on to the wrong location and then drift. Falls back to
-    scanning from frame 0 if no frame from 1/3 onwards has sufficient coverage.
-
-    The click is the centroid of the mask (person position varies per camera).
-    Falls back to None if no qualifying frame is found.
+    Starts from 1/3 into the take to avoid the walk-in period. Falls back to
+    scanning from frame 0 if nothing found. Returns (frame_idx, None) if no
+    qualifying frame exists — caller should use a different prompt strategy.
     """
     start = len(frame_files) // 3
     for scan_start in (start, 0):
@@ -132,18 +128,95 @@ def _sam2_prompt_from_mask(mask_dir, frame_files, min_coverage=0.02):
             return i, np.array([[cx, cy]], dtype=np.float32)
         if scan_start == 0:
             break
-    return 0, None  # fallback: caller will use frame-center
+    return len(frame_files) // 3, None
+
+
+def _sam2_mp_clicks(cam_id, frame_key, lm_body, lm_left, lm_right, img_w, img_h):
+    """Build SAM2 positive clicks from per-camera 2D MediaPipe landmarks.
+
+    Body: nose, midpoints(nose→each ear), shoulders_mid, mid-torso, hips_mid.
+    Hands: palm center (midpoint of wrist and avg MCP knuckles) for each hand
+    that has a valid detection on this frame.
+
+    lm_body/lm_left/lm_right: dicts loaded from landmarks_body/left/right.json,
+    shaped {cam_id: {frame_key: {joint_str: [x_norm, y_norm, z]}}}.
+    Coordinates are normalized by image dims; output is in pixels.
+
+    Returns None if not enough landmarks found to form a reliable prompt.
+    COCO upper-body indices: 0=nose, 3=lear, 4=rear, 5=lshoulder, 6=rshoulder,
+    11=lhip, 12=rhip.  Hand indices: 0=wrist, 5/9/13/17=MCP knuckles.
+    """
+    def _px(lm_dict, cam, frame, idx):
+        entry = (lm_dict or {}).get(cam, {}).get(frame)
+        if not entry:
+            return None
+        pt = entry.get(str(idx))
+        if pt is None:
+            return None
+        return np.array([pt[0] * img_w, pt[1] * img_h], dtype=np.float32)
+
+    nose      = _px(lm_body, cam_id, frame_key, 0)
+    lear      = _px(lm_body, cam_id, frame_key, 3)
+    rear      = _px(lm_body, cam_id, frame_key, 4)
+    lshoulder = _px(lm_body, cam_id, frame_key, 5)
+    rshoulder = _px(lm_body, cam_id, frame_key, 6)
+    lhip      = _px(lm_body, cam_id, frame_key, 11)
+    rhip      = _px(lm_body, cam_id, frame_key, 12)
+
+    clicks = []
+
+    # Face: nose + cheek midpoints toward each ear
+    if nose is not None:
+        clicks.append(nose)
+    if nose is not None and lear is not None:
+        clicks.append((nose + lear) / 2)
+    if nose is not None and rear is not None:
+        clicks.append((nose + rear) / 2)
+
+    # Torso spine: shoulders → mid-torso → hips
+    if lshoulder is not None and rshoulder is not None:
+        shoulder_mid = (lshoulder + rshoulder) / 2
+        clicks.append(shoulder_mid)
+        if lhip is not None and rhip is not None:
+            hip_mid = (lhip + rhip) / 2
+            clicks.append((shoulder_mid + hip_mid) / 2)
+            clicks.append(hip_mid)
+
+    if len(clicks) < 2:
+        return None
+
+    # Hands: palm midpoint (between wrist and average of MCP knuckles)
+    for lm_hand in (lm_left, lm_right):
+        entry = (lm_hand or {}).get(cam_id, {}).get(frame_key)
+        if not entry:
+            continue
+        wrist_raw = entry.get("0")
+        if wrist_raw is None:
+            continue
+        mcps = [entry.get(str(i)) for i in (5, 9, 13, 17)]
+        mcps = [m for m in mcps if m is not None]
+        if not mcps:
+            continue
+        wrist_px = np.array([wrist_raw[0] * img_w, wrist_raw[1] * img_h], dtype=np.float32)
+        mcp_avg  = np.mean([[m[0] * img_w, m[1] * img_h] for m in mcps], axis=0).astype(np.float32)
+        clicks.append((wrist_px + mcp_avg) / 2)
+
+    return np.array(clicks, dtype=np.float32)
 
 
 def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda",
-                       prompt_masks_root=None):
+                       prompt_masks_root=None, body_recon_path=None, pose2d_dir="pose2d"):
     """Like extract_masks_for_take but uses SAM2 video predictor for higher-quality,
     temporally-consistent person masks.
 
-    For the initial click prompt, uses the centroid of the first existing MediaPipe
-    mask in aligned/masks/<cam_id>/ with >2% coverage — the person's position varies
-    across cameras, so a fixed center-click doesn't work. If no prior mask exists,
-    falls back to frame-center (adequate when the person is roughly centered).
+    Prompt strategy (in priority order):
+    1. MediaPipe 2D landmarks from pose2d_dir/landmarks_body/left/right.json:
+       nose, cheek midpoints, spine, hip, and hand-palm clicks for full-body
+       coverage including face and hands. Best quality; avoids shirt-only tracking.
+    2. prompt_masks_root: existing mask directory (e.g. pre-cached MediaPipe masks)
+       — uses the centroid of the first mask with >2% coverage starting from 1/3
+       through the take. Good fallback when body reconstruction is available.
+    3. Frame-center click: last resort when neither above is available.
 
     Propagates bidirectionally from the prompt frame to cover all frames.
 
@@ -157,6 +230,7 @@ def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"
 
     Requires SAM2 installed at SAM2_SYSPATH and checkpoint at SAM2_CKPT.
     """
+    import json as _json
     import sys
     if SAM2_SYSPATH not in sys.path:
         sys.path.insert(0, SAM2_SYSPATH)
@@ -169,6 +243,20 @@ def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"
     if cam_ids is None:
         cam_ids = hmv.discover_cameras(take_dir)
     cam_ids = [c for c in cam_ids if c in calib]
+
+    # Load per-camera 2D MediaPipe landmarks for prompt generation
+    pose2d_path = os.path.join(take_dir, "aligned", pose2d_dir)
+
+    def _load_lm(fname):
+        p = os.path.join(pose2d_path, fname)
+        if not os.path.exists(p):
+            return None
+        with open(p) as _f:
+            return _json.load(_f)
+
+    lm_body  = _load_lm("landmarks_body.json")
+    lm_left  = _load_lm("landmarks_left.json")
+    lm_right = _load_lm("landmarks_right.json")
 
     predictor = build_sam2_video_predictor(SAM2_CONFIG, ckpt_path=SAM2_CKPT, device=device)
 
@@ -193,13 +281,23 @@ def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"
             continue
         h, w = first_img.shape[:2]
 
+        # Determine prompt frame and clicks
         prompt_frame_idx, prompt_pt = _sam2_prompt_from_mask(
             os.path.join(prompt_masks_root, cam_id), frame_files
         )
-        if prompt_pt is None:
-            prompt_pt = np.array([[w / 2.0, h / 2.0]], dtype=np.float32)
-        print(f"  {cam_id}: prompt click at ({prompt_pt[0,0]:.0f},{prompt_pt[0,1]:.0f}) "
-              f"on frame {prompt_frame_idx} ({frame_files[prompt_frame_idx]})")
+        mp_clicks = _sam2_mp_clicks(cam_id, frame_files[prompt_frame_idx],
+                                    lm_body, lm_left, lm_right, w, h)
+        if mp_clicks is not None:
+            prompt_clicks = mp_clicks
+            print(f"  {cam_id}: MP clicks ({len(mp_clicks)} pts) on frame "
+                  f"{prompt_frame_idx} ({frame_files[prompt_frame_idx]})")
+        elif prompt_pt is not None:
+            prompt_clicks = prompt_pt
+            print(f"  {cam_id}: centroid click at ({prompt_pt[0,0]:.0f},{prompt_pt[0,1]:.0f}) "
+                  f"on frame {prompt_frame_idx} ({frame_files[prompt_frame_idx]})")
+        else:
+            prompt_clicks = np.array([[w / 2.0, h / 2.0]], dtype=np.float32)
+            print(f"  {cam_id}: fallback center click on frame {prompt_frame_idx}")
 
         cam_masks = {}
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -207,7 +305,8 @@ def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"
             try:
                 predictor.add_new_points_or_box(
                     inference_state, frame_idx=prompt_frame_idx, obj_id=1,
-                    points=prompt_pt, labels=np.array([1], dtype=np.int32),
+                    points=prompt_clicks,
+                    labels=np.ones(len(prompt_clicks), dtype=np.int32),
                 )
                 # Propagate forward from prompt frame
                 for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
