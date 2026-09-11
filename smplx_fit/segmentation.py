@@ -108,31 +108,35 @@ SAM2_SYSPATH = "/home/fmalmb/CODE/sam2"
 
 
 def _sam2_prompt_from_mask(mask_dir, frame_files, min_coverage=0.02):
-    """Find the first frame with an existing mask and return (frame_idx, click_xy).
+    """Find a stable mid-take frame with an existing mask and return (frame_idx, click_xy).
 
-    The click is the centroid of the mask — the person's position varies per camera
-    so a fixed center-frame click doesn't work. Using the existing MediaPipe mask
-    centroid as the SAM2 starting point is fine: SAM2 produces its own higher-quality,
-    temporally-consistent mask; MediaPipe only tells us *where* to click.
+    Starts searching from 1/3 into the take (not frame 0) to avoid the walk-in
+    period at the start where the person may not yet be centered in frame — which
+    causes SAM2 to lock on to the wrong location and then drift. Falls back to
+    scanning from frame 0 if no frame from 1/3 onwards has sufficient coverage.
 
-    Falls back to the midpoint of the first frame if no mask has sufficient coverage.
+    The click is the centroid of the mask (person position varies per camera).
+    Falls back to None if no qualifying frame is found.
     """
-    for i, ff in enumerate(frame_files):
-        mask_path = os.path.join(mask_dir, ff)
-        m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        if m is None:
-            continue
-        binary = m > 127
-        if binary.mean() < min_coverage:
-            continue
-        # Centroid of the mask
-        ys, xs = np.where(binary)
-        cx, cy = float(xs.mean()), float(ys.mean())
-        return i, np.array([[cx, cy]], dtype=np.float32)
+    start = len(frame_files) // 3
+    for scan_start in (start, 0):
+        for i in range(scan_start, len(frame_files)):
+            m = cv2.imread(os.path.join(mask_dir, frame_files[i]), cv2.IMREAD_GRAYSCALE)
+            if m is None:
+                continue
+            binary = m > 127
+            if binary.mean() < min_coverage:
+                continue
+            ys, xs = np.where(binary)
+            cx, cy = float(xs.mean()), float(ys.mean())
+            return i, np.array([[cx, cy]], dtype=np.float32)
+        if scan_start == 0:
+            break
     return 0, None  # fallback: caller will use frame-center
 
 
-def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"):
+def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda",
+                       prompt_masks_root=None):
     """Like extract_masks_for_take but uses SAM2 video predictor for higher-quality,
     temporally-consistent person masks.
 
@@ -142,6 +146,11 @@ def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"
     falls back to frame-center (adequate when the person is roughly centered).
 
     Propagates bidirectionally from the prompt frame to cover all frames.
+
+    prompt_masks_root: directory to read centroid prompts from (default: same as
+    output, i.e. take_dir/aligned/masks). Pass the path to pre-existing MediaPipe
+    masks when writing SAM2 outputs to a different take_dir (e.g. a local writable
+    copy whose frame dirs are symlinked to a read-only NFS mount).
 
     Writes to the same aligned/masks/<cam_id>/<frame_file> schema as
     extract_masks_for_take -- the rest of the pipeline reads from the same path.
@@ -155,6 +164,8 @@ def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"
     from sam2.build_sam import build_sam2_video_predictor
 
     out_root = os.path.join(take_dir, "aligned", "masks")
+    if prompt_masks_root is None:
+        prompt_masks_root = out_root
     if cam_ids is None:
         cam_ids = hmv.discover_cameras(take_dir)
     cam_ids = [c for c in cam_ids if c in calib]
@@ -182,7 +193,9 @@ def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"
             continue
         h, w = first_img.shape[:2]
 
-        prompt_frame_idx, prompt_pt = _sam2_prompt_from_mask(cam_out_dir, frame_files)
+        prompt_frame_idx, prompt_pt = _sam2_prompt_from_mask(
+            os.path.join(prompt_masks_root, cam_id), frame_files
+        )
         if prompt_pt is None:
             prompt_pt = np.array([[w / 2.0, h / 2.0]], dtype=np.float32)
         print(f"  {cam_id}: prompt click at ({prompt_pt[0,0]:.0f},{prompt_pt[0,1]:.0f}) "
