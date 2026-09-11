@@ -289,14 +289,12 @@ def multi_stage_optimize(
     required (raises) if use_silhouette or use_silhouette_shape is True and
     left unset.
 
-    use_silhouette_shape independently gates Stage 3b (default off, even
-    when use_silhouette is on) -- confirmed empirically this session that
-    Stage 3b's per-iteration cost scales with (frames x cameras) just like
-    Stage 3's, and its own inner loop (100 Adam iterations, see
-    _run_adam_stage) roughly QUADRUPLED total runtime on a 40-frame test
-    (293s -> 1031s), extrapolating to ~5.6 HOURS for a 786-frame take vs.
-    ~95 minutes without it -- expensive enough that it must be opted into
-    separately, not bundled silently into use_silhouette.
+    use_silhouette_shape gates Stage 6 (default off, even when
+    use_silhouette is on): a joint refinement of betas + body_pose +
+    global_orient + transl TOGETHER with silhouette + keypoints, running
+    after all 5 keypoint stages. Shape and pose co-adapt so neither hits a
+    local optimum from being fit in isolation (the EasyMoCap "refine_poses"
+    philosophy). hand_pose stays frozen. 200 Adam iterations at lr=0.001.
 
     silhouette_n_samples/silhouette_sigma_px default to 1500/1.0, NOT
     silhouette.py's own higher-fidelity single-frame-validation defaults
@@ -442,57 +440,7 @@ def multi_stage_optimize(
         stage3_loss, max_outer_iters, rel_tol,
     )
 
-    # ---- Stage 3b: Shape refinement via silhouette (opt-in, separately
-    # from Stage 3's use_silhouette) --------------------------------------
-    # Unfrozen: betas ONLY. Frozen: everything else (global_orient/transl/
-    # body_pose, just fit by stage 3). Gated on its OWN flag
-    # (use_silhouette_shape), not use_silhouette -- confirmed empirically
-    # this session that this stage's cost scales with (frames x cameras)
-    # the same way Stage 3's does, and its own 100-iteration inner loop
-    # roughly quadrupled total runtime on a 40-frame test (293s -> 1031s),
-    # extrapolating to ~5.6 HOURS for the full 786-frame take vs. ~95
-    # minutes without it -- too expensive to bundle silently into
-    # use_silhouette. This is deliberately NOT part of stage 1: silhouette
-    # needs a real camera-frame placement to compare against (see
-    # multi_stage_optimize's docstring), which doesn't exist until stage
-    # 2/3 have run against the rest-pose-only stage 1. shape3d + reg_shape
-    # are kept alongside silhouette here (not silhouette alone) so betas
-    # stays anchored to the keypoint-based bone-length estimate rather than
-    # drifting toward whatever shape best explains a handful of 2D
-    # silhouettes on its own -- a real ambiguity (a smaller person closer
-    # to camera vs. a bigger one farther away can look similar in outline)
-    # that shape3d's independent 3D-distance signal helps resolve, on top
-    # of betas being shared across every frame AND camera in the batch,
-    # which already constrains this a lot more than any single silhouette
-    # view could alone. Uses _run_adam_stage, not _run_lbfgs_stage --
-    # confirmed empirically this session that LBFGS's line search left
-    # betas completely frozen here (shape3d's 10000x-weighted, already-at-
-    # its-stage-1-minimum term created too steep a local bowl for any
-    # LBFGS trial step to survive the Wolfe condition against silhouette's
-    # much weaker gradient), while Adam's per-parameter adaptive step size
-    # handles the scale mismatch fine.
-    if use_silhouette_shape:
-        # Stage 3b: silhouette-only shape refinement.
-        # Stage 1 already fit betas to 3D keypoints; re-adding shape3d * 10000
-        # here dwarfs the silhouette signal (~10000:1 ratio) and prevents
-        # betas from moving. Use only silhouette + weak regularization so the
-        # boundary gradient can actually steer body shape.
-        def stage3b_shape_loss():
-            reg_shape = losses.l2_regularization(params.betas)
-            output = params.forward_batch(model)
-            sil_loss, n_pairs = sil.compute_silhouette_term(
-                output.vertices, model.faces, face_idx, bary,
-                silhouette_cams, silhouette_masks, silhouette_valid, sigma_px=silhouette_sigma_px,
-            )
-            total = reg_shape * 0.01 + sil_loss * silhouette_weight
-            return total, {
-                "reg_shape": float(reg_shape.item()),
-                "silhouette": float(sil_loss.item()), "silhouette_n_pairs": n_pairs,
-            }
-
-        log["stages"]["3b_shape_refine"], _ = _run_adam_stage(
-            "3b_shape_refine", [params.betas], stage3b_shape_loss, max_iters=100, rel_tol=rel_tol, lr=0.01,
-        )
+    # (stage 3b betas-only removed -- replaced by stage 6 joint refinement below)
 
     # ---- Stage 4: Hands + body ------------------------------------------
     # Unfrozen: body_pose, lhand_pose, rhand_pose. Frozen: betas,
@@ -547,5 +495,64 @@ def multi_stage_optimize(
     log["stages"]["5_hands_only"], _ = _run_lbfgs_stage(
         "5_hands_only", [params.lhand_pose, params.rhand_pose], stage5_loss, max_outer_iters, rel_tol,
     )
+
+    # ---- Stage 6: Joint shape + pose refinement via silhouette (opt-in) --
+    # Unfrozen: betas + body_pose + global_orient + transl. hand_pose stays
+    # frozen (stages 4/5 just converged it; reopening hands for marginal
+    # silhouette benefit on body parts isn't worth undoing that work).
+    #
+    # Runs AFTER all keypoint stages so the pose is already well-initialised.
+    # Jointly optimising shape AND pose lets them co-adapt: the optimal betas
+    # depend on the current body_pose (and vice versa), so the earlier
+    # betas-only approach hit a local optimum. This is the EasyMoCap
+    # "refine_poses" philosophy: a final joint pass over everything that
+    # matters for the silhouette.
+    #
+    # Loss:
+    #   k3d          -- anchors body_pose/global_orient/transl to 3D keypoints
+    #                   so pose can't drift just to satisfy silhouette
+    #   silhouette   -- the new signal; pushes shape+pose toward mask boundary
+    #   reg_shape    -- keeps betas near plausible human range (shared across
+    #                   all frames AND cameras, so silhouette has strong shape
+    #                   constraints already -- reg is a soft backstop, not
+    #                   a dominant term)
+    #   reg_pose     -- body prior keeps legs/spine from wandering
+    #   smooth_*     -- temporal consistency on global motion
+    #
+    # Uses Adam (not LBFGS): silhouette gradient magnitude << k3d gradient
+    # magnitude, so LBFGS's single global step size would be dominated by k3d
+    # and effectively freeze betas. lr=0.001 (lower than the earlier 3b's
+    # 0.01) to avoid destabilising the converged body_pose from stage 4.
+    if use_silhouette_shape:
+        def stage6_loss():
+            output = params.forward_batch(model)
+            pred = smplx_model.predict_all_points(output, full_layout)
+            k3d, _ = losses.weighted_keypoint_loss(pred, target_points, confidence, mask=body_mask)
+            smooth_transl = losses.temporal_smoothness_loss(params.transl)
+            smooth_go = losses.temporal_smoothness_loss(params.global_orient)
+            reg_shape = losses.l2_regularization(params.betas)
+            reg_pose = body_pose_prior_loss(params.body_pose)
+            sil_loss, n_pairs = sil.compute_silhouette_term(
+                output.vertices, model.faces, face_idx, bary,
+                silhouette_cams, silhouette_masks, silhouette_valid, sigma_px=silhouette_sigma_px,
+            )
+            total = (k3d * 1.0 + smooth_transl * 0.5 + smooth_go * 0.1
+                     + reg_shape * 0.1 + reg_pose * pose_prior_weight
+                     + sil_loss * silhouette_weight)
+            return total, {
+                "k3d": float(k3d.item()),
+                "smooth_transl": float(smooth_transl.item()),
+                "smooth_global_orient": float(smooth_go.item()),
+                "reg_shape": float(reg_shape.item()),
+                "reg_pose": float(reg_pose.item()),
+                "silhouette": float(sil_loss.item()),
+                "silhouette_n_pairs": n_pairs,
+            }
+
+        log["stages"]["6_joint_sil_refine"], _ = _run_adam_stage(
+            "6_joint_sil_refine",
+            [params.betas, params.body_pose, params.global_orient, params.transl],
+            stage6_loss, max_iters=200, rel_tol=rel_tol, lr=0.001,
+        )
 
     return params, log

@@ -223,11 +223,10 @@ def main():
                               "using cached Phase 2 masks (see smplx_fit.segmentation). Off by default "
                               "-- this is the least-verified piece of the pipeline so far. Requires --calib.")
     parser.add_argument("--use-silhouette-shape", action="store_true",
-                         help="Also add a silhouette-overlap term to a new Stage 3b, refining betas "
-                              "(shape) specifically. Off by default even when --use-silhouette is on -- "
-                              "confirmed this stage's own cost scales with (frames x cameras) same as "
-                              "Stage 3's, and roughly QUADRUPLED total runtime on a 40-frame test (293s -> "
-                              "1031s); extrapolates to ~5.6 hours on a 786-frame take. Requires --calib.")
+                         help="Add Stage 6: joint refinement of betas + body_pose + global_orient + "
+                              "transl via silhouette + keypoints after all 5 keypoint stages. Shape and "
+                              "pose co-adapt (EasyMoCap 'refine_poses' philosophy). Off by default. "
+                              "Requires --calib.")
     parser.add_argument("--calib", dest="calib_path", default=None,
                          help="Calibration output JSON (calibrate.load_calibration_output's schema). "
                               "Required when --use-silhouette or --use-silhouette-shape is passed.")
