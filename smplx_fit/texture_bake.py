@@ -506,6 +506,61 @@ def register_with_optical_flow(cam_colors, cam_qualities, model_name="raft_large
 # Seam smoothing
 # ---------------------------------------------------------------------------
 
+SMPLX_SEG_JSON = "/home/fmalmb/CODE/sequence_rendering/smplx_models/smplx/smplx_vert_segmentation.json"
+
+# Body part groups available via --protect-region
+REGION_GROUPS = {
+    "head": ["head", "eyeballs", "leftEye", "rightEye"],
+    "neck": ["neck"],
+}
+
+
+def build_region_uv_mask(glctx, rast_out, smplx_faces, region_names, tex_H, tex_W,
+                          seg_json=SMPLX_SEG_JSON):
+    """Binary UV-space mask for the given SMPL-X body part region names.
+
+    Maps UV vertices back to 3D vertices via smplx_faces, looks up each vertex
+    in the segmentation JSON, then interpolates a per-UV-vertex 0/1 attribute
+    into UV space with dr.interpolate.
+
+    Args:
+        glctx:         nvdiffrast context
+        rast_out:      (1, H, W, 4) UV canvas rasterization output
+        smplx_faces:   (F, 3) SMPL-X face connectivity (3D vertex indices, int32)
+        region_names:  list of segmentation part names to mark as protected
+        tex_H, tex_W:  texture resolution (must match rast_out)
+        seg_json:      path to smplx_vert_segmentation.json
+
+    Returns:
+        (H, W) bool CPU tensor — True inside the protected region
+    """
+    import json
+    import nvdiffrast.torch as dr
+
+    with open(seg_json) as f:
+        seg = json.load(f)
+
+    protected_verts = set()
+    for name in region_names:
+        if name in seg:
+            protected_verts.update(seg[name])
+        else:
+            print(f"  Warning: region '{name}' not in segmentation JSON — skipped")
+
+    # UV vertex i*3+j corresponds to 3D vertex smplx_faces[i, j]
+    n_faces = len(smplx_faces)
+    attr = np.zeros(n_faces * 3, dtype=np.float32)
+    faces_flat = smplx_faces.reshape(-1)  # (F*3,)
+    for idx, v3d in enumerate(faces_flat):
+        if int(v3d) in protected_verts:
+            attr[idx] = 1.0
+
+    attr_t  = torch.as_tensor(attr, dtype=torch.float32, device="cuda").reshape(-1, 1)
+    ft_uv   = torch.arange(n_faces * 3, dtype=torch.int32, device="cuda").reshape(-1, 3)
+    interp, _ = dr.interpolate(attr_t[None], rast_out, ft_uv)   # (1, H, W, 1)
+    return (interp[0, :, :, 0] > 0.5).cpu()                     # (H, W) bool
+
+
 def smooth_seams(color_bgr, source_map_np, blur_radius=3):
     """Gaussian-blur only the pixels where the winning camera changes.
 
@@ -570,6 +625,8 @@ def bake_texture(
     min_iou=0.5,
     front_cam=None,
     front_cam_bias=2.0,
+    base_texture=None,
+    protect_region=None,
 ):
     """Bake a texture from multi-camera footage onto the SMPL-X UV layout.
 
@@ -683,6 +740,29 @@ def bake_texture(
     else:
         color_sum   = torch.zeros(3, tex_H, tex_W, device="cuda")
         weight_sum  = torch.zeros(1, tex_H, tex_W, device="cuda")
+
+    # Base texture + region protection — initialise from an existing texture and
+    # lock specified body-part regions so they are never overwritten.
+    if base_texture is not None and winner_take_all:
+        base_bgr = cv2.imread(base_texture)
+        if base_bgr is None:
+            raise FileNotFoundError(f"--base-texture not found: {base_texture}")
+        base_rgb = base_bgr[:, :, ::-1].astype(np.float32) / 255.0
+        if base_rgb.shape[:2] != (tex_H, tex_W):
+            base_rgb = cv2.resize(base_rgb, (tex_W, tex_H), interpolation=cv2.INTER_LINEAR)
+        color_map[:] = torch.as_tensor(base_rgb, dtype=torch.float32,
+                                        device="cuda").permute(2, 0, 1)
+        print(f"Initialised color_map from base texture: {base_texture}")
+
+        if protect_region:
+            parts = REGION_GROUPS.get(protect_region, [protect_region])
+            print(f"Building '{protect_region}' UV mask ({', '.join(parts)})...")
+            head_mask = build_region_uv_mask(glctx, rast_out, faces, parts, tex_H, tex_W)
+            # +inf quality at protected texels → winner-take-all can never beat it
+            quality_map[0][head_mask.cuda()] = float("inf")
+            source_map[head_mask.cuda()] = -2   # sentinel: protected
+            n_protected = head_mask.sum().item()
+            print(f"  Protected {n_protected} texels ({n_protected/valid_mask.sum().item()*100:.1f}% of UV coverage)")
 
     aligned_dir = os.path.join(take_dir, "aligned")
 
@@ -938,6 +1018,14 @@ def main():
     parser.add_argument("--front-cam-bias", type=float, default=2.0,
                         help="Multiplicative bias applied to the front camera's quality "
                              "scores (default 2.0)")
+    # Region protection
+    parser.add_argument("--base-texture", default=None,
+                        help="Existing texture PNG to initialise the UV canvas from; "
+                             "use with --protect-region to keep specific areas unchanged")
+    parser.add_argument("--protect-region", default=None,
+                        choices=list(REGION_GROUPS.keys()),
+                        help="Body region to protect from overwriting (requires --base-texture). "
+                             f"Available: {', '.join(REGION_GROUPS.keys())}")
     args = parser.parse_args()
 
     cam_ids = [c.strip() for c in args.cam.split(",")] if args.cam else None
@@ -976,6 +1064,8 @@ def main():
         min_iou=args.min_iou,
         front_cam=args.front_cam,
         front_cam_bias=args.front_cam_bias,
+        base_texture=args.base_texture,
+        protect_region=args.protect_region,
     )
 
 
