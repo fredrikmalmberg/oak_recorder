@@ -403,16 +403,14 @@ def multi_stage_optimize(
     )
     log["up_axis_check"] = _check_up_axis(params, model)
 
-    # ---- Stage 3: Body pose --------------------------------------------
-    # Unfrozen: + body_pose. Frozen: betas, hand_pose. Same base loss set
-    # as stage 2 -- reg_pose is doing real work here (including holding
-    # legs at neutral, since no leg keypoints ever contribute to k3d) --
-    # PLUS, when use_silhouette is on, a silhouette overlap term that gives
-    # legs (and the rest of body_pose) a REAL non-prior signal to fit
-    # against for the first time (see multi_stage_optimize's docstring for
-    # why this is the first stage silhouette can apply to, not stage 1).
-    # Needs its own forward_batch call (not stage2_loss's) since it also
-    # needs `output.vertices`, which stage2_loss's k3d-only path discards.
+    # ---- Stage 3: Body pose + shape (joint) --------------------------------
+    # Unfrozen: body_pose, global_orient, transl, AND betas. betas is (1,
+    # num_betas) shared across all frames, so it stays a single consistent
+    # shape for the whole sequence. reg_shape keeps betas near plausible
+    # human range; silhouette (when on) gives shape a real non-keypoint
+    # signal for the first time. Jointly fitting shape here lets pose and
+    # shape co-adapt -- the stage-1 betas-only estimate is a good init, but
+    # with only k3d and no silhouette it can't see the body outline.
     def stage3_loss():
         output = params.forward_batch(model)
         pred = smplx_model.predict_all_points(output, full_layout)
@@ -420,10 +418,13 @@ def multi_stage_optimize(
         smooth_transl = losses.temporal_smoothness_loss(params.transl)
         smooth_go = losses.temporal_smoothness_loss(params.global_orient)
         reg_pose = body_pose_prior_loss(params.body_pose)
-        total = k3d * 1.0 + smooth_transl * 0.5 + smooth_go * 0.1 + reg_pose * pose_prior_weight
+        reg_shape = losses.l2_regularization(params.betas)
+        total = (k3d * 1.0 + smooth_transl * 0.5 + smooth_go * 0.1
+                 + reg_pose * pose_prior_weight + reg_shape * 0.1)
         breakdown = {
             "k3d": float(k3d.item()), "smooth_transl": float(smooth_transl.item()),
             "smooth_global_orient": float(smooth_go.item()), "reg_pose": float(reg_pose.item()),
+            "reg_shape": float(reg_shape.item()),
         }
         if use_silhouette:
             sil_loss, n_pairs = sil.compute_silhouette_term(
@@ -436,7 +437,7 @@ def multi_stage_optimize(
         return total, breakdown
 
     log["stages"]["3_body_pose"], _ = _run_lbfgs_stage(
-        "3_body_pose", [params.global_orient, params.transl, params.body_pose],
+        "3_body_pose", [params.global_orient, params.transl, params.body_pose, params.betas],
         stage3_loss, max_outer_iters, rel_tol,
     )
 

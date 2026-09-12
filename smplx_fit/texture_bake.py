@@ -25,12 +25,46 @@ DISTORTION CONSISTENCY — READ THIS BEFORE TOUCHING ANY PIXEL-SPACE CODE:
   c["K"] + c["dist"] via hand_multiview.build_undistort_maps.
   silhouette.py does this correctly — see load_frame_masks_for_cameras().
 
-Usage:
-    python -m smplx_fit.texture_bake \\
-        --smplx-npz /tmp/smplx_full/aligned/pose2d_sil/smplx/smplx_params.npz \\
-        --calib output/calibration/20260908_174749_7cam.json \\
-        --take-dir /tmp/smplx_full \\
-        --hero-frames --winner-take-all --optical-flow
+CAMERA SETUP FOR THIS TAKE (20260908_174819/take_1):
+  7 cameras total (cam0–cam6), but only cam0 (front-centre), cam2 (left),
+  and cam3 (right) are used for body baking — they give the best front/side
+  coverage without the extreme oblique angles of the outer cameras.
+  Always pass --cam cam0,cam2,cam3 for this take.
+
+  For the face, use only cam0 (1 frame) because multi-camera blending at the
+  face introduces colour fringing from SMPL-X's imperfect face geometry.
+  The face frame is baked first; subsequent body/arms passes use
+  --protect-region head + --base-texture to leave the face untouched.
+
+3-PASS BAKE RECIPE (produces texture_male_body.png):
+  # Pass 1 — face only from cam0 (1 still frame, no hero filtering needed)
+  python -m smplx_fit.texture_bake \\
+      --smplx-npz .../smplx_params.npz --calib .../calib.json \\
+      --take-dir /tmp/smplx_full --cam cam0 \\
+      --hero-frames --per-camera-hero --n-arms-down 1 --n-arms-wide 0 \\
+      --front-cam cam0 --front-cam-bias 1.0 \\
+      --output .../texture_male_face.png
+
+  # Pass 2 — full body from 3 cams, head region protected
+  python -m smplx_fit.texture_bake \\
+      --smplx-npz .../smplx_params.npz --calib .../calib.json \\
+      --take-dir /tmp/smplx_full --cam cam0,cam2,cam3 \\
+      --hero-frames --per-camera-hero --n-arms-down 2 --n-arms-wide 2 \\
+      --front-cam cam0 --front-cam-bias 2.0 \\
+      --base-texture .../texture_male_face.png --protect-region head \\
+      --output .../texture_male_body.png
+
+  # Pass 3 (optional) — arms-wide update, head still protected
+  python -m smplx_fit.texture_bake \\
+      --smplx-npz .../smplx_params.npz --calib .../calib.json \\
+      --take-dir /tmp/smplx_full --cam cam0,cam2,cam3 \\
+      --hero-frames --per-camera-hero --n-arms-down 0 --n-arms-wide 4 \\
+      --front-cam cam0 --front-cam-bias 2.0 \\
+      --base-texture .../texture_male_body.png --protect-region head \\
+      --output .../texture_male_final.png
+
+  texture_male_body.png (after pass 2) is usually the cleanest result.
+  Pass 3 can introduce seam artefacts on the arms.
 """
 import argparse
 import os
@@ -677,8 +711,9 @@ def bake_texture(
     per_cam_frames = None  # None means "all cameras use all selected frames"
 
     if per_camera_hero:
+        hero_calib = {k: calib[k] for k in cam_ids} if cam_ids is not None else calib
         per_cam_frames = select_hero_frames_per_camera(
-            data, model_path, calib, take_dir,
+            data, model_path, hero_calib, take_dir,
             n_arms_down=n_arms_down, n_arms_wide=n_arms_wide,
             velocity_threshold=velocity_threshold,
             frame_pool=frame_pool_range,
