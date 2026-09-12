@@ -84,7 +84,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
             use_silhouette=False, silhouette_weight=2.0, calib_path=None,
             silhouette_out_size=(256, 144), silhouette_n_samples=1500,
             silhouette_sigma_px=1.0, use_silhouette_shape=False,
-            use_sam2=False, mask_subdir="masks"):
+            use_sam3=False, use_rvm=False, mask_subdir="masks_sam3"):
     if pose_prior_weight is None:
         # See pose_prior.DEFAULT_POSE_PRIOR_WEIGHTS's comment -- "l2" and
         # "gmm" live on very different absolute scales, so there is no
@@ -127,9 +127,13 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         calib = calibrate.load_calibration_output(calib_path)
         cam_ids = [c for c in hmv.discover_cameras(take_dir) if c in calib]
 
-        if use_sam2:
-            print("Generating SAM2 masks (will skip cameras that already have masks)...")
-            seg.extract_masks_sam2(take_dir, calib, cam_ids=cam_ids, force=False)
+        if use_sam3:
+            print(f"Generating SAM3 masks into {mask_subdir}/ (will skip cameras that already have masks)...")
+            seg.extract_masks_sam3(take_dir, calib, cam_ids=cam_ids, force=False, mask_subdir=mask_subdir)
+        if use_rvm:
+            print(f"Generating RVM masks into {mask_subdir}/ (will skip cameras that already have masks)...")
+            seg.extract_masks_rvm(take_dir, calib, cam_ids=cam_ids, force=False,
+                                   mask_subdir=mask_subdir, pose2d_dir=pose2d_dir)
 
         sil_cams, sil_masks, sil_valid = sil.load_silhouette_data(
             take_dir, calib, cam_ids, frame_keys, out_size=silhouette_out_size,
@@ -230,23 +234,23 @@ def main():
     parser.add_argument("--calib", dest="calib_path", default=None,
                          help="Calibration output JSON (calibrate.load_calibration_output's schema). "
                               "Required when --use-silhouette or --use-silhouette-shape is passed.")
-    parser.add_argument("--use-sam2", action="store_true",
-                         help="Before silhouette fitting, generate/update masks using SAM2 video predictor "
-                              "instead of relying on pre-cached MediaPipe masks. Only runs on cameras that "
-                              "don't already have masks (unless --force is also passed). "
-                              "Implies --use-silhouette or --use-silhouette-shape.")
+    parser.add_argument("--use-sam3", action="store_true",
+                         help="Before silhouette fitting, generate SAM3 masks (text prompt 'person', "
+                              "no clicking needed). Only runs on cameras that don't already have masks "
+                              "unless --force is also passed.")
+    parser.add_argument("--use-rvm", action="store_true",
+                         help="Before silhouette fitting, generate RVM masks using keypoint-guided "
+                              "ROI crops (requires triangulated 3D keypoints in pose2d_dir). "
+                              "Much faster than SAM3 (~10s/cam vs ~7min/cam on 4090). "
+                              "Only runs on cameras that don't already have masks unless --force is passed.")
     parser.add_argument("--silhouette-weight", type=float, default=0.1)
     parser.add_argument("--silhouette-out-size", default="32x18",
-                         help="WxH of the downsampled render used for the silhouette comparison (default: "
-                              "32x18 -- kept small since this cost is paid on every LBFGS closure call; "
-                              "see optimize.multi_stage_optimize's docstring for the speed/fidelity tradeoff).")
+                         help="WxH of the downsampled render used for the silhouette comparison.")
     parser.add_argument("--silhouette-n-samples", type=int, default=1500)
-    parser.add_argument("--silhouette-sigma-px", type=float, default=1.0,
-                         help="Gaussian splat radius in OUTPUT-GRID pixels (scale down if you shrink "
-                              "--silhouette-out-size -- see silhouette.render_silhouette's docstring).")
-    parser.add_argument("--mask-subdir", default="masks",
+    parser.add_argument("--silhouette-sigma-px", type=float, default=1.0)
+    parser.add_argument("--mask-subdir", default="masks_sam3",
                          help="Subdirectory under aligned/ containing per-camera mask images "
-                              "(default: masks). Use masks_sam3 for SAM3 masks.")
+                              "(default: masks_sam3).")
     args = parser.parse_args()
     sil_w, sil_h = (int(x) for x in args.silhouette_out_size.lower().split("x"))
     run_fit(
@@ -258,7 +262,7 @@ def main():
         silhouette_weight=args.silhouette_weight,
         calib_path=args.calib_path, silhouette_out_size=(sil_w, sil_h),
         silhouette_n_samples=args.silhouette_n_samples, silhouette_sigma_px=args.silhouette_sigma_px,
-        use_sam2=args.use_sam2, mask_subdir=args.mask_subdir,
+        use_sam3=args.use_sam3, use_rvm=args.use_rvm, mask_subdir=args.mask_subdir,
     )
 
 

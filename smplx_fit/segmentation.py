@@ -1,264 +1,69 @@
-"""Person segmentation masks for one take's already-aligned camera frames --
-Phase 2 of the EasyMoCap-inspired plan (see the approved plan / conversation
-history), a standalone prerequisite for Phase 3's silhouette-based fitting
-refinement. Deliberately decoupled from fitting itself, mirroring this
-project's established extraction-is-separate-from-fitting convention
-(pose2d/extraction.py vs pose2d/triangulation.py): mask quality can be
-inspected and trusted on its own before anything downstream ever depends on
-it.
+"""Person segmentation masks for one take's already-aligned camera frames.
+Phase 2 of the pipeline: a standalone prerequisite for Phase 3's
+silhouette-based fitting refinement. Deliberately decoupled from fitting
+itself (extraction-is-separate-from-fitting convention).
 
-Uses mediapipe.solutions.selfie_segmentation.SelfieSegmentation -- a real,
-dedicated person-segmentation model already available via the mediapipe
-dependency this project uses throughout (no new dependency), per the
-explicit "use a segmentation model, not background subtraction" decision
-(background subtraction would be fragile across this project's varying
-per-take backgrounds/lighting).
+Two backends:
+  SAM3  — text prompt "person" on frame 0, propagated via video predictor.
+           No clicking, no MediaPipe needed. Slow (~7 min/cam) but requires
+           no prior 3D reconstruction. Use for first-pass mask generation.
+  RVM   — Robust Video Matting with keypoint-guided ROI crop. Fast (<10s/cam
+           on 4090 fp16). Requires triangulated 3D keypoints in pose2d_dir.
 
 Usage:
     python -m smplx_fit.segmentation <take_dir> --calib PATH [--force]
+        [--mask-subdir masks_sam3|masks_rvm] [--backend sam3|rvm] [--grid-video]
 
-Writes <take_dir>/aligned/masks/<cam_id>/<frame_file> (soft probability
-mask, 0-255 grayscale PNG, same filename as the source frame) -- following
-the same per-camera/per-frame file layout convention as aligned/<cam_id>/
-frames themselves.
+Writes <take_dir>/aligned/<mask_subdir>/<cam_id>/<frame_file>
+(grayscale JPEG 0–255, same filename as the source frame).
 """
 import argparse
+import json
 import os
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
 from hand_pose import hand_multiview as hmv
 
-# SelfieSegmentation's own two models: 0 ("general", works at any distance)
-# vs 1 ("landscape", optimized for a person filling most of the frame, faster).
-# This rig's frames are close-range upper-body/hands (sign-language content),
-# closer to "landscape" model's intended use case than a generic full-scene
-# selfie -- confirmed reasonable via the plausible-coverage-fraction check
-# this module's own verification step performs, not assumed blindly.
-MODEL_SELECTION = 1
+SAM3_SYSPATH = "/home/fmalmb/CODE/sam3"
+# Must use "sam3" not "sam3.1":
+# sam3.1 uses Sam3MultiplexTrackingWithInteractivity whose init_state lacks
+# offload_state_to_cpu AND whose add_prompt triggers sam3/perflib/fa3.py which
+# requires flash_attn_interface (FlashAttention 3) — not installed in oak_env.
+# sam3 uses Sam3VideoInferenceWithInstanceInteractivity which has neither issue
+# and runs fine with standard SDPA. Do not change this to sam3.1 without
+# first installing flash_attn_interface in oak_env.
+SAM3_VERSION = "sam3"
+SAM3_TEXT_PROMPT = "person"
+
+RVM_SYSPATH = "/home/fmalmb/CODE/rvm"
+RVM_CHECKPOINT_MOBILENET = "/home/fmalmb/CODE/rvm/checkpoints/rvm_mobilenetv3.pth"
+RVM_CHECKPOINT_RESNET50  = "/home/fmalmb/CODE/rvm/checkpoints/rvm_resnet50.pth"
 
 
-def extract_masks_for_take(take_dir, calib, cam_ids=None, force=False):
-    """Runs SelfieSegmentation over each camera's already-undistorted
-    aligned/<cam_id>/*.jpg frames -- the SAME undistorted images pose2d.
-    extraction already uses, for consistency with how keypoints were
-    triangulated (a mask computed on a differently-distorted image would
-    misalign with the keypoint-based camera projections used elsewhere in
-    this pipeline, e.g. hand_pose.hand_multiview.build_projection_matrix in
-    Phase 3).
+def extract_masks_sam3(take_dir, calib, cam_ids=None, force=False, mask_subdir="masks_sam3"):
+    """Run SAM3 video predictor over each camera's aligned frames.
 
-    Returns dict {cam_id: {frame_file: mask_path}} of what was written (or
-    already cached).
+    Prompts with text "person" on frame 0, propagates through all frames.
+    Per-camera: loads the model once, processes each camera sequentially.
+
+    Returns dict {cam_id: {frame_file: mask_path}} of what was written.
     """
-    out_root = os.path.join(take_dir, "aligned", "masks")
-    if cam_ids is None:
-        cam_ids = hmv.discover_cameras(take_dir)
-    cam_ids = [c for c in cam_ids if c in calib]
-
-    written = {cid: {} for cid in cam_ids}
-    for cam_id in cam_ids:
-        frame_files = hmv.discover_frames(take_dir, cam_id)
-        if not frame_files:
-            continue
-        cam_out_dir = os.path.join(out_root, cam_id)
-        os.makedirs(cam_out_dir, exist_ok=True)
-
-        c = calib[cam_id]
-        w, h = hmv.get_image_size(take_dir, cam_id, frame_files[0])
-        map1, map2 = hmv.build_undistort_maps(c["K"], c["dist"], w, h)
-
-        n_to_process = [
-            ff for ff in frame_files
-            if force or not os.path.exists(os.path.join(cam_out_dir, ff))
-        ]
-        if not n_to_process:
-            for ff in frame_files:
-                written[cam_id][ff] = os.path.join(cam_out_dir, ff)
-            print(f"  {cam_id}: {len(frame_files)} masks already cached, skipping.")
-            continue
-
-        segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=MODEL_SELECTION)
-        try:
-            for frame_file in n_to_process:
-                frame_path = os.path.join(take_dir, "aligned", cam_id, frame_file)
-                img_bgr = cv2.imread(frame_path)
-                if img_bgr is None:
-                    continue
-                img_bgr = hmv.undistort_fast(img_bgr, map1, map2)
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-                result = segmenter.process(img_rgb)
-                mask_u8 = np.clip(result.segmentation_mask * 255.0, 0, 255).astype(np.uint8)
-
-                mask_path = os.path.join(cam_out_dir, frame_file)
-                cv2.imwrite(mask_path, mask_u8)
-                written[cam_id][frame_file] = mask_path
-        finally:
-            segmenter.close()
-        print(f"  {cam_id}: {len(n_to_process)} masks written to {cam_out_dir}")
-
-    return written
-
-
-SAM2_CKPT = "/home/fmalmb/CODE/sam2/checkpoints/sam2.1_hiera_large.pt"
-SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l"
-SAM2_SYSPATH = "/home/fmalmb/CODE/sam2"
-
-
-def _sam2_prompt_from_mask(mask_dir, frame_files, min_coverage=0.02):
-    """Find a stable mid-take frame with an existing mask and return (frame_idx, click_xy).
-
-    Starts from 1/3 into the take to avoid the walk-in period. Falls back to
-    scanning from frame 0 if nothing found. Returns (frame_idx, None) if no
-    qualifying frame exists — caller should use a different prompt strategy.
-    """
-    start = len(frame_files) // 3
-    for scan_start in (start, 0):
-        for i in range(scan_start, len(frame_files)):
-            m = cv2.imread(os.path.join(mask_dir, frame_files[i]), cv2.IMREAD_GRAYSCALE)
-            if m is None:
-                continue
-            binary = m > 127
-            if binary.mean() < min_coverage:
-                continue
-            ys, xs = np.where(binary)
-            cx, cy = float(xs.mean()), float(ys.mean())
-            return i, np.array([[cx, cy]], dtype=np.float32)
-        if scan_start == 0:
-            break
-    return len(frame_files) // 3, None
-
-
-def _sam2_mp_clicks(cam_id, frame_key, lm_body, lm_left, lm_right, img_w, img_h):
-    """Build SAM2 positive clicks from per-camera 2D MediaPipe landmarks.
-
-    Body: nose, midpoints(nose→each ear), shoulders_mid, mid-torso, hips_mid.
-    Hands: palm center (midpoint of wrist and avg MCP knuckles) for each hand
-    that has a valid detection on this frame.
-
-    lm_body/lm_left/lm_right: dicts loaded from landmarks_body/left/right.json,
-    shaped {cam_id: {frame_key: {joint_str: [x_norm, y_norm, z]}}}.
-    Coordinates are normalized by image dims; output is in pixels.
-
-    Returns None if not enough landmarks found to form a reliable prompt.
-    COCO upper-body indices: 0=nose, 3=lear, 4=rear, 5=lshoulder, 6=rshoulder,
-    11=lhip, 12=rhip.  Hand indices: 0=wrist, 5/9/13/17=MCP knuckles.
-    """
-    def _px(lm_dict, cam, frame, idx):
-        entry = (lm_dict or {}).get(cam, {}).get(frame)
-        if not entry:
-            return None
-        pt = entry.get(str(idx))
-        if pt is None:
-            return None
-        return np.array([pt[0] * img_w, pt[1] * img_h], dtype=np.float32)
-
-    nose      = _px(lm_body, cam_id, frame_key, 0)
-    lear      = _px(lm_body, cam_id, frame_key, 3)
-    rear      = _px(lm_body, cam_id, frame_key, 4)
-    lshoulder = _px(lm_body, cam_id, frame_key, 5)
-    rshoulder = _px(lm_body, cam_id, frame_key, 6)
-    lhip      = _px(lm_body, cam_id, frame_key, 11)
-    rhip      = _px(lm_body, cam_id, frame_key, 12)
-
-    clicks = []
-
-    # Face: nose + cheek midpoints toward each ear
-    if nose is not None:
-        clicks.append(nose)
-    if nose is not None and lear is not None:
-        clicks.append((nose + lear) / 2)
-    if nose is not None and rear is not None:
-        clicks.append((nose + rear) / 2)
-
-    # Torso spine: shoulders → mid-torso → hips
-    if lshoulder is not None and rshoulder is not None:
-        shoulder_mid = (lshoulder + rshoulder) / 2
-        clicks.append(shoulder_mid)
-        if lhip is not None and rhip is not None:
-            hip_mid = (lhip + rhip) / 2
-            clicks.append((shoulder_mid + hip_mid) / 2)
-            clicks.append(hip_mid)
-
-    if len(clicks) < 2:
-        return None
-
-    # Hands: palm midpoint (between wrist and average of MCP knuckles)
-    for lm_hand in (lm_left, lm_right):
-        entry = (lm_hand or {}).get(cam_id, {}).get(frame_key)
-        if not entry:
-            continue
-        wrist_raw = entry.get("0")
-        if wrist_raw is None:
-            continue
-        mcps = [entry.get(str(i)) for i in (5, 9, 13, 17)]
-        mcps = [m for m in mcps if m is not None]
-        if not mcps:
-            continue
-        wrist_px = np.array([wrist_raw[0] * img_w, wrist_raw[1] * img_h], dtype=np.float32)
-        mcp_avg  = np.mean([[m[0] * img_w, m[1] * img_h] for m in mcps], axis=0).astype(np.float32)
-        clicks.append((wrist_px + mcp_avg) / 2)
-
-    return np.array(clicks, dtype=np.float32)
-
-
-def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda",
-                       prompt_masks_root=None, body_recon_path=None, pose2d_dir="pose2d"):
-    """Like extract_masks_for_take but uses SAM2 video predictor for higher-quality,
-    temporally-consistent person masks.
-
-    Prompt strategy (in priority order):
-    1. MediaPipe 2D landmarks from pose2d_dir/landmarks_body/left/right.json:
-       nose, cheek midpoints, spine, hip, and hand-palm clicks for full-body
-       coverage including face and hands. Best quality; avoids shirt-only tracking.
-    2. prompt_masks_root: existing mask directory (e.g. pre-cached MediaPipe masks)
-       — uses the centroid of the first mask with >2% coverage starting from 1/3
-       through the take. Good fallback when body reconstruction is available.
-    3. Frame-center click: last resort when neither above is available.
-
-    Propagates bidirectionally from the prompt frame to cover all frames.
-
-    prompt_masks_root: directory to read centroid prompts from (default: same as
-    output, i.e. take_dir/aligned/masks). Pass the path to pre-existing MediaPipe
-    masks when writing SAM2 outputs to a different take_dir (e.g. a local writable
-    copy whose frame dirs are symlinked to a read-only NFS mount).
-
-    Writes to the same aligned/masks/<cam_id>/<frame_file> schema as
-    extract_masks_for_take -- the rest of the pipeline reads from the same path.
-
-    Requires SAM2 installed at SAM2_SYSPATH and checkpoint at SAM2_CKPT.
-    """
-    import json as _json
     import sys
-    if SAM2_SYSPATH not in sys.path:
-        sys.path.insert(0, SAM2_SYSPATH)
     import torch
-    from sam2.build_sam import build_sam2_video_predictor
+    if SAM3_SYSPATH not in sys.path:
+        sys.path.insert(0, SAM3_SYSPATH)
+    from sam3 import build_sam3_predictor
 
-    out_root = os.path.join(take_dir, "aligned", "masks")
-    if prompt_masks_root is None:
-        prompt_masks_root = out_root
     if cam_ids is None:
         cam_ids = hmv.discover_cameras(take_dir)
     cam_ids = [c for c in cam_ids if c in calib]
 
-    # Load per-camera 2D MediaPipe landmarks for prompt generation
-    pose2d_path = os.path.join(take_dir, "aligned", pose2d_dir)
+    out_root = os.path.join(take_dir, "aligned", mask_subdir)
 
-    def _load_lm(fname):
-        p = os.path.join(pose2d_path, fname)
-        if not os.path.exists(p):
-            return None
-        with open(p) as _f:
-            return _json.load(_f)
-
-    lm_body  = _load_lm("landmarks_body.json")
-    lm_left  = _load_lm("landmarks_left.json")
-    lm_right = _load_lm("landmarks_right.json")
-
-    predictor = build_sam2_video_predictor(SAM2_CONFIG, ckpt_path=SAM2_CKPT, device=device)
+    print(f"Building SAM3 model ({SAM3_VERSION})...")
+    model = build_sam3_predictor(version=SAM3_VERSION, compile=False, async_loading_frames=False)
 
     written = {cid: {} for cid in cam_ids}
     for cam_id in cam_ids:
@@ -271,75 +76,277 @@ def extract_masks_sam2(take_dir, calib, cam_ids=None, force=False, device="cuda"
         if not force and all(os.path.exists(os.path.join(cam_out_dir, ff)) for ff in frame_files):
             for ff in frame_files:
                 written[cam_id][ff] = os.path.join(cam_out_dir, ff)
-            print(f"  {cam_id}: {len(frame_files)} SAM2 masks already cached, skipping.")
+            print(f"  {cam_id}: {len(frame_files)} SAM3 masks already cached, skipping.")
             continue
 
         frame_dir = os.path.join(take_dir, "aligned", cam_id)
-        first_img = cv2.imread(os.path.join(frame_dir, frame_files[0]))
-        if first_img is None:
-            print(f"  {cam_id}: could not read first frame, skipping.")
-            continue
-        h, w = first_img.shape[:2]
+        print(f"  {cam_id}: processing {len(frame_files)} frames...")
 
-        # Determine prompt frame and clicks
-        prompt_frame_idx, prompt_pt = _sam2_prompt_from_mask(
-            os.path.join(prompt_masks_root, cam_id), frame_files
-        )
-        mp_clicks = _sam2_mp_clicks(cam_id, frame_files[prompt_frame_idx],
-                                    lm_body, lm_left, lm_right, w, h)
-        if mp_clicks is not None:
-            prompt_clicks = mp_clicks
-            print(f"  {cam_id}: MP clicks ({len(mp_clicks)} pts) on frame "
-                  f"{prompt_frame_idx} ({frame_files[prompt_frame_idx]})")
-        elif prompt_pt is not None:
-            prompt_clicks = prompt_pt
-            print(f"  {cam_id}: centroid click at ({prompt_pt[0,0]:.0f},{prompt_pt[0,1]:.0f}) "
-                  f"on frame {prompt_frame_idx} ({frame_files[prompt_frame_idx]})")
-        else:
-            prompt_clicks = np.array([[w / 2.0, h / 2.0]], dtype=np.float32)
-            print(f"  {cam_id}: fallback center click on frame {prompt_frame_idx}")
+        response = model.handle_request({"type": "start_session", "resource_path": frame_dir})
+        session_id = response["session_id"]
 
-        cam_masks = {}
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            inference_state = predictor.init_state(video_path=frame_dir)
-            try:
-                predictor.add_new_points_or_box(
-                    inference_state, frame_idx=prompt_frame_idx, obj_id=1,
-                    points=prompt_clicks,
-                    labels=np.ones(len(prompt_clicks), dtype=np.int32),
-                )
-                # Propagate forward from prompt frame
-                for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
-                    inference_state, start_frame_idx=prompt_frame_idx, reverse=False
-                ):
-                    cam_masks[frame_idx] = (mask_logits[0, 0] > 0).cpu().numpy().astype(np.uint8) * 255
-                # Propagate backward to cover frames before the prompt
-                if prompt_frame_idx > 0:
-                    for frame_idx, _obj_ids, mask_logits in predictor.propagate_in_video(
-                        inference_state, start_frame_idx=prompt_frame_idx, reverse=True
-                    ):
-                        cam_masks[frame_idx] = (mask_logits[0, 0] > 0).cpu().numpy().astype(np.uint8) * 255
-            finally:
-                predictor.reset_state(inference_state)
+        model.handle_request({
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "text": SAM3_TEXT_PROMPT,
+        })
 
-        for frame_idx, mask_u8 in cam_masks.items():
+        n_written = 0
+        for response in model.handle_stream_request(
+            {"type": "propagate_in_video", "session_id": session_id}
+        ):
+            frame_idx = response.get("frame_index")
+            if frame_idx is None:
+                continue
+            outputs = response.get("outputs", {})
+            binary_masks = outputs.get("out_binary_masks")
+            if binary_masks is None:
+                continue
+            if isinstance(binary_masks, torch.Tensor):
+                binary_masks = binary_masks.cpu().numpy()
+
+            # Combine all detected objects into one binary mask
+            combined = np.zeros(binary_masks.shape[-2:], dtype=np.uint8)
+            for m in binary_masks:
+                if m.ndim == 3:
+                    m = m[0]
+                combined |= (m > 0).astype(np.uint8)
+
             ff = frame_files[frame_idx]
             mask_path = os.path.join(cam_out_dir, ff)
-            cv2.imwrite(mask_path, mask_u8)
+            cv2.imwrite(mask_path, combined * 255)
+            written[cam_id][ff] = mask_path
+            n_written += 1
+
+        print(f"  {cam_id}: {n_written} masks written to {cam_out_dir}")
+
+    return written
+
+
+# ---------------------------------------------------------------------------
+# RVM backend
+# ---------------------------------------------------------------------------
+
+def _load_reconstruction_kps(take_dir, pose2d_dir="pose2d"):
+    """Load smoothed 3D body + hand keypoints from reconstruction JSONs.
+
+    Returns:
+        body_kps  dict {frame_key: np.ndarray (N_body, 3)}
+        left_kps  dict {frame_key: np.ndarray (N_left, 3)} — may be sparse
+        right_kps dict {frame_key: np.ndarray (N_right, 3)} — may be sparse
+    """
+    pose2d_path = os.path.join(take_dir, "aligned", pose2d_dir)
+
+    def _load(name):
+        path = os.path.join(pose2d_path, f"reconstruction_{name}.json")
+        if not os.path.exists(path):
+            return {}
+        with open(path) as f:
+            d = json.load(f)
+        smoothed = d.get("smoothed", {})
+        result = {}
+        for frame_key, kp_dict in smoothed.items():
+            if not kp_dict:
+                continue
+            pts = np.array([kp_dict[str(i)] for i in range(len(kp_dict))], dtype=np.float32)
+            result[frame_key] = pts
+        return result
+
+    return _load("body"), _load("left"), _load("right")
+
+
+def compute_projected_bboxes(take_dir, calib, cam_id, frame_keys,
+                             pad=0.30, smooth_window=5, pose2d_dir="pose2d"):
+    """Project 3D body+hand keypoints into cam_id and compute padded bboxes.
+
+    Returns np.ndarray of shape (N, 4) with integer [x1, y1, x2, y2] per
+    frame, clamped to frame bounds. Frames with no visible keypoints reuse
+    the last known box; if no box has been computed yet, uses the full frame.
+    """
+    body_kps, left_kps, right_kps = _load_reconstruction_kps(take_dir, pose2d_dir)
+
+    cam = calib[cam_id]
+    K  = np.array(cam["K"],  dtype=np.float64)
+    R  = np.array(cam["R"],  dtype=np.float64)
+    t  = np.array(cam["t"],  dtype=np.float64)
+    W  = int(cam["width"])
+    H  = int(cam["height"])
+
+    def _project(pts3d):
+        """pts3d: (N, 3) world → pixel (u, v). Returns (N, 2) float."""
+        p_cam = (R @ pts3d.T).T + t        # (N, 3)
+        p_img = (K @ p_cam.T).T            # (N, 3)
+        z = p_img[:, 2:3]
+        valid = z[:, 0] > 0                # behind-camera guard
+        uv = p_img[:, :2] / np.where(z > 0, z, 1.0)
+        return uv, valid
+
+    raw_boxes = np.full((len(frame_keys), 4), -1, dtype=np.float32)
+    for fi, fk in enumerate(frame_keys):
+        pts_list = []
+        if fk in body_kps:
+            pts_list.append(body_kps[fk])
+        if fk in left_kps:
+            pts_list.append(left_kps[fk])
+        if fk in right_kps:
+            pts_list.append(right_kps[fk])
+        if not pts_list:
+            continue
+
+        pts3d = np.concatenate(pts_list, axis=0)
+        uv, valid = _project(pts3d)
+        uv = uv[valid]
+        if len(uv) < 2:
+            continue
+
+        u_min, v_min = uv.min(axis=0)
+        u_max, v_max = uv.max(axis=0)
+
+        # Pad by `pad` fraction of the larger dimension
+        bw = u_max - u_min
+        bh = v_max - v_min
+        margin = max(bw, bh) * pad
+        raw_boxes[fi] = [u_min - margin, v_min - margin,
+                         u_max + margin, v_max + margin]
+
+    # Temporal smoothing: fill gaps with last known box, then smooth
+    last_box = np.array([0, 0, W, H], dtype=np.float32)
+    filled = raw_boxes.copy()
+    for fi in range(len(frame_keys)):
+        if filled[fi, 0] < 0:
+            filled[fi] = last_box
+        else:
+            last_box = filled[fi]
+
+    # Simple causal moving average
+    hw = smooth_window // 2
+    smoothed = np.zeros_like(filled)
+    for fi in range(len(frame_keys)):
+        lo = max(0, fi - hw)
+        hi = min(len(frame_keys), fi + hw + 1)
+        smoothed[fi] = filled[lo:hi].mean(axis=0)
+
+    # Clamp and convert to int
+    smoothed[:, 0::2] = np.clip(smoothed[:, 0::2], 0, W)
+    smoothed[:, 1::2] = np.clip(smoothed[:, 1::2], 0, H)
+    return smoothed.astype(np.int32)
+
+
+def extract_masks_rvm(take_dir, calib, cam_ids=None, force=False,
+                      mask_subdir="masks_rvm", backbone="mobilenetv3",
+                      downsample_ratio=0.25, pad=0.30, smooth_window=5,
+                      input_size=(1080, 1920), pose2d_dir="pose2d"):
+    """Run Robust Video Matting over each camera using keypoint-guided crops.
+
+    Loads one RVM model and processes all cameras sequentially. Each camera
+    gets a fresh recurrent state; the model stays in VRAM across cameras
+    (it's only 32MB for MobileNetV3).
+
+    Returns dict {cam_id: {frame_file: mask_path}} of what was written.
+    """
+    import sys
+    import torch
+    if RVM_SYSPATH not in sys.path:
+        sys.path.insert(0, RVM_SYSPATH)
+    from model.model import MattingNetwork  # noqa: E402
+
+    if cam_ids is None:
+        cam_ids = hmv.discover_cameras(take_dir)
+    cam_ids = [c for c in cam_ids if c in calib]
+
+    ckpt = RVM_CHECKPOINT_RESNET50 if backbone == "resnet50" else RVM_CHECKPOINT_MOBILENET
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError(
+            f"RVM checkpoint not found: {ckpt}\n"
+            f"Download with:\n"
+            f"  wget -P /home/fmalmb/CODE/rvm/checkpoints \\\n"
+            f"    https://github.com/PeterL1n/RobustVideoMatting/releases/"
+            f"download/v1.0.0/rvm_{backbone}.pth"
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Building RVM model ({backbone}) on {device}...")
+    rvm_model = MattingNetwork(backbone).eval().to(device)
+    if device.type == "cuda":
+        rvm_model = rvm_model.half()
+    rvm_model.load_state_dict(torch.load(ckpt, map_location=device))
+
+    input_h, input_w = input_size
+    out_root = os.path.join(take_dir, "aligned", mask_subdir)
+    written = {cid: {} for cid in cam_ids}
+
+    for cam_id in cam_ids:
+        frame_files = hmv.discover_frames(take_dir, cam_id)
+        if not frame_files:
+            continue
+        cam_out_dir = os.path.join(out_root, cam_id)
+        os.makedirs(cam_out_dir, exist_ok=True)
+
+        if not force and all(os.path.exists(os.path.join(cam_out_dir, ff)) for ff in frame_files):
+            for ff in frame_files:
+                written[cam_id][ff] = os.path.join(cam_out_dir, ff)
+            print(f"  {cam_id}: {len(frame_files)} RVM masks already cached, skipping.")
+            continue
+
+        bboxes = compute_projected_bboxes(
+            take_dir, calib, cam_id, frame_files,
+            pad=pad, smooth_window=smooth_window, pose2d_dir=pose2d_dir,
+        )
+
+        cam_h = int(calib[cam_id]["height"])
+        cam_w = int(calib[cam_id]["width"])
+
+        print(f"  {cam_id}: running RVM on {len(frame_files)} frames...")
+        r1 = r2 = r3 = r4 = None  # recurrent state — reset per camera
+        t0 = __import__("time").time()
+
+        for fi, ff in enumerate(frame_files):
+            frame_path = os.path.join(take_dir, "aligned", cam_id, ff)
+            img = cv2.imread(frame_path)
+            if img is None:
+                continue
+
+            x1, y1, x2, y2 = bboxes[fi]
+            crop = img[y1:y2, x1:x2]
+            if crop.size == 0:
+                crop = img
+
+            crop_rs = cv2.resize(crop, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
+            # BGR → RGB, HWC → CHW, [0,1] float
+            src_np = crop_rs[:, :, ::-1].astype(np.float32) / 255.0
+            src = torch.from_numpy(src_np).permute(2, 0, 1).unsqueeze(0).to(device)
+            if device.type == "cuda":
+                src = src.half()
+
+            with torch.no_grad():
+                fgr, pha, r1, r2, r3, r4 = rvm_model(
+                    src, r1, r2, r3, r4, downsample_ratio=downsample_ratio
+                )
+
+            # pha: (1, 1, input_h, input_w) — resize back to crop size then un-crop
+            alpha = pha[0, 0].float().cpu().numpy()  # (input_h, input_w) 0–1
+            crop_h = y2 - y1
+            crop_w = x2 - x1
+            alpha_crop = cv2.resize(alpha, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+
+            full_alpha = np.zeros((cam_h, cam_w), dtype=np.float32)
+            full_alpha[y1:y2, x1:x2] = alpha_crop
+            mask_img = (full_alpha * 255).clip(0, 255).astype(np.uint8)
+
+            mask_path = os.path.join(cam_out_dir, ff)
+            cv2.imwrite(mask_path, mask_img)
             written[cam_id][ff] = mask_path
 
-        print(f"  {cam_id}: {len(cam_masks)} SAM2 masks written to {cam_out_dir}")
+        elapsed = __import__("time").time() - t0
+        fps = len(frame_files) / elapsed
+        print(f"  {cam_id}: {len(frame_files)} masks written in {elapsed:.1f}s ({fps:.0f} fps)")
 
     return written
 
 
 def summarize_mask_coverage(take_dir, written, threshold=127):
-    """Sanity check per the approved plan's Phase 2 verification: spot-check
-    that mask pixel-coverage fraction per frame is plausible (a person
-    filling some meaningful but not all/none of the frame), not a
-    degenerate all-black/all-white output that would silently corrupt
-    Phase 3 without this check catching it first.
-    """
+    """Spot-check that mask pixel-coverage fraction per frame is plausible."""
     fractions = []
     for cam_id, by_frame in written.items():
         for frame_file, mask_path in by_frame.items():
@@ -356,10 +363,9 @@ def summarize_mask_coverage(take_dir, written, threshold=127):
     n_degenerate = int(((fractions < 0.01) | (fractions > 0.95)).sum())
     if n_degenerate:
         print(f"  WARNING: {n_degenerate}/{len(fractions)} frames have degenerate "
-              f"(near-0% or near-100%) coverage -- inspect these before trusting "
-              f"this take's masks for Phase 3.")
+              f"(near-0% or near-100%) coverage.")
     else:
-        print("  no degenerate (near-0%/near-100%) frames found.")
+        print("  no degenerate frames found.")
     return {
         "mean_coverage": float(fractions.mean()),
         "min_coverage": float(fractions.min()),
@@ -369,28 +375,19 @@ def summarize_mask_coverage(take_dir, written, threshold=127):
     }
 
 
-MASK_TINT_COLOR = (0, 200, 0)  # BGR green -- distinct from grid_video.py's body/hand palette
+MASK_TINT_COLOR = (0, 200, 0)  # BGR green
 
 
 def render_mask_grid_video(
-    take_dir, calib, cam_ids=None, output_path=None,
+    take_dir, calib, cam_ids=None, mask_subdir="masks_sam3", output_path=None,
     fps=15.0, cols=3, canvas_size=(1920, 1080), alpha=0.45, mask_threshold=127,
 ):
-    """Structurally mirrors pose2d.grid_video.render_pose2d_grid_video (grid
-    math, per-camera undistortion, leftover-slot legend panel) -- this IS
-    the deliverable for judging segmentation-mask quality by eye, same
-    inspection-first convention as that module's own docstring describes
-    for 2D keypoints. Tints each camera's undistorted frame green wherever
-    that camera's cached mask exceeds `mask_threshold`, with the per-frame
-    coverage fraction printed in-frame so degenerate frames (see
-    summarize_mask_coverage) are easy to spot by eye too, not just by the
-    aggregate stats.
-    """
+    """Render a grid video of masks overlaid on undistorted frames."""
     if cam_ids is None:
         cam_ids = hmv.discover_cameras(take_dir)
     cam_ids = [c for c in cam_ids if c in calib]
     if output_path is None:
-        output_path = os.path.join(take_dir, "aligned", "masks", "mask_grid_video.mp4")
+        output_path = os.path.join(take_dir, "aligned", mask_subdir, "mask_grid_video.mp4")
 
     frame_keys = hmv.discover_frames(take_dir, cam_ids[0])
     undistort_maps = {}
@@ -409,17 +406,16 @@ def render_mask_grid_video(
     try:
         for idx, frame_key in enumerate(frame_keys):
             canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-
             for cam_idx, cam_id in enumerate(cam_ids):
-                frame_path = os.path.join(take_dir, "aligned", cam_id, frame_key)
-                img = cv2.imread(frame_path)
+                img = cv2.imread(os.path.join(take_dir, "aligned", cam_id, frame_key))
                 if img is None:
                     continue
                 w, h, (map1, map2) = undistort_maps[cam_id]
                 img = hmv.undistort_fast(img, map1, map2)
-
-                mask_path = os.path.join(take_dir, "aligned", "masks", cam_id, frame_key)
-                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                mask = cv2.imread(
+                    os.path.join(take_dir, "aligned", mask_subdir, cam_id, frame_key),
+                    cv2.IMREAD_GRAYSCALE,
+                )
                 coverage_pct = None
                 if mask is not None:
                     binary = mask > mask_threshold
@@ -427,49 +423,33 @@ def render_mask_grid_video(
                     tinted = img.copy()
                     tinted[binary] = MASK_TINT_COLOR
                     img = cv2.addWeighted(tinted, alpha, img, 1.0 - alpha, 0)
-
                 resized = cv2.resize(img, (slot_w, slot_h), interpolation=cv2.INTER_AREA)
-                cv2.putText(
-                    resized, cam_id, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA,
-                )
-                if coverage_pct is not None:
-                    cv2.putText(
-                        resized, f"{coverage_pct:.1f}%", (10, slot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (255, 255, 255), 2, cv2.LINE_AA,
-                    )
-                else:
-                    cv2.putText(
-                        resized, "no mask", (10, slot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 0, 255), 2, cv2.LINE_AA,
-                    )
-
+                cv2.putText(resized, cam_id, (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                label = f"{coverage_pct:.1f}%" if coverage_pct is not None else "no mask"
+                color = (255, 255, 255) if coverage_pct is not None else (0, 0, 255)
+                cv2.putText(resized, label, (10, slot_h - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
                 row, col = cam_idx // cols, cam_idx % cols
-                y1, x1 = row * slot_h, col * slot_w
-                canvas[y1:y1 + slot_h, x1:x1 + slot_w] = resized
+                canvas[row * slot_h:(row + 1) * slot_h, col * slot_w:(col + 1) * slot_w] = resized
 
             if empty_slots:
                 panel = np.zeros((slot_h, slot_w, 3), dtype=np.uint8)
-                lines = [
-                    "LEGEND", "green tint = segmented person",
-                    f"tint alpha: {alpha}", f"mask threshold: {mask_threshold}/255",
-                    "red 'no mask' = mask not found for this frame",
-                ]
-                y = 28
-                for line in lines:
-                    cv2.putText(panel, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-                    y += 27
+                for i, line in enumerate(["LEGEND", "green = person mask",
+                                          f"alpha: {alpha}", f"threshold: {mask_threshold}/255"]):
+                    cv2.putText(panel, line, (20, 28 + i * 27),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
                 row, col = empty_slots[0] // cols, empty_slots[0] % cols
                 canvas[row * slot_h:(row + 1) * slot_h, col * slot_w:(col + 1) * slot_w] = panel
 
-            header = f"frame {idx} ({frame_key})"
-            cv2.putText(canvas, header, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
-
+            cv2.putText(canvas, f"frame {idx} ({frame_key})", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
             writer.write(canvas)
             if (idx + 1) % 50 == 0 or (idx + 1) == len(frame_keys):
-                print(f"  Progress: {idx + 1}/{len(frame_keys)} grid frames compiled.")
+                print(f"  {idx + 1}/{len(frame_keys)} frames done.")
     finally:
         writer.release()
-        print(f"Saved mask grid video to {os.path.abspath(output_path)}")
+        print(f"Saved: {os.path.abspath(output_path)}")
     return output_path
 
 
@@ -481,24 +461,31 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("take_dir")
     parser.add_argument("--calib", default=os.path.join("output", "calibration", "20260903_153052_7cam.json"))
+    parser.add_argument("--backend", choices=["sam3", "rvm"], default="sam3",
+                        help="Segmentation backend: sam3 (video propagation) or rvm (keypoint-guided, faster).")
+    parser.add_argument("--pose2d-dir", default="pose2d",
+                        help="Subdirectory under aligned/ with reconstruction JSONs (RVM only).")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--sam2", action="store_true",
-                         help="Use SAM2 video predictor instead of MediaPipe SelfieSegmentation. "
-                              "Requires SAM2 installed at %(default)s.",
-                         default=False)
+    parser.add_argument("--mask-subdir", default=None,
+                        help="Subdirectory under aligned/ to write masks to. "
+                             "Defaults to masks_sam3 or masks_rvm based on --backend.")
     parser.add_argument("--grid-video", action="store_true",
-                         help="Also render aligned/masks/mask_grid_video.mp4 for visual inspection.")
+                        help="Also render a mask grid video for visual inspection.")
     parser.add_argument("--fps", type=float, default=15.0)
     args = parser.parse_args()
 
+    mask_subdir = args.mask_subdir or (f"masks_{args.backend}")
     calib = calibrate.load_calibration_output(args.calib)
-    if args.sam2:
-        written = extract_masks_sam2(args.take_dir, calib, force=args.force)
+
+    if args.backend == "rvm":
+        written = extract_masks_rvm(args.take_dir, calib, force=args.force,
+                                    mask_subdir=mask_subdir, pose2d_dir=args.pose2d_dir)
     else:
-        written = extract_masks_for_take(args.take_dir, calib, force=args.force)
+        written = extract_masks_sam3(args.take_dir, calib, force=args.force, mask_subdir=mask_subdir)
+
     summarize_mask_coverage(args.take_dir, written)
     if args.grid_video:
-        render_mask_grid_video(args.take_dir, calib, fps=args.fps)
+        render_mask_grid_video(args.take_dir, calib, mask_subdir=mask_subdir, fps=args.fps)
 
 
 if __name__ == "__main__":

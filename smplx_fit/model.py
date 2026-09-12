@@ -76,9 +76,13 @@ def forward(model, betas, global_orient, body_pose, left_hand_pose, right_hand_p
 # which reads visually as part of the torso, not "legs"; cutting at the hip
 # joint instead gives a cleaner torso base with no gap.
 LOWER_BODY_JOINTS = {1, 2, 4, 5, 7, 8, 10, 11}
+# Pelvis (joint 0) is kept by default because its dominant-weight vertices
+# are the glutes/crotch area — it reads as a torso base. Add it to the
+# exclusion set via hide_pelvis=True when a tighter upper-body cut is wanted.
+PELVIS_JOINT = 0
 
 
-def upper_body_faces(model):
+def upper_body_faces(model, hide_pelvis=False):
     """Returns a (F, 3) face-index array containing only faces with NO
     vertex dominantly skinned (argmax of that vertex's lbs_weights row) to
     a lower-body joint -- i.e. legs/feet excluded, everything else kept.
@@ -86,15 +90,15 @@ def upper_body_faces(model):
     extra vertex-segmentation file needed) rather than a fixed vertex-index
     list, so it stays correct regardless of SMPL-X mesh topology version.
 
-    Confirmed on the SMPL-X neutral template this session: 10475 vertices
-    -> 1378 classified lower-body; of 20908 faces, 18111 have zero
-    lower-body vertices (kept), 2713 have all three (dropped), and only 84
-    straddle the hip boundary (dropped too -- excluding on ANY lower-body
-    vertex, not requiring all three, avoids stray sliver faces at the cut).
+    hide_pelvis=True also excludes the pelvis joint (glutes/lower abdomen),
+    giving a tighter cut just above the hip line.
     """
+    exclude = set(LOWER_BODY_JOINTS)
+    if hide_pelvis:
+        exclude.add(PELVIS_JOINT)
     dominant_joint = model.lbs_weights.argmax(dim=1)
     lower_mask = torch.tensor(
-        [int(j) in LOWER_BODY_JOINTS for j in dominant_joint], dtype=torch.bool,
+        [int(j) in exclude for j in dominant_joint], dtype=torch.bool,
     )
     faces_t = torch.as_tensor(model.faces.astype("int64"))
     keep = ~lower_mask[faces_t].any(dim=1)

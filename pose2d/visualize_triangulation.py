@@ -61,7 +61,7 @@ def load_reconstructions(take_dir, parts, use_smoothed, pose2d_dir="pose2d"):
     return out
 
 
-def load_smplx_mesh_sequence(npz_path, model_path, hide_lower_body=False):
+def load_smplx_mesh_sequence(npz_path, model_path, hide_lower_body=False, hide_pelvis=False):
     """Loads a smplx_fit.fit_take output .npz and returns (vertices_by_frame,
     faces) -- vertices_by_frame maps EXACTLY the frame_key strings the fit
     covered (often a subset of the take, e.g. a --frames slice) to that
@@ -97,7 +97,10 @@ def load_smplx_mesh_sequence(npz_path, model_path, hide_lower_body=False):
 
     vertices = output.vertices.numpy()
     vertices_by_frame = {fk: vertices[i] for i, fk in enumerate(frame_keys)}
-    faces = smplx_model.upper_body_faces(model) if hide_lower_body else model.faces
+    if hide_lower_body:
+        faces = smplx_model.upper_body_faces(model, hide_pelvis=hide_pelvis)
+    else:
+        faces = model.faces
     return vertices_by_frame, faces
 
 
@@ -228,6 +231,7 @@ def setup_app_style_scene(server):
 def launch_3d_viewer(
     take_dir, calib_path, parts, port, fps, use_smoothed, pose2d_dir="pose2d",
     smplx_npz=None, smplx_model_path=None, frame_range=None, smplx_hide_lower_body=False,
+    smplx_hide_hips=False,
 ):
     calib = calibrate.load_calibration_output(calib_path)
     reconstructions = load_reconstructions(take_dir, parts, use_smoothed, pose2d_dir=pose2d_dir)
@@ -243,7 +247,9 @@ def launch_3d_viewer(
     smplx_mesh = None
     if smplx_npz is not None:
         print(f"Loading SMPL-X fit from {smplx_npz}...")
-        smplx_mesh = load_smplx_mesh_sequence(smplx_npz, smplx_model_path, hide_lower_body=smplx_hide_lower_body)
+        smplx_mesh = load_smplx_mesh_sequence(smplx_npz, smplx_model_path,
+                                               hide_lower_body=smplx_hide_lower_body,
+                                               hide_pelvis=smplx_hide_hips)
         print(f"SMPL-X mesh covers {len(smplx_mesh[0])} frame(s).")
 
     frame_counts = ", ".join(f"{p}={len(reconstructions[p])}" for p in parts)
@@ -286,6 +292,10 @@ def main():
              "so a fit's legs are held near-neutral by the pose prior/silhouette term alone, not "
              "real data; hiding them avoids visually overclaiming their accuracy.",
     )
+    parser.add_argument(
+        "--smplx-hide-hips", action="store_true",
+        help="Also drop the pelvis/hip region (glutes, lower abdomen). Requires --smplx-hide-lower-body.",
+    )
     args = parser.parse_args()
     parts = [p.strip() for p in args.part.split(",") if p.strip()]
     frame_range = None
@@ -296,6 +306,7 @@ def main():
         args.take_dir, args.calib, parts, args.port, args.fps, use_smoothed=not args.raw,
         pose2d_dir=args.pose2d_dir, smplx_npz=args.smplx_npz, smplx_model_path=args.smplx_model_path,
         frame_range=frame_range, smplx_hide_lower_body=args.smplx_hide_lower_body,
+        smplx_hide_hips=args.smplx_hide_hips,
     )
 
 
