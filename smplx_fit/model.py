@@ -70,6 +70,26 @@ def forward(model, betas, global_orient, body_pose, left_hand_pose, right_hand_p
     )
 
 
+def forward_with_expr(model, betas, global_orient, body_pose, left_hand_pose,
+                      right_hand_pose, transl, expression, jaw_pose):
+    """Like forward() but also passes FLAME expression + jaw_pose parameters.
+
+    expression: (B, 10)  -- FLAME expression coefficients
+    jaw_pose:   (B, 3)   -- jaw rotation in axis-angle; converted to (B,3,3) here
+    """
+    return model(
+        betas=betas,
+        global_orient=axis_angle_to_rotmat(global_orient),
+        body_pose=axis_angle_to_rotmat(body_pose),
+        left_hand_pose=axis_angle_to_rotmat(left_hand_pose),
+        right_hand_pose=axis_angle_to_rotmat(right_hand_pose),
+        transl=transl,
+        expression=expression,
+        jaw_pose=axis_angle_to_rotmat(jaw_pose),
+        return_verts=True,
+    )
+
+
 # Lower-body joints in smplx.joint_names.JOINT_NAMES's fixed ordering:
 # hips(1,2), knees(4,5), ankles(7,8), feet(10,11). Pelvis(0) is deliberately
 # NOT included -- its dominant-weight vertices are the glutes/crotch region,

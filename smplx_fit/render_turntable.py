@@ -104,6 +104,7 @@ def render_turntable(
     render_h=1080,
     fps=30,
     bg_color=(240, 240, 240),
+    flat_color=None,        # (R,G,B) 0-255 — if set, skip texture and use Lambertian shading
 ):
     import nvdiffrast.torch as dr
 
@@ -130,15 +131,25 @@ def render_turntable(
     rh    = torch.as_tensor(data["rhand_pose"],    dtype=torch.float32)
     tr    = torch.as_tensor(data["transl"],        dtype=torch.float32)
 
+    # Load FLAME face parameters if present; fall back to zeros
+    expr_np = data["expression"] if "expression" in data else np.zeros((n_frames, 10), np.float32)
+    jaw_np  = data["jaw_pose"]   if "jaw_pose"   in data else np.zeros((n_frames, 3),  np.float32)
+    expr = torch.as_tensor(expr_np, dtype=torch.float32)
+    jaw  = torch.as_tensor(jaw_np,  dtype=torch.float32)
+    has_expr = np.abs(expr_np).max() > 1e-6
+    print(f"  expression/jaw_pose: {'fitted' if has_expr else 'zeros (not fitted)'}")
+
     print(f"Running SMPL-X forward on {n_frames} frames...")
     BATCH      = 64
     verts_all  = []
     joints_all = []
     with torch.no_grad():
         for i in range(0, n_frames, BATCH):
-            out = smplx_model.forward(model_layer,
-                                       betas[i:i+BATCH], go[i:i+BATCH], bp[i:i+BATCH],
-                                       lh[i:i+BATCH], rh[i:i+BATCH], tr[i:i+BATCH])
+            out = smplx_model.forward_with_expr(
+                model_layer,
+                betas[i:i+BATCH], go[i:i+BATCH], bp[i:i+BATCH],
+                lh[i:i+BATCH], rh[i:i+BATCH], tr[i:i+BATCH],
+                expr[i:i+BATCH], jaw[i:i+BATCH])
             verts_all.append(out.vertices.cpu())
             joints_all.append(out.joints.cpu())
     verts_all  = torch.cat(verts_all,  dim=0).numpy()   # (N, V, 3)
@@ -152,12 +163,22 @@ def render_turntable(
     vt_loop_t = torch.as_tensor(vt,     dtype=torch.float32, device="cuda")
     ft_loop_t = torch.as_tensor(ft_loop, dtype=torch.int32,  device="cuda")
 
-    # --- Texture ---
-    print(f"Loading texture: {texture_path}")
-    tex_bgr  = cv2.imread(texture_path)
-    tex_rgb  = tex_bgr[:, :, ::-1].astype(np.float32) / 255.0
-    tex_t    = torch.as_tensor(tex_rgb[::-1].copy(),   # V=0 at bottom for dr.texture
-                                dtype=torch.float32, device="cuda").unsqueeze(0)
+    # --- Texture OR flat color ---
+    if flat_color is not None:
+        tex_t = None
+        base_rgb = torch.tensor([flat_color[0] / 255.0,
+                                  flat_color[1] / 255.0,
+                                  flat_color[2] / 255.0], dtype=torch.float32, device="cuda")
+        print(f"Flat color mode: RGB {flat_color}")
+    else:
+        print(f"Loading texture: {texture_path}")
+        tex_bgr  = cv2.imread(texture_path)
+        tex_rgb  = tex_bgr[:, :, ::-1].astype(np.float32) / 255.0
+        tex_t    = torch.as_tensor(tex_rgb[::-1].copy(),   # V=0 at bottom for dr.texture
+                                    dtype=torch.float32, device="cuda").unsqueeze(0)
+        base_rgb = None
+
+    faces_t = torch.as_tensor(faces_np.astype(np.int64), dtype=torch.long, device="cuda")
 
     # --- Camera path: sweep_cams[0] → sweep_cams[1] → sweep_cams[2] ---
     print("Building camera path...")
@@ -201,7 +222,8 @@ def render_turntable(
 
     print(f"Rendering {n_frames} frames → {output_path}")
     for fi in range(n_frames):
-        verts_loop_buf.copy_(torch.as_tensor(verts_all[fi][faces_flat], dtype=torch.float32))
+        verts_world = torch.as_tensor(verts_all[fi], dtype=torch.float32, device="cuda")
+        verts_loop_buf.copy_(verts_world[faces_t.reshape(-1)])
         R_v, t_v = look_at(path_positions[fi], target, world_up)
 
         with torch.no_grad():
@@ -211,14 +233,59 @@ def render_turntable(
                                              ft_loop_t.contiguous(),
                                              resolution=[render_h, render_w])
             del rast_db
-            uv_interp, uv_db = dr.interpolate(vt_loop_t[None], rast, ft_loop_t)
-            del uv_db
-            color_t = dr.texture(tex_t, uv_interp, filter_mode="linear")
-            color_t = dr.antialias(color_t, rast, clips, ft_loop_t)
+
+            if flat_color is not None:
+                # Lambertian shading with two lights: key (front-above-cam) + fill (ambient)
+                # Per-vertex normals on the original mesh (not loop-inflated)
+                nv = verts_world.shape[0]
+                v0 = verts_world[faces_t[:, 0]]
+                v1 = verts_world[faces_t[:, 1]]
+                v2 = verts_world[faces_t[:, 2]]
+                face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)  # (F, 3)
+                area = face_normals.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                face_normals_unit = face_normals / area                 # unit per-face normal
+
+                # Scatter: each face contributes its normal to its three vertices
+                vn = torch.zeros(nv, 3, device="cuda")
+                idx = faces_t.reshape(-1, 1).expand(-1, 3)             # (F*3, 3)
+                fn3 = face_normals_unit.repeat_interleave(3, dim=0)    # (F*3, 3)
+                vn.scatter_add_(0, idx, fn3)
+                vn = torch.nn.functional.normalize(vn, dim=-1)         # (V, 3)
+
+                # Transform normals to camera space
+                R_t = torch.as_tensor(R_v, dtype=torch.float32, device="cuda")
+                normals_cam = vn @ R_t.T  # (V, 3)
+
+                # Loop-inflate normals to match ft_loop_t layout, then interpolate
+                faces_flat_t = faces_t.reshape(-1)
+                normals_loop = normals_cam[faces_flat_t]               # (F*3, 3)
+                norm_interp, _ = dr.interpolate(normals_loop[None], rast, ft_loop_t)
+                norm_interp = torch.nn.functional.normalize(norm_interp, dim=-1)  # (1,H,W,3)
+
+                # Key light: slightly above and in front of the camera (camera-space direction)
+                key_dir = torch.tensor([0.3, -0.5, -0.8], device="cuda")  # cam space: -z = forward
+                key_dir = torch.nn.functional.normalize(key_dir, dim=0)
+                fill_dir = torch.tensor([-0.5, 0.2, -0.6], device="cuda")
+                fill_dir = torch.nn.functional.normalize(fill_dir, dim=0)
+
+                ndotl_key  = (norm_interp[..., :3] * key_dir).sum(-1, keepdim=True).clamp(0, 1)
+                ndotl_fill = (norm_interp[..., :3] * fill_dir).sum(-1, keepdim=True).clamp(0, 1)
+
+                shading = 0.15 + 0.65 * ndotl_key + 0.20 * ndotl_fill  # ambient + key + fill
+                color_t = (base_rgb * shading).clamp(0, 1)              # (1, H, W, 3)
+                color_t = dr.antialias(color_t, rast, clips, ft_loop_t)
+
+                del norm_interp, ndotl_key, ndotl_fill, shading
+            else:
+                uv_interp, uv_db = dr.interpolate(vt_loop_t[None], rast, ft_loop_t)
+                del uv_db
+                color_t = dr.texture(tex_t, uv_interp, filter_mode="linear")
+                color_t = dr.antialias(color_t, rast, clips, ft_loop_t)
+                del uv_interp
 
             color_np = (color_t[0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
             mask_np  = (rast[0, :, :, 3] > 0).cpu().numpy()
-            del clips, rast, uv_interp, color_t
+            del clips, rast, color_t
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -245,7 +312,10 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--smplx-npz",    required=True, help="smplx_params.npz from fit_take")
     parser.add_argument("--calib",        default=CALIB_DEFAULT)
-    parser.add_argument("--texture",      required=True, help="Baked texture PNG")
+    parser.add_argument("--texture",      default=None, help="Baked texture PNG")
+    parser.add_argument("--flat-color",   default=None,
+                        help="Flat shaded solid color as R,G,B (0-255), e.g. 70,130,200. "
+                             "Overrides --texture.")
     parser.add_argument("--output",       default=None,  help="Output .mp4 path")
     parser.add_argument("--uv-npz",       default=UV_NPZ_DEFAULT)
     parser.add_argument("--smplx-model-path", default="models/SMPLX")
@@ -258,6 +328,9 @@ def main():
 
     output = args.output or args.smplx_npz.replace("smplx_params.npz", "turntable.mp4")
     sweep_cams = [c.strip() for c in args.sweep_cams.split(",")]
+    flat_color = None
+    if args.flat_color:
+        flat_color = tuple(int(x) for x in args.flat_color.split(","))
 
     render_turntable(
         smplx_npz=args.smplx_npz,
@@ -270,6 +343,7 @@ def main():
         render_w=args.render_size,
         render_h=args.render_size,
         fps=args.fps,
+        flat_color=flat_color,
     )
 
 

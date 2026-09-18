@@ -644,6 +644,7 @@ def bake_texture(
     debug_phase1=False,
     cam_ids=None,
     frame_range=None,
+    frame_margin=100,
     normal_threshold=0.0,
     depth_tolerance=0.02,
     hero_frames=False,
@@ -706,7 +707,14 @@ def bake_texture(
     num_betas = int(data["num_betas"])
 
     nf = len(frame_keys)
-    frame_pool_range = list(range(*frame_range)) if frame_range is not None else None
+    if frame_range is not None:
+        frame_pool_range = list(range(*frame_range))
+    elif frame_margin > 0:
+        frame_pool_range = list(range(frame_margin, nf - frame_margin))
+        print(f"  Frame pool: {frame_pool_range[0]}–{frame_pool_range[-1]} "
+              f"({len(frame_pool_range)} frames, margin={frame_margin})")
+    else:
+        frame_pool_range = None
 
     per_cam_frames = None  # None means "all cameras use all selected frames"
 
@@ -1019,6 +1027,9 @@ def main():
                         help="Min dot(normal, cam_dir) to accept a texel")
     parser.add_argument("--frame-range", default=None,
                         help="START:END slice for frame pool, e.g. 373:413")
+    parser.add_argument("--frame-margin", type=int, default=100,
+                        help="Exclude this many frames from the start and end of the "
+                             "sequence when building the hero-frame pool (default 100)")
     # Hero frame selection
     parser.add_argument("--hero-frames", action="store_true",
                         help="Auto-select pose-diverse still keyframes (global)")
@@ -1084,6 +1095,7 @@ def main():
         debug_phase1=args.debug_phase1,
         cam_ids=cam_ids,
         frame_range=frame_range,
+        frame_margin=args.frame_margin,
         normal_threshold=args.normal_threshold,
         depth_tolerance=args.depth_tolerance,
         hero_frames=args.hero_frames,
