@@ -2708,7 +2708,7 @@ def main():
             # it's actually visible. Plain text, not markdown: these lines
             # get baked as escaped HTML into the grid, so plain text is the
             # only formatting that renders correctly there. Coverage is
-            # deliberately NOT repeated here as a percentage: the red/green
+            # deliberately NOT repeated here as a percentage: the blue/orange
             # grid draw_coverage_overlay already paints it directly onto the
             # thumbnail (Pass 1 above). Capture mode's single-camera preview
             # deliberately does NOT reuse this -- it's all calibration debug

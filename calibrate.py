@@ -100,9 +100,15 @@ DEFAULT_CONFIG = {
     "quality_gates": {
         "min_corners": 8,
         "blur_laplacian_var_min": 30.0,
-        "coverage_grid_rows": 4,
-        "coverage_grid_cols": 6,
-        "min_coverage_cells_per_frame": 4,
+        # rows/cols quadrupled (from 4x6) per user feedback -- the coarser
+        # grid could show a cell as "covered" from just a corner clipping
+        # it, hiding real corner-of-frame coverage gaps. min_coverage_cells_
+        # per_frame is scaled by the same 4x4=16x cell-count increase to
+        # preserve its original meaning (a board detection must still cover
+        # roughly the same physical fraction of the frame to count).
+        "coverage_grid_rows": 16,
+        "coverage_grid_cols": 24,
+        "min_coverage_cells_per_frame": 64,
         "min_pose_translation_diversity_m": 0.05,
         "min_pose_angle_diversity_deg": 8.0,
     },
@@ -1157,9 +1163,9 @@ class PoseGraphWorker(threading.Thread):
 
 
 def draw_coverage_overlay(frame, coverage):
-    """Tints covered grid cells green and uncovered ones red directly on the
-    live thumbnail -- a best-effort coverage-guidance heuristic (spec section
-    8), not a precisely optimal "go here next" suggestion.
+    """Tints covered grid cells blue and uncovered ones dark orange directly
+    on the live thumbnail -- a best-effort coverage-guidance heuristic (spec
+    section 8), not a precisely optimal "go here next" suggestion.
     """
     out = frame.copy()
     h, w = out.shape[:2]
@@ -1170,9 +1176,9 @@ def draw_coverage_overlay(frame, coverage):
         for c in range(cols):
             x0, y0 = int(c * cell_w), int(r * cell_h)
             x1, y1 = int((c + 1) * cell_w), int((r + 1) * cell_h)
-            color = (0, 140, 0) if coverage.filled[r, c] else (0, 0, 200)
+            color = (200, 0, 0) if coverage.filled[r, c] else (0, 90, 170)  # BGR: blue / dark orange
             cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
-    cv2.addWeighted(overlay, 0.18, out, 0.82, 0, out)
+    cv2.addWeighted(overlay, 0.30, out, 0.70, 0, out)
     for r in range(1, rows):
         y = int(r * cell_h)
         cv2.line(out, (0, y), (w, y), (90, 90, 90), 1)
@@ -1844,7 +1850,7 @@ def main():
                 if session.last_frame_preview is not None:
                     if state.intrinsics_locked:
                         # No live coverage grid to show for a cache-loaded camera -- the
-                        # default all-red overlay would misleadingly read as "bad coverage"
+                        # default all-orange overlay would misleadingly read as "bad coverage"
                         # despite the camera already being intrinsics-converged.
                         viser_mgr.update_thumbnail_raw(cam_id, session.last_frame_preview)
                     else:
