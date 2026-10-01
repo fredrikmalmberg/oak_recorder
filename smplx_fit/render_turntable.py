@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import calibrate  # noqa: E402
 
 from smplx_fit import model as smplx_model  # noqa: E402
-from smplx_fit.texture_bake import load_uv_data  # noqa: E402
+from smplx_fit.texture.texture_bake import load_uv_data  # noqa: E402
 from smplx_fit.silhouette import _get_nvdiffrast_ctx  # noqa: E402
 
 UV_NPZ_DEFAULT   = "/home/fmalmb/CODE/sl_reconstruction/visualization/textures/smplx_uv_2023.npz"
@@ -92,6 +92,14 @@ def verts_to_clip(verts_t, K, R, t, W, H):
 # Main render function
 # ---------------------------------------------------------------------------
 
+# COCO-17 skeleton connections for body landmarks 0-12
+BODY_SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),          # face
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # arms
+    (5, 11), (6, 12), (11, 12),               # torso
+]
+
+
 def render_turntable(
     smplx_npz,
     calib_path,
@@ -105,6 +113,8 @@ def render_turntable(
     fps=30,
     bg_color=(240, 240, 240),
     flat_color=None,        # (R,G,B) 0-255 — if set, skip texture and use Lambertian shading
+    mesh_alpha=1.0,         # mesh opacity (0=transparent, 1=opaque)
+    skeleton_path=None,     # path to reconstruction_body.json; None = no skeleton
 ):
     import nvdiffrast.torch as dr
 
@@ -116,6 +126,31 @@ def render_turntable(
 
     world_up = world_up_from_calib(calib, sweep_cams)
     print(f"World up (from cameras): {world_up.round(3)}")
+
+    # --- Skeleton data (optional) ---
+    skel_by_key = {}     # body: {frame_key: {landmark_id: (x,y,z)}}
+    hand_by_key = {}     # hands: {frame_key: [(x,y,z), ...]}  flat list of all hand pts
+    if skeleton_path is not None:
+        import json
+        print(f"Loading skeleton from {skeleton_path}...")
+        with open(skeleton_path) as f:
+            skel_data = json.load(f)
+        # Use smoothed — matches what fit_take uses as target
+        skel_src = skel_data.get("smoothed", skel_data.get("raw"))
+        for fk, lms in skel_src.items():
+            skel_by_key[fk] = {int(k): np.array(v, dtype=np.float32) for k, v in lms.items()}
+        # Also load hand reconstructions (smoothed) if present alongside body
+        skel_dir = os.path.dirname(skeleton_path)
+        for hand_file in ("reconstruction_left.json", "reconstruction_right.json"):
+            hp = os.path.join(skel_dir, hand_file)
+            if os.path.exists(hp):
+                with open(hp) as f:
+                    hr = json.load(f)
+                hand_src = hr.get("smoothed", hr.get("raw"))
+                for fk, lms in hand_src.items():
+                    pts = [np.array(v, dtype=np.float32) for v in lms.values()]
+                    hand_by_key.setdefault(fk, []).extend(pts)
+        print(f"  body frames: {len(skel_by_key)}, hand points loaded: {sum(len(v) for v in hand_by_key.values())}")
 
     # --- SMPL-X fit ---
     print("Loading SMPL-X fit...")
@@ -291,7 +326,49 @@ def render_turntable(
         torch.cuda.empty_cache()
 
         bg_buf[:] = bg_np
-        bg_buf[mask_np] = color_np[:, :, ::-1][mask_np]
+        frame_bgr = color_np[:, :, ::-1]
+        if mesh_alpha >= 1.0:
+            bg_buf[mask_np] = frame_bgr[mask_np]
+        else:
+            alpha_f = np.float32(mesh_alpha)
+            bg_buf[mask_np] = (alpha_f * frame_bgr[mask_np].astype(np.float32)
+                               + (1 - alpha_f) * bg_np).clip(0, 255).astype(np.uint8)
+
+        # --- Skeleton overlay ---
+        if skel_by_key:
+            fk = str(data["frame_keys"][fi])
+            if fk in skel_by_key:
+                lms_3d = skel_by_key[fk]
+                R_t = np.asarray(R_v, dtype=np.float32)
+                t_t = np.asarray(t_v, dtype=np.float32)
+                K_t = np.asarray(K_render, dtype=np.float32)
+                pts2d = {}
+                for idx, p3d in lms_3d.items():
+                    pc = R_t @ p3d + t_t
+                    if pc[2] < 0.01:
+                        continue
+                    px = K_t[0, 0] * pc[0] / pc[2] + K_t[0, 2]
+                    py = K_t[1, 1] * pc[1] / pc[2] + K_t[1, 2]
+                    py_flip = render_h - 1 - py  # match verts_to_clip Y-flip
+                    if 0 <= px < render_w and 0 <= py_flip < render_h:
+                        pts2d[idx] = (int(px), int(py_flip))
+                for a, b in BODY_SKELETON:
+                    if a in pts2d and b in pts2d:
+                        cv2.line(bg_buf, pts2d[a], pts2d[b], (50, 220, 50), 3, cv2.LINE_AA)
+                for pt in pts2d.values():
+                    cv2.circle(bg_buf, pt, 6, (255, 80, 0), -1, cv2.LINE_AA)
+        # Hand keypoints
+        if hand_by_key and fk in hand_by_key:
+            for p3d in hand_by_key[fk]:
+                pc = R_t @ p3d + t_t
+                if pc[2] < 0.01:
+                    continue
+                px = K_t[0, 0] * pc[0] / pc[2] + K_t[0, 2]
+                py = K_t[1, 1] * pc[1] / pc[2] + K_t[1, 2]
+                py_flip = render_h - 1 - py
+                if 0 <= px < render_w and 0 <= py_flip < render_h:
+                    cv2.circle(bg_buf, (int(px), int(py_flip)), 4, (0, 120, 255), -1, cv2.LINE_AA)
+
         writer.write(bg_buf)
         del color_np, mask_np
 
@@ -324,6 +401,11 @@ def main():
     parser.add_argument("--render-size",  type=int, default=1080,
                         help="Square render resolution (default 1080)")
     parser.add_argument("--fps",          type=int, default=30)
+    parser.add_argument("--alpha",        type=float, default=1.0,
+                        help="Mesh opacity 0–1 (default 1.0 = fully opaque).")
+    parser.add_argument("--skeleton",     default=None,
+                        help="Path to reconstruction_body.json for skeleton overlay. "
+                             "Auto-detected from --smplx-npz location if 'auto'.")
     args = parser.parse_args()
 
     output = args.output or args.smplx_npz.replace("smplx_params.npz", "turntable.mp4")
@@ -331,6 +413,12 @@ def main():
     flat_color = None
     if args.flat_color:
         flat_color = tuple(int(x) for x in args.flat_color.split(","))
+    skeleton_path = args.skeleton
+    if skeleton_path == "auto":
+        import os as _os
+        skeleton_path = _os.path.join(
+            _os.path.dirname(_os.path.dirname(args.smplx_npz)),
+            "reconstruction_body.json")
 
     render_turntable(
         smplx_npz=args.smplx_npz,
@@ -344,6 +432,8 @@ def main():
         render_h=args.render_size,
         fps=args.fps,
         flat_color=flat_color,
+        mesh_alpha=args.alpha,
+        skeleton_path=skeleton_path,
     )
 
 
