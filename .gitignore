@@ -7,9 +7,17 @@
 *.mp4
 *.mjpeg
 *.json
+*.npz
+*.png
 
 *.h5
 recordings/*
 logs/*
 models/
 install.cmd
+v3/*
+output/*
+legacy/*
+ir_out/*
+ir_pipeline/*
+ir_recordings/*

@@ -443,6 +443,100 @@ cell), which is kept but not documented separately here.
   `/tmp/*` scripts that aren't part of this repo, so they aren't runnable as
   committed — kept for reference only.
 
+## Full offline pipeline — from take to SMPL-X fit
+
+All commands run from `/home/fmalmb/CODE/oak_recorder` in the `oak_env` conda env.
+
+### Step 1 — Align frames
+
+```
+python align_session.py /mnt/recordings/<session>/<take>
+```
+
+Writes `<take>/aligned/cam*/XXXXXX.jpg` + `alignment_report.json`.
+Uses `device_ts_s` (depthai hardware clock) by default — this is accurate to
+sub-frame for cameras on the same host.
+
+**Flash-based alignment (takes with LED sync marker):** run `detect_flash.py`
+first to measure per-camera onset offsets, then write aligned frames manually
+(e.g. via a local mirror directory with symlinks to the MJPEG files, with
+`align_session.py` given that local path). The LED double-flash approach
+gives an independent, pixel-level alignment ground truth that can verify or
+correct timestamp-based alignment. Corrected offsets for `20260925_153809/take_3`:
+
+| Camera | Onset offset vs cam0 |
+|--------|----------------------|
+| cam0   | 0 (reference)        |
+| cam1   | 0                    |
+| cam2   | +1 fr               |
+| cam3   | 0                    |
+| cam4   | −2 fr               |
+| cam5   | −4 fr               |
+| cam6   | unknown (LED not detected) |
+
+**SMB read-only:** `align_session.py` writes into the take directory; if the
+SMB share is mounted read-only, create a local take_dir with symlinks to the
+MJPEG + log files and run align there.
+
+### Step 2 — Pose 2D extraction (MediaPipe)
+
+```
+python -m pose2d.run_pipeline <take_dir> \
+    --calib output/calibration/<calib>.json
+```
+
+Reads `<take_dir>/aligned/cam*/XXXXXX.jpg`.
+Writes detection + tracking output to `<take_dir>/aligned/pose2d/`.
+Use `pose2d.run_pipeline_dwpose` for DWPose instead (writes to `pose2d_dwpose/`).
+
+### Step 3 — Triangulation
+
+```
+python -m pose2d.triangulation <take_dir> \
+    --calib output/calibration/<calib>.json
+```
+
+Reads `<take_dir>/aligned/pose2d/`.
+Writes `reconstruction_body.json`, `reconstruction_left.json`,
+`reconstruction_right.json`, and per-part diagnostics to the same folder.
+Pass `--pose2d-dir pose2d_dwpose` to triangulate DWPose detections instead.
+
+Reports per-part inlier reprojection error; typical on a well-calibrated rig
+is 3–5 mm. Residuals significantly above that indicate calibration drift.
+
+### Step 4 — SMPL-X body fit
+
+```
+python -m smplx_fit.fit_take <take_dir> \
+    --model-path models/SMPLX \
+    --calib output/calibration/<calib>.json \
+    [--use-silhouette] [--frames START:END]
+```
+
+Reads triangulated 3D keypoints from step 3.
+Writes `smplx_params.npz`, `optimization_log.json`, `fit_config.json` to
+`<take_dir>/aligned/pose2d/smplx/`.
+
+Reference run (`20260908_174819/take_1`):
+- Calibration: `output/calibration/20260908_174749_7cam.json`
+- Flags used: `--use-silhouette` (adds silhouette overlap term in stage 3)
+- Result: `smplx_params.npz` at `/mnt/recordings/20260908_174819/take_1/aligned/pose2d/smplx/`
+
+### Step 5 — Optional: texture bake + turntable
+
+See full CLI in `smplx_fit/texture_bake.py` module docstring.
+Camera recipe: cam0 + cam2 + cam3 for body, cam0-only for face; 3-pass
+winner-take-all bake. See memory entry `project_texture_bake_setup.md`.
+
+### Calibration
+
+Most recent calibration: `output/calibration/20260908_183729_7cam.json`
+(calibrated 2026-09-08, all 7 cameras, full intrinsics + distortion + extrinsics).
+Older calibrations in the same folder. Calibration drifts over time —
+if reprojection error in step 3 is high, recalibrate with `calibrate.py`.
+
+---
+
 ## Next steps / ideas
 
 Not implemented -- notes from a design discussion, kept here so the reasoning

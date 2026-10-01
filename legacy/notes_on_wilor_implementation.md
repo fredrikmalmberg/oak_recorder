@@ -190,3 +190,138 @@ Takeaways:
   MediaPipe landmarks for that hand at all (see per-camera `mp_landmarks` coverage,
   e.g. cam01 hand=R only has landmarks on 10/50 frames) -- a detection-coverage gap,
   not a triangulation failure.
+
+### v3 package refactor (source of truth)
+
+The hand pipeline above has been extracted into a reusable `v3/` package
+(`v3/calibration.py`, `v3/keypoints_io.py`, `v3/hand_detection.py`,
+`v3/triangulation.py`, `v3/smoothing.py`, `v3/skeletons.py`,
+`v3/visualization.py`), generalized over a leading "instance" axis (empty for
+single-instance body keypoints, `(2,)` for left/right hands) and over
+`n_joints` (21 for hands, 33 for MediaPipe Pose body landmarks).
+`ransac_keypoint_reconstruction.ipynb` is now regenerated from
+`v3/notebooks/build_hand_notebook.py` (`python -m v3.notebooks.build_hand_notebook`);
+the old `/tmp/build_ransac_keypoint_notebook.py` is no longer used. The v3
+port was verified bit-for-bit equivalent to the original source-string code
+on the cached `ransac_keypoint_detections.npz` (detection arrays and all
+triangulation/smoothing/jitter/SG outputs).
+
+One pre-existing discrepancy noted during verification: re-running the
+*original* (pre-v3) code on the current `ransac_keypoint_detections.npz`
+gives right-hand inlier-camera mean=2.36 (vs. 2.33 above) and mean
+reprojection error 24.3px (vs. 23.6px above), with wrist-residual
+median≈17.7px (vs. ≈17.8px). Since the original code reproduces the same
+numbers as v3 on this npz, the discrepancy is a stale-cache artifact (the npz
+was regenerated at some point after the numbers above were written), not a
+v3 porting bug.
+
+## v3: body keypoint triangulation (frames 0-127)
+
+`body_keypoint_reconstruction.ipynb` (source `v3/notebooks/build_body_notebook.py`)
+applies the same RANSAC-triangulation + Kalman/RTS-smoothing + Savitzky-Golay/2x
+pipeline to the 33-landmark MediaPipe Pose body keypoints from
+`extracted_2d_keypoints.json`'s `'body'` field, for the full 128-frame range
+(0-127), single instance (no left/right split). The RANSAC seed point is the
+hip-center (pixel-space midpoint of `left_hip`=23 and `right_hip`=24),
+analogous to SMPL-X's pelvis joint.
+
+**Presence**: cam00 is missing body landmarks on 4/128 frames (49, 85, 87, 88);
+all other cameras have 128/128. This matches the plan's expectation and never
+drops a frame below 6 cameras, so RANSAC is unaffected.
+
+**Threshold choice**: kept `RANSAC_REPROJ_THRESH_PX=50.0`, same as the hand
+pipeline -- the empirical-check criteria from the plan (frames with `<2`
+inliers, or residuals close to/over 50px) don't trigger: all 128/128 frames
+are valid, and the hip-center residual distribution (mean=17.6px,
+median=17.0px, max=47.2px) is essentially identical to the hands' wrist
+residuals (mean=19.7px, median=17.8px, max=48.4px) and sits comfortably under
+50px. (For reference, 75px and 100px thresholds were also tried: both still
+give 128/128 valid with more inlier cameras (mean 2.44 and 3.09 respectively)
+but push the hip-center residual mean to 28.0px / 48.4px -- the 100px residual
+mean is right at the hands' threshold, so 50px was kept.)
+
+**Results** (`RANSAC_REPROJ_THRESH_PX=50.0`):
+- 128/128 frames valid; inlier cameras min=2, mean=2.12, max=3 (histogram:
+  112 frames with 2 inliers, 16 with 3).
+- mean reprojection error across all 33 joints: 52.5px (higher than the
+  hip-center's own 17.6px mean -- limb/extremity landmarks disagree across
+  cameras more than the central hip does; this is informational, not a
+  validity criterion).
+- hip-center RANSAC residual (px): mean=17.6, median=17.0, max=47.2.
+- hysteresis kept the previous frame's camera set on 27/128 valid frames.
+
+**Smoothing** (`min_inliers_base=3`, same as hands -- n_inliers is in {2,3}
+here too, so 112/128 frames get the larger 2-camera measurement uncertainty):
+- Kalman/RTS correction on hip-center: mean=2.10cm, median=0.76cm,
+  max=9.98cm.
+- jitter flagging (raw vs. smoothed hip-center, MAD factor 4.0): 36/128
+  frames flagged (median residual 0.76cm, threshold 2.81cm, max 9.98cm).
+- Savitzky-Golay correction on hip-center: mean=0.865cm, max=4.914cm;
+  255/255 frames valid at 2x rate.
+
+These corrections/jitter rates are noticeably larger than the hands' (Kalman
+mean 0.15-1.62cm, 0/46-2/42 jitter-flagged), which is expected: the hip-center
+is a lower-precision MediaPipe landmark (low-texture, often clothing-occluded)
+than the wrist, and full-body motion over 128 frames covers much larger
+excursions than the 50-frame hand clip. No retuning was done in response to
+this -- it reflects real data characteristics, not a pipeline issue.
+
+Saves `body_keypoint_3d.npz` (gitignored via the repo's blanket `*.npz` rule)
+with `joints3d`/`valid`/`n_inliers`/`reproj_err` (128-frame rate) and their
+smoothed/SG/2x counterparts, for Phase 3's SMPL-X fit.
+
+## v3: SMPL-X body-only fit (smplx_body_fit.ipynb)
+
+`smplx_body_fit.ipynb` (source `v3/notebooks/build_smplx_notebook.py`) fits
+an SMPL-X body model to the triangulated body joints from `body_keypoint_3d.npz`.
+
+**Setup**: `smplx.create(model_path='/home/fmalmb/CODE/smplx_debug',
+model_type='smplx', gender='neutral', use_pca=False, flat_hand_mean=True,
+num_betas=10, batch_size=1)` — neutral gender, body-only (no hand/face pose
+optimized), `output.joints[0:22]` used for correspondence.
+
+**Joint correspondences** (`v3.smplx_body_fit.JOINT_CORRESPONDENCES`, 15 entries):
+- Direct pairs, weight 1.0: shoulders (MP 11→SMPLX 16, 12→17), elbows
+  (13→18, 14→19), wrists (15→20, 16→21), hips (23→1, 24→2), knees (25→4,
+  26→5), ankles (27→7, 28→8).
+- Synthetic midpoint, weight 1.0: pelvis from (hip_L, hip_R) midpoint → SMPLX 0.
+- Synthetic midpoint, weight 0.5: neck from (shoulder_L, shoulder_R) midpoint → SMPLX 12.
+- Direct, weight 0.3: head from nose (0) → SMPLX 15.
+
+**Optimizer**: Adam, lr=0.05, N_ITERS=300, w_betas=1e-2, w_pose=1e-3,
+init transl = pelvis target (calibration-world coordinates). Independent fit per
+frame (no warm-starting).
+
+**Representative frames**: 5 frames drawn from those with max n_inliers (==3)
+and no jitter-flag: [46, 61, 64, 74, 86].
+
+**Results** (per-joint residuals averaged over 5 frames):
+
+| Joint          | Residual (mean mm, 5 frames)     |
+|----------------|----------------------------------|
+| wrists         | ~5-19mm (smallest)               |
+| elbows/knees   | ~9-37mm                          |
+| shoulders      | ~31-56mm                         |
+| ankles         | ~10-93mm (variable)              |
+| hips           | ~67-129mm (systematically large) |
+| pelvis         | ~71-102mm                        |
+| neck/head      | ~14-58mm                         |
+
+Mean residual across frames: ~43-46mm.
+
+**Interpretation**: Wrist/elbow/knee residuals are small-moderate (5-37mm),
+consistent with the optimizer having degrees of freedom (body_pose) to match
+those joints closely. Hip and pelvis residuals are large (67-129mm) by design
+— MediaPipe hip landmarks are surface points (greater trochanter area) while
+SMPL-X hip/pelvis joints are internal skeletal joints; this geometric offset
+(~10cm) is expected and is NOT a correspondence-table bug (it's symmetric
+between left/right and consistent across frames). Ankle variability reflects
+foot/ankle pose being harder to constrain from the limited number of landmarks
+and ankle-joint geometry differences (MediaPipe ankle ≠ SMPL-X ankle joint
+center).
+
+The optimizer runs forward passes through the smplx package installed at
+`~/.local/lib/python3.10/site-packages/smplx/`, which has a leftover debug
+`print(betas.device, shapedirs.device, full_pose.device)` call on every
+forward pass (body_models.py:1230). `v3.smplx_body_fit.fit_frame` suppresses
+this via `contextlib.redirect_stdout` to keep the notebook output clean.
