@@ -192,7 +192,7 @@ def run_multi_skeleton_player(server, reconstructions, fps=15.0, smplx_mesh=None
         print("Viewer interrupted.")
 
 
-def setup_app_style_scene(server):
+def setup_app_style_scene(server, floor_y=0.0):
     """Ports calibrate.ViserManager.__init__/add_view_controls/the floor-grid
     setup (calibrate.py:1176-1212, 1300-1319) as standalone code, so this
     viewer looks and controls the same as app.py's live 3D view. The FOV
@@ -200,6 +200,11 @@ def setup_app_style_scene(server):
     connects later, same broadcast-plus-on_client_connect pattern as the
     original. Returns the floor grid handle (already visible=True here --
     see module docstring for why that differs from app.py's default).
+
+    floor_y: world Y coordinate of the floor plane (Y is the up axis when the
+    calibration has not had world-alignment applied -- "Set down direction from
+    board" was NOT run). Pass the minimum Y vertex from the SMPL-X mesh if
+    available, otherwise 0.
     """
     server.gui.configure_theme(dark_mode=True)
     server.scene.set_background_image(np.zeros((2, 2, 3), dtype=np.uint8))
@@ -221,8 +226,16 @@ def setup_app_style_scene(server):
             lambda client: setattr(client.camera, "fov", math.radians(fov_slider.value))
         )
 
+    # Calibrations without world-alignment (no "Set down direction from board") are in
+    # OpenCV camera convention: +Y = camera-image-down = physically DOWN, -Y = physically UP.
+    # Tell viser so orbit navigation feels natural.
+    server.scene.set_up_direction((0.0, -1.0, 0.0))
+
+    # floor_y is the physically-lowest point (maximum Y in world, since +Y is down).
+    # plane="xz" is horizontal in this frame (perpendicular to the Y axis).
     floor_grid = server.scene.add_grid(
-        "/floor_grid", width=20.0, height=20.0, cell_size=0.5, plane="xy", visible=True,
+        "/floor_grid", width=20.0, height=20.0, cell_size=0.5, plane="xz",
+        position=(0.0, floor_y, 0.0), visible=True,
         plane_color=(220, 220, 220), plane_opacity=0.6, shadow_opacity=0.4,
     )
     return floor_grid
@@ -231,26 +244,41 @@ def setup_app_style_scene(server):
 def launch_3d_viewer(
     take_dir, calib_path, parts, port, fps, use_smoothed, pose2d_dir="pose2d",
     smplx_npz=None, smplx_model_path=None, frame_range=None, smplx_hide_lower_body=False,
-    smplx_hide_hips=False,
+    smplx_hide_hips=False, ref_calib_path=None,
 ):
     calib = calibrate.load_calibration_output(calib_path)
     reconstructions = load_reconstructions(take_dir, parts, use_smoothed, pose2d_dir=pose2d_dir)
 
-    server = hmv.start_viser_server(port=port)
-    setup_app_style_scene(server)
-    cam_ids = list(calib.keys())
-    if cam_ids:
-        poses = {cam_id: (calib[cam_id]["R"], calib[cam_id]["t"]) for cam_id in cam_ids}
-        sample = calib[cam_ids[0]]
-        hmv.add_camera_frustums(server, poses, sample["K"], sample["width"], sample["height"])
-
     smplx_mesh = None
+    floor_y = 0.0
     if smplx_npz is not None:
         print(f"Loading SMPL-X fit from {smplx_npz}...")
         smplx_mesh = load_smplx_mesh_sequence(smplx_npz, smplx_model_path,
                                                hide_lower_body=smplx_hide_lower_body,
                                                hide_pelvis=smplx_hide_hips)
         print(f"SMPL-X mesh covers {len(smplx_mesh[0])} frame(s).")
+        # Calibrations without world-alignment use +Y = physically down (OpenCV convention).
+        # The floor (feet contact) is at the MAXIMUM Y vertex across all frames.
+        all_verts = np.concatenate(list(smplx_mesh[0].values()), axis=0)
+        floor_y = float(np.max(all_verts[:, 1]))
+        print(f"Floor Y estimated from SMPL-X vertices: {floor_y:.3f}")
+
+    server = hmv.start_viser_server(port=port)
+    setup_app_style_scene(server, floor_y=floor_y)
+    cam_ids = list(calib.keys())
+    if cam_ids:
+        poses = {cam_id: (calib[cam_id]["R"], calib[cam_id]["t"]) for cam_id in cam_ids}
+        sample = calib[cam_ids[0]]
+        hmv.add_camera_frustums(server, poses, sample["K"], sample["width"], sample["height"])
+
+    if ref_calib_path is not None:
+        print(f"Loading reference calibration from {ref_calib_path}...")
+        ref_calib = calibrate.load_calibration_output(ref_calib_path)
+        ref_cam_ids = list(ref_calib.keys())
+        if ref_cam_ids:
+            ref_poses = {f"ref/{cam_id}": (ref_calib[cam_id]["R"], ref_calib[cam_id]["t"]) for cam_id in ref_cam_ids}
+            ref_sample = ref_calib[ref_cam_ids[0]]
+            hmv.add_camera_frustums(server, ref_poses, ref_sample["K"], ref_sample["width"], ref_sample["height"])
 
     frame_counts = ", ".join(f"{p}={len(reconstructions[p])}" for p in parts)
     print(
@@ -296,6 +324,10 @@ def main():
         "--smplx-hide-hips", action="store_true",
         help="Also drop the pelvis/hip region (glutes, lower abdomen). Requires --smplx-hide-lower-body.",
     )
+    parser.add_argument(
+        "--ref-calib", default=None,
+        help="Optional second calibration JSON to overlay as reference camera frustums (shown in orange).",
+    )
     args = parser.parse_args()
     parts = [p.strip() for p in args.part.split(",") if p.strip()]
     frame_range = None
@@ -306,7 +338,7 @@ def main():
         args.take_dir, args.calib, parts, args.port, args.fps, use_smoothed=not args.raw,
         pose2d_dir=args.pose2d_dir, smplx_npz=args.smplx_npz, smplx_model_path=args.smplx_model_path,
         frame_range=frame_range, smplx_hide_lower_body=args.smplx_hide_lower_body,
-        smplx_hide_hips=args.smplx_hide_hips,
+        smplx_hide_hips=args.smplx_hide_hips, ref_calib_path=args.ref_calib,
     )
 
 

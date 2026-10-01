@@ -81,6 +81,7 @@ def summarize_fit_quality(params, model, full_layout, target_points, confidence)
 def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, max_outer_iters, force,
             pose_prior_backend="l2", pose_prior_weight=None,
             gmm_prior_path=pose_prior.DEFAULT_GMM_PATH, hand_reg_weight=0.0001,
+            shape_reg_weight=1.0, hand_smooth_weight=0.1, body_smooth_weight=5.0, max_stage=5,
             use_silhouette=False, silhouette_weight=2.0, calib_path=None,
             silhouette_out_size=(256, 144), silhouette_n_samples=1500,
             silhouette_sigma_px=1.0, use_silhouette_shape=False,
@@ -155,6 +156,8 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         max_outer_iters=max_outer_iters, num_betas=num_betas,
         pose_prior_backend=pose_prior_backend, gmm_prior_path=gmm_prior_path,
         pose_prior_weight=pose_prior_weight, hand_reg_weight=hand_reg_weight,
+        shape_reg_weight=shape_reg_weight, hand_smooth_weight=hand_smooth_weight,
+        body_smooth_weight=body_smooth_weight, max_stage=max_stage,
         device=device,
         **silhouette_kwargs,
     )
@@ -222,6 +225,17 @@ def main():
     parser.add_argument("--hand-reg-weight", type=float, default=0.0001,
                          help="Independent L2 weight for hand pose regularization (default: 0.0001, "
                               "today's value). Never touched by --pose-prior.")
+    parser.add_argument("--hand-smooth-weight", type=float, default=0.1,
+                         help="Weight on temporal smoothness for hand pose (default: 0.1). "
+                              "Set to 0.0 to disable smoothness and allow per-frame hand fitting.")
+    parser.add_argument("--body-smooth-weight", type=float, default=5.0,
+                         help="Weight on temporal smoothness for body joint rotations in stages 4/5 (default: 5.0).")
+    parser.add_argument("--max-stage", type=int, default=5,
+                         help="Stop after this stage (1-5, default: 5). E.g. 3 skips hand fitting stages 4 and 5.")
+    parser.add_argument("--shape-reg-weight", type=float, default=1.0,
+                         help="Multiplier on the beta shape regularization (default: 1.0). "
+                              "Lower values (e.g. 0.01) let betas move further from zero, "
+                              "allowing hand/body size to adapt more freely to the keypoints.")
     parser.add_argument("--use-silhouette", action="store_true",
                          help="Phase 3: add a silhouette-overlap term to Stage 3 (body pose) only, "
                               "using cached Phase 2 masks (see smplx_fit.segmentation). Off by default "
@@ -258,6 +272,9 @@ def main():
         args.frames, args.max_outer_iters, args.force,
         pose_prior_backend=args.pose_prior_backend, pose_prior_weight=args.pose_prior_weight,
         gmm_prior_path=args.gmm_prior_path, hand_reg_weight=args.hand_reg_weight,
+        shape_reg_weight=args.shape_reg_weight,
+        hand_smooth_weight=args.hand_smooth_weight,
+        body_smooth_weight=args.body_smooth_weight, max_stage=args.max_stage,
         use_silhouette=args.use_silhouette, use_silhouette_shape=args.use_silhouette_shape,
         silhouette_weight=args.silhouette_weight,
         calib_path=args.calib_path, silhouette_out_size=(sil_w, sil_h),

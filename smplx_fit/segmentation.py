@@ -311,6 +311,7 @@ def extract_masks_rvm(take_dir, calib, cam_ids=None, force=False,
             crop = img[y1:y2, x1:x2]
             if crop.size == 0:
                 crop = img
+                x1, y1, x2, y2 = 0, 0, cam_w, cam_h
 
             crop_rs = cv2.resize(crop, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
             # BGR → RGB, HWC → CHW, [0,1] float

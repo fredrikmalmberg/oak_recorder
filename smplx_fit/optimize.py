@@ -252,7 +252,8 @@ def multi_stage_optimize(
     model, target_points_np, confidence_np, full_layout,
     max_outer_iters=10, rel_tol=1e-9, num_betas=20,
     pose_prior_backend="l2", gmm_prior_path=pose_prior.DEFAULT_GMM_PATH,
-    pose_prior_weight=0.01, hand_reg_weight=0.0001,
+    pose_prior_weight=0.01, hand_reg_weight=0.0001, shape_reg_weight=1.0,
+    hand_smooth_weight=0.1, body_smooth_weight=5.0, max_stage=5,
     use_silhouette=False, silhouette_weight=2.0, silhouette_cams=None,
     silhouette_masks=None, silhouette_valid=None, silhouette_n_samples=1500,
     silhouette_sigma_px=1.0, use_silhouette_shape=False,
@@ -373,10 +374,12 @@ def multi_stage_optimize(
         rest_points = smplx_model.predict_all_points(rest_output, full_layout)[0]
         shape3d, _ = losses.shape3d_loss(target_points, confidence, rest_points, layout_index_by_local_id)
         reg_shape = losses.l2_regularization(params.betas)
-        total = shape3d * 10000.0 + reg_shape * 1.0
+        total = shape3d * 10000.0 + reg_shape * shape_reg_weight
         return total, {"shape3d": float(shape3d.item()), "reg_shape": float(reg_shape.item())}
 
     log["stages"]["1_shape"], _ = _run_lbfgs_stage("1_shape", [params.betas], stage1_loss, max_outer_iters, rel_tol)
+    if max_stage <= 1:
+        return params, log
 
     # ---- Stage 2: Global rotation + translation ------------------------
     # Unfrozen: global_orient, transl. Frozen: betas (from stage 1),
@@ -402,6 +405,8 @@ def multi_stage_optimize(
         "2_global_rt", [params.global_orient, params.transl], stage2_loss, max_outer_iters, rel_tol,
     )
     log["up_axis_check"] = _check_up_axis(params, model)
+    if max_stage <= 2:
+        return params, log
 
     # ---- Stage 3: Body pose + shape (joint) --------------------------------
     # Unfrozen: body_pose, global_orient, transl, AND betas. betas is (1,
@@ -417,14 +422,15 @@ def multi_stage_optimize(
         k3d, _ = losses.weighted_keypoint_loss(pred, target_points, confidence, mask=body_mask)
         smooth_transl = losses.temporal_smoothness_loss(params.transl)
         smooth_go = losses.temporal_smoothness_loss(params.global_orient)
+        smooth_body = losses.temporal_smoothness_loss(params.body_pose)
         reg_pose = body_pose_prior_loss(params.body_pose)
         reg_shape = losses.l2_regularization(params.betas)
-        total = (k3d * 1.0 + smooth_transl * 0.5 + smooth_go * 0.1
-                 + reg_pose * pose_prior_weight + reg_shape * 0.1)
+        total = (k3d * 1.0 + smooth_transl * 0.5 + smooth_go * 0.1 + smooth_body * body_smooth_weight
+                 + reg_pose * pose_prior_weight + reg_shape * (shape_reg_weight * 0.1))
         breakdown = {
             "k3d": float(k3d.item()), "smooth_transl": float(smooth_transl.item()),
-            "smooth_global_orient": float(smooth_go.item()), "reg_pose": float(reg_pose.item()),
-            "reg_shape": float(reg_shape.item()),
+            "smooth_global_orient": float(smooth_go.item()), "smooth_body_pose": float(smooth_body.item()),
+            "reg_pose": float(reg_pose.item()), "reg_shape": float(reg_shape.item()),
         }
         if use_silhouette:
             sil_loss, n_pairs = sil.compute_silhouette_term(
@@ -440,6 +446,8 @@ def multi_stage_optimize(
         "3_body_pose", [params.global_orient, params.transl, params.body_pose, params.betas],
         stage3_loss, max_outer_iters, rel_tol,
     )
+    if max_stage <= 3:
+        return params, log
 
     # (stage 3b betas-only removed -- replaced by stage 6 joint refinement below)
 
@@ -469,18 +477,20 @@ def multi_stage_optimize(
         k3d_hand, _ = losses.weighted_keypoint_loss(pred, target_points, confidence, mask=hand_mask)
         smooth_body = losses.temporal_smoothness_loss(params.body_pose)
         smooth_hand = losses.temporal_smoothness_loss(params.lhand_pose) + losses.temporal_smoothness_loss(params.rhand_pose)
+        smooth_transl = losses.temporal_smoothness_loss(params.transl)
         reg_pose = body_pose_prior_loss(params.body_pose)
         reg_hand = losses.l2_regularization(params.lhand_pose) + losses.l2_regularization(params.rhand_pose)
-        total = (k3d * 1.0 + k3d_hand * 10.0 + smooth_body * 5.0 + smooth_hand * 0.1
-                 + reg_pose * pose_prior_weight + reg_hand * hand_reg_weight)
+        total = (k3d * 1.0 + k3d_hand * 10.0 + smooth_body * body_smooth_weight + smooth_hand * hand_smooth_weight
+                 + smooth_transl * 5.0 + reg_pose * pose_prior_weight + reg_hand * hand_reg_weight)
         return total, {
             "k3d": float(k3d.item()), "k3d_hand": float(k3d_hand.item()),
             "smooth_body_pose": float(smooth_body.item()), "smooth_hand_pose": float(smooth_hand.item()),
+            "smooth_transl": float(smooth_transl.item()),
             "reg_pose": float(reg_pose.item()), "reg_hand": float(reg_hand.item()),
         }
 
     log["stages"]["4_hands_and_body"], _ = _run_lbfgs_stage(
-        "4_hands_and_body", [params.body_pose, params.lhand_pose, params.rhand_pose],
+        "4_hands_and_body", [params.body_pose, params.lhand_pose, params.rhand_pose, params.transl],
         stage4_loss, max_outer_iters, rel_tol,
     )
 
@@ -538,7 +548,7 @@ def multi_stage_optimize(
                 silhouette_cams, silhouette_masks, silhouette_valid, sigma_px=silhouette_sigma_px,
             )
             total = (k3d * 1.0 + smooth_transl * 0.5 + smooth_go * 0.1
-                     + reg_shape * 0.1 + reg_pose * pose_prior_weight
+                     + reg_shape * (shape_reg_weight * 0.1) + reg_pose * pose_prior_weight
                      + sil_loss * silhouette_weight)
             return total, {
                 "k3d": float(k3d.item()),
