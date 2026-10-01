@@ -1750,6 +1750,209 @@ def apply_confidence_penalty(confidence, flags, penalty_factor=0.01):
     return new_confidence, n_penalized
 
 
+# ---------------------------------------------------------------------------
+# Extended correction signals: trajectory-continuity flip, 3-D body-wrist
+# projection, and false-detection hard gate.
+# ---------------------------------------------------------------------------
+
+def detect_trajectory_flips_sequence(
+    left_landmarks, right_landmarks, frame_keys, camera_ids, width, height,
+    wrist_id=0, velocity_thresh_px=100.0, swap_margin_px=30.0, gap_reset_frames=5,
+):
+    """Frame-to-frame trajectory-continuity flip detector.
+
+    Maintains a per-camera, per-side wrist anchor across frames and flags when
+    swapping the left↔right assignment fits the trajectory better than the
+    as-labeled assignment by more than ``swap_margin_px``:
+
+        d_same = dist(curr_L, anchor_L) + dist(curr_R, anchor_R)
+        d_swap = dist(curr_L, anchor_R) + dist(curr_R, anchor_L)
+        swap_detected = d_swap < d_same - swap_margin_px
+
+    Unlike body-wrist and LOO tests, this needs no external reference or second
+    camera — it catches flips that repeat over runs of frames where body-pose
+    wrists are absent and no LOO consensus exists.
+
+    Anchor updates are gated by ``velocity_thresh_px``: if the new position
+    exceeds that radius from the anchor its slot would update, the anchor stays
+    unchanged (rather than being poisoned by a bad detection).  When a swap is
+    detected the anchors are updated with the positions crossed (anchor_L ←
+    curr_R_px, anchor_R ← curr_L_px) so that the tracking continues correctly
+    after a corrected flip.  Anchors for a side reset after ``gap_reset_frames``
+    consecutive frames without an in-radius update.
+
+    Returns dict[cam_id][frame_key] → {'swap_detected', 'd_same', 'd_swap',
+    'margin'}.  Only includes entries where both sides have a current detection
+    *and* both anchors are established (the first frame that seeds them is not
+    returned as a result).
+    """
+    wrist_key = str(wrist_id)
+    results = {}
+
+    for cam_id in camera_ids:
+        anchor_l = None
+        anchor_r = None
+        gap_l = 0
+        gap_r = 0
+
+        for fk in frame_keys:
+            obs_l = left_landmarks.get(cam_id, {}).get(fk, {}).get(wrist_key)
+            obs_r = right_landmarks.get(cam_id, {}).get(fk, {}).get(wrist_key)
+            curr_l = (np.array([obs_l[0] * width, obs_l[1] * height], dtype=np.float64)
+                      if obs_l is not None else None)
+            curr_r = (np.array([obs_r[0] * width, obs_r[1] * height], dtype=np.float64)
+                      if obs_r is not None else None)
+
+            # Reset a side's anchor after too many missed frames.
+            if gap_l >= gap_reset_frames:
+                anchor_l = None
+            if gap_r >= gap_reset_frames:
+                anchor_r = None
+
+            # Seed anchors on the first frame with both hands present.
+            if anchor_l is None or anchor_r is None:
+                if curr_l is not None and curr_r is not None:
+                    anchor_l, anchor_r = curr_l.copy(), curr_r.copy()
+                    gap_l = gap_r = 0
+                else:
+                    gap_l = gap_l + 1 if curr_l is None else 0
+                    gap_r = gap_r + 1 if curr_r is None else 0
+                continue
+
+            # Can only compare the swap hypothesis when both hands are present.
+            if curr_l is None or curr_r is None:
+                if curr_l is None:
+                    gap_l += 1
+                else:
+                    if np.linalg.norm(curr_l - anchor_l) <= velocity_thresh_px:
+                        anchor_l = curr_l.copy()
+                        gap_l = 0
+                    else:
+                        gap_l += 1
+                if curr_r is None:
+                    gap_r += 1
+                else:
+                    if np.linalg.norm(curr_r - anchor_r) <= velocity_thresh_px:
+                        anchor_r = curr_r.copy()
+                        gap_r = 0
+                    else:
+                        gap_r += 1
+                continue
+
+            d_same = float(np.linalg.norm(curr_l - anchor_l) + np.linalg.norm(curr_r - anchor_r))
+            d_swap = float(np.linalg.norm(curr_l - anchor_r) + np.linalg.norm(curr_r - anchor_l))
+            swap_detected = d_swap < d_same - swap_margin_px
+
+            results.setdefault(cam_id, {})[fk] = {
+                'swap_detected': swap_detected,
+                'd_same': d_same,
+                'd_swap': d_swap,
+                'margin': d_same - d_swap,
+            }
+
+            # Update anchors; cross them when a swap is detected.
+            new_anchor_l = curr_r if swap_detected else curr_l
+            new_anchor_r = curr_l if swap_detected else curr_r
+            if np.linalg.norm(new_anchor_l - anchor_l) <= velocity_thresh_px:
+                anchor_l = new_anchor_l.copy()
+                gap_l = 0
+            else:
+                gap_l += 1
+            if np.linalg.norm(new_anchor_r - anchor_r) <= velocity_thresh_px:
+                anchor_r = new_anchor_r.copy()
+                gap_r = 0
+            else:
+                gap_r += 1
+
+    return results
+
+
+def project_body_wrists_3d_to_2d(
+    body_reconstruction, projection_matrices, camera_ids, frame_keys, width, height,
+    left_id=BODY_WRIST_COCO['left'], right_id=BODY_WRIST_COCO['right'],
+):
+    """Project triangulated 3-D body wrists into each camera's undistorted pixel space.
+
+    ``body_reconstruction`` is the dict[frame_key] → {lm_id_str: [x, y, z]}
+    produced by ``triangulate_sequence`` or ``triangulate_sequence_ransac`` for a
+    COCO-17 body model.  Returns a dict in the same schema as a raw
+    ``landmarks_body`` argument (dict[cam_id][frame_key] → {lm_id_str:
+    [x_norm, y_norm, 0.0]}) so it can be passed directly to
+    ``detect_body_wrist_hand_swaps_sequence`` as a more robust (all-camera-
+    aggregated) wrist reference instead of the noisy 2-D body-pose estimate.
+
+    Returned coordinates are in the undistorted normalized space (0–1) because
+    the projection matrices are P = K @ [R|t] and we divide by ``width`` /
+    ``height`` — consistent with the ``_u``-suffixed landmark dicts used by the
+    body-wrist swap detector.  Frames or landmark ids absent from the
+    reconstruction are silently skipped.
+    """
+    left_key = str(left_id)
+    right_key = str(right_id)
+    result = {}
+
+    for cam_id in camera_ids:
+        P = projection_matrices[cam_id]
+        for fk in frame_keys:
+            frame_pts = body_reconstruction.get(fk)
+            if frame_pts is None:
+                continue
+            entry = {}
+            for key, pt in ((left_key, frame_pts.get(left_key)), (right_key, frame_pts.get(right_key))):
+                if pt is None:
+                    continue
+                X = np.array([pt[0], pt[1], pt[2], 1.0], dtype=np.float64)
+                x_h = P @ X
+                if abs(x_h[2]) < 1e-9:
+                    continue
+                entry[key] = [x_h[0] / x_h[2] / width, x_h[1] / x_h[2] / height, 0.0]
+            if entry:
+                result.setdefault(cam_id, {})[fk] = entry
+
+    return result
+
+
+def gate_false_detections(
+    per_camera_reproj_left, per_camera_reproj_right,
+    confidence_left, confidence_right,
+    false_detect_thresh_px=200.0,
+):
+    """Hard-zero confidence for (camera, frame) pairs whose RANSAC wrist
+    reprojection error exceeds ``false_detect_thresh_px``.
+
+    ``per_camera_reproj_left`` and ``_right`` are per-camera reprojection error
+    dicts produced by ``ransac_per_camera_reproj_error`` (format:
+    dict[cam_id][frame_key] → float in pixels).  Any (camera, frame) whose
+    error exceeds the threshold on either side has its confidence zeroed on
+    *both* sides — the whole-body false detection (e.g. cam00 locking onto a
+    poster) makes both hand detections unreliable for that frame on that camera.
+
+    Returns (confidence_left, confidence_right, fake_flags) where
+    ``fake_flags[cam_id][frame_key] → bool`` records gated pairs — same shape
+    as entries in ``per_camera_flags`` for ``render_hand_grid_video``.
+    """
+    new_conf_left = copy.deepcopy(confidence_left)
+    new_conf_right = copy.deepcopy(confidence_right)
+    fake_flags = {}
+
+    gated = set()
+    for cam_id, by_frame in per_camera_reproj_left.items():
+        for fk, err in by_frame.items():
+            if err > false_detect_thresh_px:
+                gated.add((cam_id, fk))
+    for cam_id, by_frame in per_camera_reproj_right.items():
+        for fk, err in by_frame.items():
+            if err > false_detect_thresh_px:
+                gated.add((cam_id, fk))
+
+    for cam_id, fk in gated:
+        new_conf_left.setdefault(cam_id, {})[fk] = 0.0
+        new_conf_right.setdefault(cam_id, {})[fk] = 0.0
+        fake_flags.setdefault(cam_id, {})[fk] = True
+
+    return new_conf_left, new_conf_right, fake_flags
+
+
 def save_reconstruction(path, data):
     with open(path, 'w') as f:
         json.dump(data, f)
