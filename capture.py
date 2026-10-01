@@ -22,9 +22,15 @@ from camera_settings import DEFAULT_CAMERA_SETTINGS
 # ==============================================================================
 # 1. OPTIMIZED CONFIGURATION FOR SIGN LANGUAGE KEYPOINT TRACKING
 # ==============================================================================
-FPS               = 30    # Target framerate
+FPS               = 30    # Target framerate; overridden to 60 by --half-res
 REC_W, REC_H      = 3840, 2160  # Pristine 4K for storage (MediaPipe / SMPLX)
-VIEW_W, VIEW_H    = 1280, 720   # Lightweight 720p for GUI preview
+VIEW_W, VIEW_H    = 1280, 720   # Lightweight preview; 960x720 in --half-res mode
+
+# Half-resolution mode (2024x1520 @ 60fps): 2x2 bin of the full IMX412 sensor,
+# wider FOV than 4K crop. Requires separate calibration -- use
+#   python calibrate.py --config calibrate_config_half.yaml
+#   python app.py       --config calibrate_config_half.yaml
+# The intrinsics cache keys by (device_id, resolution) so both modes coexist.
 
 # Hardware Encoder Settings
 ENCODER_PROFILE   = dai.VideoEncoderProperties.Profile.MJPEG
@@ -162,31 +168,67 @@ def connect_device_with_retry(device_info, session, boot_position, retries=2, re
 
 
 # ==============================================================================
-# 3. PIPELINE GENERATOR (DepthAI v3 Architecture - Definitions Only)
+# 3. PIPELINE GENERATOR
 # ==============================================================================
-def create_dual_stream_pipeline(device, preview=True):
+def create_dual_stream_pipeline(device, preview=True, native_sensor=False):
+    """Build the capture pipeline.
+
+    native_sensor=True: v2 ColorCamera path with explicit
+    setResolution(THE_2024X1520) — forces hardware 2x2 binning on the IMX412
+    sensor. Only valid when REC_W/REC_H == 2024x1520 (i.e. --half-res
+    --native-sensor). Use this to compare against the default v3 ISP-scale
+    path under --half-res alone.
+
+    native_sensor=False (default): v3 Camera node + requestOutput — the ISP
+    scales to (REC_W, REC_H); works at all resolutions but may not use the
+    sensor's native binning mode for 2024x1520.
+    """
     pipeline = dai.Pipeline(device)
 
-    cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-    cam_rgb.initialControl.setManualExposure(FORCED_SHUTTER_US, FORCED_ISO)
-    cam_rgb.initialControl.setManualWhiteBalance(FORCED_WB_K)
+    if native_sensor:
+        # v2 ColorCamera path: explicit hardware sensor mode
+        cam_rgb = pipeline.create(dai.node.ColorCamera)
+        cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+        cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_2024X1520)
+        cam_rgb.setFps(FPS)
+        cam_rgb.setVideoSize(REC_W, REC_H)
+        cam_rgb.initialControl.setManualExposure(FORCED_SHUTTER_US, FORCED_ISO)
+        cam_rgb.initialControl.setManualWhiteBalance(FORCED_WB_K)
 
-    out_rec = cam_rgb.requestOutput((REC_W, REC_H), type=dai.ImgFrame.Type.NV12, fps=FPS)
+        video_enc = pipeline.create(dai.node.VideoEncoder)
+        video_enc.setDefaultProfilePreset(FPS, ENCODER_PROFILE)
+        video_enc.setQuality(MJPEG_QUALITY)
+        cam_rgb.video.link(video_enc.input)
 
-    video_enc = pipeline.create(dai.node.VideoEncoder).build(
-        out_rec,
-        frameRate=FPS,
-        profile=ENCODER_PROFILE
-    )
-    video_enc.setQuality(MJPEG_QUALITY)
+        out_preview = None
+        if preview:
+            cam_rgb.setPreviewSize(VIEW_W, VIEW_H)
+            out_preview = cam_rgb.preview
 
-    out_preview = None
-    if preview:
-        out_preview = cam_rgb.requestOutput(
-            (VIEW_W, VIEW_H), type=dai.ImgFrame.Type.BGR888p, fps=FPS
+        return pipeline, video_enc.out, out_preview
+
+    else:
+        # v3 Camera path (default): ISP scales to requested output size
+        cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+        cam_rgb.initialControl.setManualExposure(FORCED_SHUTTER_US, FORCED_ISO)
+        cam_rgb.initialControl.setManualWhiteBalance(FORCED_WB_K)
+
+        out_rec = cam_rgb.requestOutput((REC_W, REC_H), type=dai.ImgFrame.Type.NV12, fps=FPS)
+
+        video_enc = pipeline.create(dai.node.VideoEncoder).build(
+            out_rec,
+            frameRate=FPS,
+            profile=ENCODER_PROFILE
         )
+        video_enc.setQuality(MJPEG_QUALITY)
 
-    return pipeline, video_enc.out, out_preview
+        out_preview = None
+        if preview:
+            out_preview = cam_rgb.requestOutput(
+                (VIEW_W, VIEW_H), type=dai.ImgFrame.Type.BGR888p, fps=FPS
+            )
+
+        return pipeline, video_enc.out, out_preview
 
 
 def session_dir_name(timestamp):
@@ -297,7 +339,8 @@ def run_warmup(recorders, warmup_frames, preview_enabled):
 
 
 class CameraRecorder:
-    def __init__(self, cam_idx, device_info, session, session_dir, preview, record=True):
+    def __init__(self, cam_idx, device_info, session, session_dir, preview, record=True,
+                 native_sensor=False):
         self.cam_idx = cam_idx
         self.cam_label = f"cam{cam_idx}"
         self.device_id = device_info.deviceId
@@ -321,9 +364,15 @@ class CameraRecorder:
         print(f"  [{self.cam_label}] USB speed: {self.usb_speed.name}{speed_flag}")
 
         self.pipeline, rec_endpoint, view_endpoint = create_dual_stream_pipeline(
-            self.device, preview=preview
+            self.device, preview=preview, native_sensor=native_sensor
         )
-        self.q_rec = rec_endpoint.createOutputQueue(maxSize=8, blocking=False)
+        # blocking=True so the device waits rather than dropping frames during
+        # brief host IO spikes (e.g. flushing a 30-second segment to disk).
+        # Dropped frames are silent and hard to diagnose in postprocess; a
+        # visible stall is preferable. q_view stays non-blocking — dropped
+        # preview frames are harmless and we don't want a slow UI thread to
+        # stall the recording pipeline.
+        self.q_rec = rec_endpoint.createOutputQueue(maxSize=8, blocking=True)
         self.q_view = None
         if view_endpoint is not None:
             self.q_view = view_endpoint.createOutputQueue(maxSize=4, blocking=False)
@@ -508,16 +557,22 @@ def main(args=None):
     os.makedirs(RECORD_DIR, exist_ok=True)
     if args is not None:
         try:
-            global FORCED_ISO, FORCED_SHUTTER_US, FPS
+            global FORCED_ISO, FORCED_SHUTTER_US, FPS, REC_W, REC_H, VIEW_W, VIEW_H
             FORCED_ISO = int(args.iso)
             FORCED_SHUTTER_US = int(args.shutter)
-            FPS = int(args.fps)
+            if getattr(args, "half_res", False):
+                REC_W, REC_H = 2024, 1520
+                VIEW_W, VIEW_H = 960, 720   # 4:3 to match sensor aspect
+                FPS = args.fps if args.fps is not None else 60
+            else:
+                FPS = args.fps if args.fps is not None else 30
         except Exception:
             pass
 
     no_preview = args.no_preview if args is not None else False
     preview_enabled = not no_preview
     record_enabled = not (args.no_record if args is not None else False)
+    native_sensor = getattr(args, "native_sensor", False) and getattr(args, "half_res", False)
     warmup_enabled = not (args.no_warmup if args is not None else False)
     align_enabled = not (args.no_align if args is not None else False)
     warmup_frames = args.warmup_frames if args is not None else DEFAULT_WARMUP_FRAMES
@@ -596,7 +651,8 @@ def main(args=None):
                     time.sleep(CONNECT_STAGGER_S)
                 print(f"Connecting cam{cam_idx} (ID: {device_info.deviceId})...")
                 recorders.append(CameraRecorder(
-                    cam_idx, device_info, timestamp, session_dir, preview_enabled, record_enabled
+                    cam_idx, device_info, timestamp, session_dir, preview_enabled, record_enabled,
+                    native_sensor=native_sensor,
                 ))
         except Exception as e:
             # cam_idx/device_info still hold the values from the iteration that raised
@@ -618,7 +674,10 @@ def main(args=None):
             print(f"  Session folder: {session_dir}")
         else:
             print("  Recording: disabled")
-        print(f"  Configuration: 4K ({REC_W}x{REC_H}) MJPEG @ {FPS}fps")
+        mode_tag = (f"half-res native-sensor ({REC_W}x{REC_H})" if native_sensor
+                    else f"half-res ISP-scale ({REC_W}x{REC_H})" if getattr(args, "half_res", False)
+                    else f"4K ({REC_W}x{REC_H})")
+        print(f"  Configuration: {mode_tag} MJPEG @ {FPS}fps")
         print(f"  Shutter Time: {FORCED_SHUTTER_US} us | ISO: {FORCED_ISO}")
         print(f"  Warmup: {'enabled' if warmup_enabled and record_enabled else 'disabled'}"
               + (f" ({warmup_frames} frames)" if warmup_enabled and record_enabled else ""))
@@ -770,7 +829,21 @@ if __name__ == "__main__":
                         help="ISO value")
     parser.add_argument("-s", "--shutter", type=int, default=DEFAULT_CAMERA_SETTINGS["shutter_us"],
                         help="Shutter speed in microseconds")
-    parser.add_argument("-f", "--fps", type=int, default=30, help="Frames per second")
+    parser.add_argument("-f", "--fps", type=int, default=None,
+                        help="Frames per second (default: 60 with --half-res, 30 otherwise)")
+    parser.add_argument(
+        "--half-res",
+        action="store_true",
+        help="Record at 2024x1520 @ 60fps instead of 4K @ 30fps. "
+             "Requires separate calibration: calibrate.py/app.py --config calibrate_config_half.yaml",
+    )
+    parser.add_argument(
+        "--native-sensor",
+        action="store_true",
+        help="With --half-res: use v2 ColorCamera + THE_2024X1520 sensor mode for explicit "
+             "hardware 2x2 binning. Without --half-res this flag is ignored. "
+             "Compare against --half-res alone (v3 ISP scale) to evaluate image quality.",
+    )
     parser.add_argument(
         "--no-preview",
         action="store_true",

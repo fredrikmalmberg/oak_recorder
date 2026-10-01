@@ -1,0 +1,22 @@
+# Half-resolution calibration config: 2024x1520 @ 60fps
+#
+# Use with:
+#   python calibrate.py --config calibrate_config_half.yaml
+#   python app.py       --config calibrate_config_half.yaml
+#
+# 2024x1520 is a 2x2 bin of the full IMX412 sensor (4048x3040), giving a
+# wider FOV than the 4K crop (3840x2160). Intrinsics are NOT related to the
+# 4K intrinsics by a simple scale factor -- they require a dedicated
+# calibration run. The intrinsics cache keys by (device_id, resolution), so
+# 4K and half-res calibrations coexist without conflict.
+
+camera:
+  record_width: 2024
+  record_height: 1520
+  display_width: 480
+  display_height: 360   # 4:3 to match sensor aspect (vs 16:9 at 4K)
+  fps: 60
+  mjpeg_quality: 90
+
+output:
+  dir: output/calibration_half
