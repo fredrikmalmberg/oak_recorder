@@ -40,7 +40,7 @@ import calibrate  # noqa: E402
 
 from hand_pose.hand_multiview import build_undistort_maps, undistort_fast  # noqa: E402
 from smplx_fit import model as smplx_model  # noqa: E402
-from smplx_fit.fit_face_expr import _load_head_vert_indices, _mediapipe_on_crop  # noqa: E402
+from smplx_fit.texture.fit_face_expr import _load_head_vert_indices, _mediapipe_on_crop  # noqa: E402
 from smplx_fit.silhouette import project_points  # noqa: E402
 
 UV_NPZ_DEFAULT = "/home/fmalmb/CODE/sl_reconstruction/visualization/textures/smplx_uv_2023.npz"
