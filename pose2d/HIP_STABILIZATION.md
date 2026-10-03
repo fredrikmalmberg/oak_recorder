@@ -44,12 +44,12 @@ longer than the right. Shoulders do not have this problem (residuals 1-11 px).
 
 ## Tried and not adopted
 
-- **Silhouette flags** (`output/sapiens2/sil_flags.json`, from `sapiens2_test/make_sil_flags.py` /
+- **Silhouette flags** (`output/sapiens2/sil_flags.json`, from `sapiens2/make_sil_flags.py` /
   `kp_silhouette_check.py`): flag camera observations whose keypoint falls outside the SAM3 silhouette.
   `--exclude-flags` drops flagged camera observations in triangulation (kept in `triangulation.py`). Modest gain on the
   baseline, no gain once the hip cameras are fixed, and combined with the fixed cameras it was slightly worse (more gaps,
   Rhip accel p95 6.9 vs 2.0) and moved the shoulders by up to 32 mm.
-- **2D interpolation of flagged keypoints** (`sapiens2_test/interp_flagged_kps.py`): replace flagged 2D points by linear
+- **2D interpolation of flagged keypoints** (`sapiens2/interp_flagged_kps.py`): replace flagged 2D points by linear
   interpolation, keep the camera in the set. Worse: it destabilised the stable-set selection.
 - **Looser/tighter hip residual threshold**: 20 px skipped about 68% of hip landmark-frames, 40 px gave smoothed hip width
   std 51 mm from gap bridging, 60 px gives full coverage in 300-650.
@@ -65,7 +65,7 @@ longer than the right. Shoulders do not have this problem (residuals 1-11 px).
 
 ## Where things are
 
-`sapiens2_test/` (helper scripts, still untracked) holds the flag and interpolation scripts and `view_compare.py`, which
-shows several reconstructions in viser: `python -m sapiens2_test.view_compare --calib <calib> --set LABEL=<dir> ...`.
+`sapiens2/` (the Sapiens2 pipeline package) holds the flag and interpolation scripts and `view_compare.py`, which
+shows several reconstructions in viser: `python -m sapiens2.view_compare --calib <calib> --set LABEL=<dir> ...`.
 Variant outputs: `output/silbase` (baseline), `silflags`, `silinterp`, `silhipA` (hip cams), `silhipB` (adopted),
 `silhipC` (B + flags).

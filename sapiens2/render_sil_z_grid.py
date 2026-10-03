@@ -9,7 +9,7 @@ Dim blue tint = arm/hand pixels excluded from the silhouette windows. Red line =
 import argparse, os, subprocess
 from concurrent.futures import ThreadPoolExecutor
 import cv2, numpy as np
-from sapiens2_test.kp_silhouette_check import windowed_z, arm_mask
+from sapiens2.kp_silhouette_check import windowed_z, arm_mask
 
 NAMES = {"Lsh": 5, "Rsh": 6, "Lhip": 9, "Rhip": 10}
 GREEN, RED, GREY, CYAN, YEL = (0, 220, 0), (0, 0, 255), (150, 150, 150), (255, 255, 0), (0, 230, 255)

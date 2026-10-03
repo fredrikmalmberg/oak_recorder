@@ -226,7 +226,7 @@ def triangulate_sequence_stable(
     cameras fall back to that frame's per-frame RANSAC camera set for it.
 
     exclude (optional): dict[cam_id][frame_key][lm_key] -> True marks that camera's observation of that
-    landmark as untrustworthy (see sapiens2_test/make_sil_flags.py); it is never used, also not in the
+    landmark as untrustworthy (see sapiens2/make_sil_flags.py); it is never used, also not in the
     RANSAC fallback. Where a flag removed a camera, the result is only kept if the remaining cameras'
     rays at the point span at least `min_ray_angle_deg` (near-collinear cameras give an unconstrained
     depth); otherwise that landmark has no measurement this frame and the Kalman smoother bridges it.
@@ -593,7 +593,7 @@ def main():
     parser.add_argument(
         "--exclude-flags", default=None,
         help="Stable mode, body only: JSON {cam: {landmark_id: [frame numbers]}} of camera observations to leave "
-             "out (made by sapiens2_test/make_sil_flags.py).",
+             "out (made by sapiens2/make_sil_flags.py).",
     )
     parser.add_argument(
         "--min-ray-angle", type=float, default=20.0,

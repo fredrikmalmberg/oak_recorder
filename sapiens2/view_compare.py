@@ -2,7 +2,7 @@
 
 Each --set is LABEL=DIR where DIR holds reconstruction_{left,right,body}.json; sets get distinct colours
 and a checkbox. Hip (body ids 11, 12) trails are drawn per set to make frame-to-frame hip motion visible.
-  python -m sapiens2_test.view_compare --calib CAL --set "MediaPipe=<take>/aligned/pose2d" \
+  python -m sapiens2.view_compare --calib CAL --set "MediaPipe=<take>/aligned/pose2d" \
       --set "Sapiens=<take>/aligned/pose2d_sapiens_smoothbox" --port 8082
 """
 import argparse, json, os, sys, time
@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import calibrate  # noqa: E402
 from hand_pose import hand_multiview as hmv  # noqa: E402
 from pose2d import visualize_triangulation as vt  # noqa: E402
-from sapiens2_test.view_sapiens import BODY_BONES, draw, hand_bones  # noqa: E402
+from sapiens2.view_sapiens import BODY_BONES, draw, hand_bones  # noqa: E402
 
 PALETTE = [(255, 235, 0), (120, 200, 255), (255, 120, 220), (120, 255, 140)]
 

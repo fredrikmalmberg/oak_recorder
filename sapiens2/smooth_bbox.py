@@ -6,7 +6,7 @@ shifts other keypoints such as the hips. Here each edge is taken as a sliding-wi
 the model aspect (3:4). The pipeline multiplies the box by a further 1.25, so the crop the
 model actually sees is `effective_crop(box)`.
 
-  python -m sapiens2_test.smooth_bbox --take TAKE --out output/sapiens2/boxes_smooth.npz
+  python -m sapiens2.smooth_bbox --take TAKE --out output/sapiens2/boxes_smooth.npz
 Output npz: frames[F], cams[C], boxes[F,C,4] (x0,y0,x1,y1; NaN if no mask), raw[F,C,4]
 """
 import argparse

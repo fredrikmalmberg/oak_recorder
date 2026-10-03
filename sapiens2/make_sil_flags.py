@@ -4,12 +4,12 @@ A frame t with score z > --thr flags the steps t-1..t+2 that the score window co
 observations at frames t-1 .. t+2 (--before/--after) are marked for that camera and landmark.
 Sapiens ids -> pose2d body ids: 5->5, 6->6 (shoulders), 9->11, 10->12 (hips).
 
-  python -m sapiens2_test.make_sil_flags --check output/sapiens2/kp_sil_check_v2.npz --out output/sapiens2/sil_flags.json
+  python -m sapiens2.make_sil_flags --check output/sapiens2/kp_sil_check_v2.npz --out output/sapiens2/sil_flags.json
 Output: {"cam1": {"11": [516, 517, ...], ...}, ...}
 """
 import argparse, json
 import numpy as np
-from sapiens2_test.kp_silhouette_check import windowed_z
+from sapiens2.kp_silhouette_check import windowed_z
 
 NAME_TO_POSE2D = {"Lsh": 5, "Rsh": 6, "Lhip": 11, "Rhip": 12}
 

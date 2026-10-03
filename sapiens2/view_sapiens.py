@@ -5,7 +5,7 @@ Body: left side blue, right side orange, midline white, plus neck (shoulder midp
 and spine (shoulder midpoint -> hip midpoint). Camera frustums from --calib, optionally a
 second calibration with --ref-calib (orange frustums).
 
-  python -m sapiens2_test.view_sapiens TAKE --calib output/calibration/..._sapiens_ext8000.json --port 8080
+  python -m sapiens2.view_sapiens TAKE --calib output/calibration/..._sapiens_ext8000.json --port 8080
 """
 import argparse, colorsys, os, sys, time
 import numpy as np

@@ -1,6 +1,6 @@
 """3x2 camera grid video with two 3D reconstructions reprojected onto the (distorted) frames.
 
-  python -m sapiens2_test.render_recon_grid --take T --calib CAL \
+  python -m sapiens2.render_recon_grid --take T --calib CAL \
       --recon-a <dir> --recon-b <dir> --out output/sapiens2/grid_recon_cmp.mp4
 A = light blue (larger dots, underneath), B = yellow (on top). Projection uses cv2.projectPoints
 with the calibration's dist coeffs, so points land in distorted pixel space like the raw frames.

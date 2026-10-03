@@ -9,7 +9,7 @@ camera: mm = px * Z_cam / fx * 1000.
 The calibration scale is "arbitrary"; mm assumes 1 calibration unit = 1 m, which is
 only a sanity-checked assumption (triangulated shoulder width median 0.36 units).
 
-  python -m sapiens2_test.reproj_mm --take TAKE --pose2d-dir pose2d_sapiens \
+  python -m sapiens2.reproj_mm --take TAKE --pose2d-dir pose2d_sapiens \
       --calib output/calibration/....json --recon-dir <dir with reconstruction_*.json>
 """
 import argparse, json, os, sys

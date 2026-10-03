@@ -1,6 +1,6 @@
 """Refine camera extrinsics with Sapiens2 keypoints (robust bundle adjustment), validate on the flash LED.
 
-  PYTHONPATH=. python -m sapiens2_test.refine_extrinsics
+  PYTHONPATH=. python -m sapiens2.refine_extrinsics
 Fixed: intrinsics/distortion, cam0 pose (defines the world frame) and the cam0<->anchor-cam baseline length
 (real-world scale from the existing board-scaled calibration). Free: other cameras' R,t and all 3D points.
 Residuals are in undistorted pixel space (observations are undistorted once with the fixed intrinsics);

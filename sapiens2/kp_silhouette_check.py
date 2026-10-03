@@ -13,7 +13,7 @@ lam ~ 0.14 * edge length in px for a sigma-2 blurred edge). The reported discrep
 is "the keypoint moved but the silhouette around it didn't (or moved differently)". Direction with no
 silhouette constraint are reported as unobservable (rank counts observable directions: 0, 1, 2).
 
-  python -m sapiens2_test.kp_silhouette_check --take T --npz output/sapiens2/allframes_1b_smoothbox.npz \
+  python -m sapiens2.kp_silhouette_check --take T --npz output/sapiens2/allframes_1b_smoothbox.npz \
       --out output/sapiens2/kp_sil_check.npz
 """
 import argparse, os

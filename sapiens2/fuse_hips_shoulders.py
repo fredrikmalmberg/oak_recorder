@@ -9,7 +9,7 @@ Per target landmark (body ids 5,6,11,12):
 Output dir gets reconstruction_{left,right,body}.json: body raw = fused measurements, body smoothed = Kalman for targets;
 non-target body joints and hands are copied from --base (Sapiens). Both 'raw' and 'smoothed' of non-targets are the base's.
 
-  python -m sapiens2_test.fuse_hips_shoulders --a <MP dir> --b <Sapiens dir> --out output/fused/aligned/pose2d_fused
+  python -m sapiens2.fuse_hips_shoulders --a <MP dir> --b <Sapiens dir> --out output/fused/aligned/pose2d_fused
 """
 import argparse, json, os, shutil, sys
 import numpy as np

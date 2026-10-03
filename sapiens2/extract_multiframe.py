@@ -1,11 +1,11 @@
 """Run Sapiens2 pose on many frames x cameras and cache keypoints (distorted pixel space).
 
-  PYTHONPATH=/home/fmalmb/CODE/sapiens2:. python -m sapiens2_test.extract_multiframe --take ... --n 48
+  PYTHONPATH=/home/fmalmb/CODE/sapiens2:. python -m sapiens2.extract_multiframe --take ... --n 48
 Output npz: frames[F], cams[C], kp[F,C,308,2] (NaN if no person mask), sc[F,C,308]
 """
 import argparse, time
 import cv2, numpy as np, torch
-from sapiens2_test import run_pose as rp
+from sapiens2 import run_pose as rp
 
 
 def main():

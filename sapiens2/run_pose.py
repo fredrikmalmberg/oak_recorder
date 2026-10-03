@@ -1,7 +1,7 @@
 """Sapiens2 308-keypoint pose on our camera frames + speed benchmark.
 
 Run from repo root:
-  PYTHONPATH=/home/fmalmb/CODE/sapiens2 python -m sapiens2_test.run_pose \
+  PYTHONPATH=/home/fmalmb/CODE/sapiens2 python -m sapiens2.run_pose \
       --take /data/oak_recorder_sessions/20260925_153809_take3 --frame 300 --sizes 0.4b 0.8b 1b
 
 Frames and RVM masks are both in raw (distorted) pixel space; person bboxes come from the

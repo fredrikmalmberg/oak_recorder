@@ -1,6 +1,6 @@
 """Triangulate Sapiens2 308 keypoints (conf > thr) with the calibration and report reprojection error.
 
-  python -m sapiens2_test.triangulate --size 1b --frame 300 --min-conf 0.5
+  python -m sapiens2.triangulate --size 1b --frame 300 --min-conf 0.5
 Keypoints are in distorted pixel space (as saved by run_pose.py); they are undistorted before DLT and
 errors are measured in distorted space (cv2.projectPoints with dist coeffs).
 """

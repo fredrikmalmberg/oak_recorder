@@ -6,7 +6,7 @@ Only parts whose part confidence >= --min-conf (the triangulation gate) are draw
 With --boxes (smooth_bbox npz): red = raw RVM mask extents, cyan = crop Sapiens actually saw
 (smoothed box x1.25, aspect-fixed). Hips (body ids 11, 12) are drawn as large magenta rings.
 
-  python -m sapiens2_test.render_pose2d_grid --take T --calib CAL --pose2d-dir pose2d_sapiens_smoothbox --out out.mp4
+  python -m sapiens2.render_pose2d_grid --take T --calib CAL --pose2d-dir pose2d_sapiens_smoothbox --out out.mp4
 """
 import argparse, json, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +14,7 @@ import cv2, numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import calibrate  # noqa: E402
-from sapiens2_test.smooth_bbox import effective_crop  # noqa: E402
+from sapiens2.smooth_bbox import effective_crop  # noqa: E402
 
 COLORS = {"body": (0, 255, 255), "left": (255, 200, 120), "right": (60, 140, 255)}  # BGR
 RADIUS = {"body": 1.0, "left": 0.6, "right": 0.6}

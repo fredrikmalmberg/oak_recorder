@@ -9,7 +9,7 @@ Sapiens keypoints are in DISTORTED pixel space; pose2d's schema is undistorted p
 coords / (w, h) (the projection matrices have no distortion), so they are undistorted
 here with each camera's own K/dist before normalising.
 
-  python -m sapiens2_test.to_pose2d --take /data/oak_recorder_sessions/20260925_153809_take3
+  python -m sapiens2.to_pose2d --take /data/oak_recorder_sessions/20260925_153809_take3
 """
 import argparse, json, os, sys
 import cv2, numpy as np

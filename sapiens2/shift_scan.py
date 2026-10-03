@@ -1,12 +1,12 @@
 """Scan per-camera frame shifts around a frame; pick shifts minimising multi-view reprojection error.
 
-  PYTHONPATH=/home/fmalmb/CODE/sapiens2:. python -m sapiens2_test.shift_scan --take ... --frame 300 --size 1b
+  PYTHONPATH=/home/fmalmb/CODE/sapiens2:. python -m sapiens2.shift_scan --take ... --frame 300 --size 1b
 Objective = median plain-DLT reprojection error (distorted px) over all keypoint views with conf > thr.
 """
 import argparse, numpy as np, cv2, torch
 import calibrate
-from sapiens2_test import run_pose as rp
-from sapiens2_test.triangulate import proj, dlt
+from sapiens2 import run_pose as rp
+from sapiens2.triangulate import proj, dlt
 
 
 def objective(kp, sc, cams, ids, thr, per_cam=False):

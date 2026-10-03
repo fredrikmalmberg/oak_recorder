@@ -5,7 +5,7 @@ Alternative to dropping flagged camera observations in triangulation (pose2d.tri
 <take>/aligned/<src> to <take>/aligned/<dst> and patches landmarks_body.json (pose2d schema,
 undistorted pixel coords / (w, h)).
 
-  python -m sapiens2_test.interp_flagged_kps --take T --flags output/sapiens2/sil_flags.json \
+  python -m sapiens2.interp_flagged_kps --take T --flags output/sapiens2/sil_flags.json \
       --src pose2d_sapiens_smoothbox --dst pose2d_sapiens_smoothbox_interp
 """
 import argparse, json, os, shutil

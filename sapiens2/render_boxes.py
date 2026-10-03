@@ -4,12 +4,12 @@ Red    = raw per-frame RVM mask extents (tight)
 Yellow = crop Sapiens actually saw in the current run (mask extents +5%, x1.25, aspect-fixed)
 Cyan   = crop from the modified (smoothed, bottom-pinned) box, same x1.25 + aspect fix
 
-  python -m sapiens2_test.render_boxes --take TAKE --boxes output/sapiens2/boxes_smooth.npz --out output/sapiens2/boxes_grid.mp4
+  python -m sapiens2.render_boxes --take TAKE --boxes output/sapiens2/boxes_smooth.npz --out output/sapiens2/boxes_grid.mp4
 """
 import argparse, os, subprocess
 from concurrent.futures import ThreadPoolExecutor
 import cv2, numpy as np
-from sapiens2_test.smooth_bbox import effective_crop, padded_raw
+from sapiens2.smooth_bbox import effective_crop, padded_raw
 
 
 def rect(img, b, s, col, th):

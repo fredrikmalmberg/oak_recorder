@@ -2,7 +2,7 @@
 shoulders (body ids 5,6) and hips (11,12), at selectable levels. Everything else (other body
 joints, hands) shows the pipeline's own smoothed output.
 
-  python -m sapiens2_test.view_levels --calib CAL --recon-dir <dir with reconstruction_*.json> --port 8083
+  python -m sapiens2.view_levels --calib CAL --recon-dir <dir with reconstruction_*.json> --port 8083
 """
 import argparse, json, os, sys, time
 import numpy as np
@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import calibrate  # noqa: E402
 from hand_pose import hand_multiview as hmv  # noqa: E402
 from pose2d import visualize_triangulation as vt  # noqa: E402
-from sapiens2_test.view_sapiens import BODY_BONES, draw, hand_bones  # noqa: E402
+from sapiens2.view_sapiens import BODY_BONES, draw, hand_bones  # noqa: E402
 
 TARGET = ("5", "6", "11", "12")
 LEVELS = {  # name -> (process_std, meas_std); None = unfiltered raw triangulation

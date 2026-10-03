@@ -1,6 +1,6 @@
 """Render a 3x2 camera grid video with Sapiens2 keypoints overlaid.
 
-  python -m sapiens2_test.render_grid --take ... --npz output/sapiens2/allframes_1b.npz --out output/sapiens2/grid_1b.mp4
+  python -m sapiens2.render_grid --take ... --npz output/sapiens2/allframes_1b.npz --out output/sapiens2/grid_1b.mp4
 Frames and keypoints are both in distorted pixel space, so the overlay needs no remapping.
 """
 import argparse, subprocess, os
