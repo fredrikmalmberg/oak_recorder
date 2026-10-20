@@ -17,7 +17,6 @@ import numpy as np
 from tqdm import tqdm
 
 PREVIEW_GRID_W = 1920
-PREVIEW_GRID_H = 1080
 BLUE_BGR = (255, 0, 0)
 
 
@@ -25,6 +24,22 @@ def preview_grid_layout(num_cameras):
     cols = math.ceil(math.sqrt(num_cameras))
     rows = math.ceil(num_cameras / cols)
     return cols, rows
+
+
+def grid_cell_size(cols, frame_w, frame_h):
+    """Cell width/height for the xstack grid, preserving the SOURCE frame's
+    own aspect ratio instead of forcing it into a fixed 1920x1080 canvas
+    sliced evenly by cols/rows -- correct for 4K's 16:9 ISP crop (where it's
+    a no-op) but visibly stretched/squashed for the half-res native-sensor
+    profile, which reads the full sensor at a ~1.33 aspect ratio instead.
+    Width stays anchored to PREVIEW_GRID_W / cols (keeps the overall grid
+    close to the usual ~1920px-wide preview size); height follows from the
+    real aspect ratio instead of a second fixed-canvas-height division.
+    Both rounded to even pixels, required for yuv420p encoding.
+    """
+    cell_w = (PREVIEW_GRID_W // cols // 2) * 2
+    cell_h = round(cell_w * frame_h / frame_w / 2) * 2
+    return cell_w, cell_h
 
 
 def xstack_layout(num_cameras, cell_w, cell_h):
@@ -124,43 +139,6 @@ def parse_log_header(log_path):
                 if offset_m:
                     host_offset_s = float(offset_m.group(1))
     return rec_w, rec_h, fps, host_offset_s
-
-
-def parse_legacy_log_header(log_path):
-    """Mirrors parse_log_header, but for a TEMPORARY frame_timestamps_legacy_
-    <cam>.log sibling (see AppCameraSession's cfg["debug"]["legacy_timestamp_
-    compare"] in calibrate.DEFAULT_CONFIG) -- reads legacy_host_offset_s=
-    instead of host_offset_s=.
-    """
-    legacy_host_offset_s = None
-    with open(log_path, encoding="utf-8") as f:
-        for line in f:
-            if not line.startswith("#"):
-                break
-            if line.startswith("# sync_calibration"):
-                m = re.search(r"legacy_host_offset_s=([-\d.]+)", line)
-                if m:
-                    legacy_host_offset_s = float(m.group(1))
-    return legacy_host_offset_s
-
-
-def parse_legacy_timestamp_log(log_path):
-    """Returns dict[seq] -> legacy_host_ts_s from a frame_timestamps_legacy_
-    <cam>.log sibling -- only 2 fields per line (legacy_host_ts_s
-    sequence_num), unlike the main log's 4, so this doesn't reuse
-    parse_timestamp_log.
-    """
-    legacy_by_seq = {}
-    with open(log_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            legacy_by_seq[int(parts[1])] = parse_host_ts_s(parts[0])
-    return legacy_by_seq
 
 
 def parse_timestamp_log(log_path, host_offset_s=None):
@@ -283,22 +261,20 @@ def align_session(
     rec_h=None,
     align_host_only=False,
     align_device_raw=False,
-    align_legacy_host_ts=False,
     align_unified_legacy=False,
 ):
     session_dir, cameras = discover_session(session_dir)
 
-    # What raw timing data this take was recorded with (depthai version,
-    # whether the legacy-timestamp debug logging was on) -- written by
-    # app.py's write_take_meta() at record time. Older takes predate this
-    # field, so both come back None when take_meta.json is missing/lacks it.
+    # What raw timing data this take was recorded with (depthai version) --
+    # written by app.py's write_take_meta() at record time. Older takes
+    # predate this field, so it comes back None when take_meta.json is
+    # missing/lacks it.
     take_meta_path = os.path.join(session_dir, "take_meta.json")
-    depthai_version, legacy_timestamp_compare_debug = None, None
+    depthai_version = None
     if os.path.isfile(take_meta_path):
         with open(take_meta_path, encoding="utf-8") as f:
             take_meta = json.load(f)
         depthai_version = take_meta.get("depthai_version")
-        legacy_timestamp_compare_debug = take_meta.get("legacy_timestamp_compare_debug")
 
     header_w, header_h, header_fps, _ = parse_log_header(cameras[0]["log_path"])
     rec_w = rec_w or header_w or 3840
@@ -313,35 +289,7 @@ def align_session(
         _w, _h, _fps, host_offset_s = parse_log_header(cam["log_path"])
         offsets[cam["label"]] = host_offset_s
 
-    legacy_offsets, legacy_by_seq = {}, {}
-    if align_legacy_host_ts:
-        # TEMPORARY, see cfg["debug"]["legacy_timestamp_compare"]: rebuilds
-        # the unified_device timebase from the pre-addCallback host-
-        # timestamp method instead, for a direct comparison against the
-        # real (addCallback-based) unified_device result on identical
-        # recorded motion -- device_ts_s is unaffected either way (same
-        # msg.getTimestamp() read regardless of host method), only the
-        # host_ts_s side (per-frame and the one-shot offset anchor) differs.
-        for cam in cameras:
-            legacy_log_path = os.path.join(
-                session_dir, f"frame_timestamps_legacy_{cam['label']}.log",
-            )
-            if not os.path.isfile(legacy_log_path):
-                raise FileNotFoundError(
-                    f"--legacy-host-ts requires {legacy_log_path} -- was "
-                    f"cfg['debug']['legacy_timestamp_compare'] enabled for this recording?"
-                )
-            legacy_offsets[cam["label"]] = parse_legacy_log_header(legacy_log_path)
-            legacy_by_seq[cam["label"]] = parse_legacy_timestamp_log(legacy_log_path)
-        missing = [label for label, off in legacy_offsets.items() if off is None]
-        if missing:
-            raise ValueError(f"Missing legacy_host_offset_s in legacy log header for {', '.join(missing)}")
-
-    if align_legacy_host_ts:
-        time_key = "unified_ts_s"
-        timebase = "legacy_unified"
-        use_unified = True
-    elif align_device_raw:
+    if align_device_raw:
         # Explicit, redundant-with-default alias for the else branch below
         # (kept as its own flag for scripts/callers that want to state this
         # choice explicitly rather than relying on it being the default).
@@ -388,23 +336,10 @@ def align_session(
     parsed = {
         cam["label"]: parse_timestamp_log(
             cam["log_path"],
-            host_offset_s=offsets[cam["label"]] if (use_unified and not align_legacy_host_ts) else None,
+            host_offset_s=offsets[cam["label"]] if use_unified else None,
         )
         for cam in cameras
     }
-    if align_legacy_host_ts:
-        # device_ts_s (already parsed above) is identical either way -- only
-        # host_ts_s (per-frame, for reporting) and unified_ts_s (recomputed
-        # from the legacy one-shot offset) get overridden here.
-        for cam in cameras:
-            label = cam["label"]
-            offset = legacy_offsets[label]
-            by_seq = legacy_by_seq[label]
-            for entry in parsed[label]:
-                legacy_host_ts = by_seq.get(entry["seq"])
-                if legacy_host_ts is not None:
-                    entry["host_ts_s"] = legacy_host_ts
-                entry["unified_ts_s"] = entry["device_ts_s"] + offset
     for cam in cameras:
         label = cam["label"]
         if not parsed[label]:
@@ -429,8 +364,7 @@ def align_session(
     print(f"[Alignment] Cameras: {', '.join(cam_labels)}")
     print(f"[Alignment] Slot times: {num_slots} reference frames from {ref_label}")
     if use_unified:
-        report_offsets = legacy_offsets if align_legacy_host_ts else offsets
-        for label, off in report_offsets.items():
+        for label, off in offsets.items():
             print(f"[Alignment]   {label}: host_offset_s={off:.9f}")
     print(
         f"[Alignment] Timeline: {num_slots} slots @ {fps:.1f} FPS "
@@ -560,7 +494,6 @@ def align_session(
     # meanings (see align_device_raw's docstring note above).
     timebase_suffix = {
         "unified_device": "unified", "host": "host", "host_legacy": "host", "device_raw": "device_raw",
-        "legacy_unified": "legacy_unified",
     }[timebase]
     spread_key = f"cross_camera_{timebase_suffix}_spread_ms"
     overlap_start_key = f"overlap_start_{timebase_suffix}_s"
@@ -570,7 +503,6 @@ def align_session(
         "session_dir": session_dir,
         "timebase": timebase,
         "depthai_version": depthai_version,
-        "legacy_timestamp_compare_debug": legacy_timestamp_compare_debug,
         "fps": fps,
         "rec_w": rec_w,
         "rec_h": rec_h,
@@ -584,7 +516,7 @@ def align_session(
             "p95": cross_spread_p95,
             "fully_matched_slots": len(cross_camera_spreads_ms),
         },
-        "host_offsets_s": (legacy_offsets if align_legacy_host_ts else offsets) if use_unified else {},
+        "host_offsets_s": offsets if use_unified else {},
         "cameras": {},
         "warnings": [],
     }
@@ -712,8 +644,6 @@ def print_alignment_report(report):
         label = "unified" if timebase == "unified_device" else "host"
         if timebase == "host_legacy":
             label = "host (legacy)"
-        if timebase == "legacy_unified":
-            label = "unified (legacy host-ts)"
         print(
             f"[Alignment] Cross-camera {label} spread: "
             f"mean {spread.get('mean', 0):.1f}ms | "
@@ -749,12 +679,16 @@ def print_alignment_report(report):
 
 
 
-def convert_mjpegs_to_grid_mp4(video_paths, fps, session_dir):
-    """Build preview grid MP4 directly from raw per-camera MJPEG files."""
+def convert_mjpegs_to_grid_mp4(video_paths, fps, session_dir, frame_w, frame_h):
+    """Build preview grid MP4 directly from raw per-camera MJPEG files.
+    frame_w/frame_h are the SOURCE cameras' own resolution (see
+    grid_cell_size) -- required, not probed from the files here, since
+    callers already have it on hand (a log header or take_meta.json) and
+    probing would mean decoding a frame per call for no benefit.
+    """
     num_cameras = len(video_paths)
-    cols, rows = preview_grid_layout(num_cameras)
-    cell_w = PREVIEW_GRID_W // cols
-    cell_h = PREVIEW_GRID_H // rows
+    cols, _rows = preview_grid_layout(num_cameras)
+    cell_w, cell_h = grid_cell_size(cols, frame_w, frame_h)
     output_path = grid_mp4_path(session_dir)
 
     print(
@@ -799,14 +733,13 @@ def export_raw_grid_mp4(session_dir, fps=None):
     print("\n[Alignment] Raw export (no timestamp alignment)")
     print(f"[Alignment] Session: {os.path.basename(session_dir)}")
     print(f"[Alignment] Cameras: {', '.join(cam_labels)} @ {fps:.1f} FPS")
-    return convert_mjpegs_to_grid_mp4(video_paths, fps, session_dir)
+    return convert_mjpegs_to_grid_mp4(video_paths, fps, session_dir, header_w, header_h)
 
 
-def convert_aligned_jpegs_to_grid_mp4(session_dir, cam_labels, fps):
+def convert_aligned_jpegs_to_grid_mp4(session_dir, cam_labels, fps, frame_w, frame_h):
     num_cameras = len(cam_labels)
-    cols, rows = preview_grid_layout(num_cameras)
-    cell_w = PREVIEW_GRID_W // cols
-    cell_h = PREVIEW_GRID_H // rows
+    cols, _rows = preview_grid_layout(num_cameras)
+    cell_w, cell_h = grid_cell_size(cols, frame_w, frame_h)
     aligned_dir = os.path.join(session_dir, "aligned")
     output_path = grid_mp4_path(session_dir)
 
@@ -896,24 +829,13 @@ def main():
         action="store_true",
         help="Skip alignment; build grid MP4 from raw MJPEG only",
     )
-    parser.add_argument(
-        "--legacy-host-ts",
-        action="store_true",
-        help=(
-            "TEMPORARY: rebuild the unified_device timebase using the pre-addCallback "
-            "host-timestamp method (frame_timestamps_legacy_<cam>.log) instead of the "
-            "current addCallback-based one, for a direct comparison on identical "
-            "recorded motion. Requires the recording to have been made with "
-            "cfg['debug']['legacy_timestamp_compare'] enabled."
-        ),
-    )
     args = parser.parse_args()
 
     exclusive = [args.align_raw, args.align_host, args.align_device_raw,
-                 args.legacy_host_ts, args.align_unified_legacy]
+                 args.align_unified_legacy]
     if sum(exclusive) > 1:
         parser.error(
-            "--align-raw, --align-host, --align-device-raw, --legacy-host-ts, and "
+            "--align-raw, --align-host, --align-device-raw, and "
             "--align-unified-legacy are mutually exclusive"
         )
 
@@ -928,14 +850,13 @@ def main():
         fps=args.fps,
         align_host_only=args.align_host,
         align_device_raw=args.align_device_raw,
-        align_legacy_host_ts=args.legacy_host_ts,
         align_unified_legacy=args.align_unified_legacy,
     )
 
     if args.output_mp4 == "small":
         cam_labels = list(report["cameras"].keys())
         mp4_path = convert_aligned_jpegs_to_grid_mp4(
-            report["session_dir"], cam_labels, report["fps"]
+            report["session_dir"], cam_labels, report["fps"], report["rec_w"], report["rec_h"]
         )
         print(f"[Success] Grid mp4 saved: {mp4_path}")
 

@@ -13,14 +13,22 @@ import os
 import queue
 import threading
 
-from align_session import convert_mjpegs_to_grid_mp4
+from align_session import convert_mjpegs_to_grid_mp4, parse_log_header
 
 
 def _step_grid_video(take_dir, meta):
     processed_dir = os.path.join(take_dir, "processed")
     os.makedirs(processed_dir, exist_ok=True)
-    video_paths = [cam["video_path"] for cam in meta["cameras"].values()]
-    convert_mjpegs_to_grid_mp4(video_paths, meta["fps"], processed_dir)
+    cameras = list(meta["cameras"].values())
+    video_paths = [cam["video_path"] for cam in cameras]
+    # Resolution isn't in take_meta.json itself -- read it from any one
+    # camera's own log header (all cameras in a take share cfg["camera"]'s
+    # record_width/height) so the grid's cells get the SOURCE frames' real
+    # aspect ratio instead of being distorted into a fixed 16:9 slice (see
+    # grid_cell_size's docstring -- matters for the half-res native-sensor
+    # profile, whose full-sensor readout isn't 16:9 like 4K's ISP crop).
+    frame_w, frame_h, _fps, _offset = parse_log_header(cameras[0]["log_path"])
+    convert_mjpegs_to_grid_mp4(video_paths, meta["fps"], processed_dir, frame_w, frame_h)
 
 
 PROCESSING_STEPS = [_step_grid_video]

@@ -242,11 +242,13 @@ first presses "Start capture" (not at app boot) and is timestamped then;
 each individual recording within it is a *take* (`take_1`, `take_2`, ...),
 saved under `recordings/<session_ts>/take_<n>/` as
 `video_<cam>.mjpeg`/`frame_timestamps_<cam>.log` per camera (same shape
-`capture.py` itself writes), a `sync_still_<cam>.jpg` per camera from that
-take's device/host clock-sync read, and a `take_meta.json` recording the
+`capture.py` itself writes) and a `take_meta.json` recording the
 take's actual start time, which calibration was active (the loaded file's
 path, or `"uncalibrated"` if none), and each camera's applied
-exposure/USB speed/file paths.
+exposure/USB speed/file paths. A BLE-triggered flash ("S" sent via
+`flash_control.FlashConnection`, held open for the app's whole lifetime) is
+fired fire-and-forget right as the take starts, giving every camera a
+shared visual sync event without any blocking per-camera read.
 
 **No pipeline swap, ever.** There is exactly one `dai.Pipeline` per camera
 for the entire app run, built once at boot

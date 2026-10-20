@@ -26,11 +26,23 @@ FPS               = 30    # Target framerate; overridden to 60 by --half-res
 REC_W, REC_H      = 3840, 2160  # Pristine 4K for storage (MediaPipe / SMPLX)
 VIEW_W, VIEW_H    = 1280, 720   # Lightweight preview; 960x720 in --half-res mode
 
-# Half-resolution mode (2024x1520 @ 60fps): 2x2 bin of the full IMX412 sensor,
-# wider FOV than 4K crop. Requires separate calibration -- use
+# Half-resolution mode (2016x1520 @ 60fps): the SENSOR capture is still the
+# IMX378's native THE_2024X1520 2x2-binned mode (confirmed via Luxonis's own
+# hardware docs: it's the only RVC2 mode on this sensor that does real 2x2
+# binning, not just a crop/ISP-scale), wider FOV than 4K crop. Recorded/
+# encoded width is cropped from 2024 to
+# 2016 (4px off each side, <0.4% FOV loss) because the hardware MJPEG/H26x
+# VideoEncoder hard-requires width to be a multiple of 32 (2024 is not;
+# confirmed empirically -- it raises a device-side critical error and the
+# pipeline never produces a frame) -- 2016 = 63*32 exactly. Requires
+# separate calibration -- use
 #   python calibrate.py --config calibrate_config_half.yaml
 #   python app.py       --config calibrate_config_half.yaml
-# The intrinsics cache keys by (device_id, resolution) so both modes coexist.
+# The intrinsics cache is keyed by device_id ONLY, inside whichever single
+# file intrinsics_cache.path points at -- 4K and half-res calibrations
+# coexist only because calibrate_config_half.yaml points that path at its
+# own separate file (output/calibration_half/intrinsics_cache.json), not
+# because the cache key itself encodes resolution.
 
 # Hardware Encoder Settings
 ENCODER_PROFILE   = dai.VideoEncoderProperties.Profile.MJPEG
@@ -174,14 +186,26 @@ def create_dual_stream_pipeline(device, preview=True, native_sensor=False):
     """Build the capture pipeline.
 
     native_sensor=True: v2 ColorCamera path with explicit
-    setResolution(THE_2024X1520) — forces hardware 2x2 binning on the IMX412
-    sensor. Only valid when REC_W/REC_H == 2024x1520 (i.e. --half-res
+    setResolution(THE_2024X1520) — forces hardware 2x2 binning on the IMX378
+    sensor, then setVideoSize(REC_W, REC_H) crops that binned 2024x1520
+    capture down to REC_W/REC_H (2016x1520 under --half-res -- see the
+    half-res comment near REC_W's module-level default for why 2016, not
+    2024: the VideoEncoder requires a width that's a multiple of 32).
+    setVideoSize crops the ISP's output, it does not re-scale/re-acquire,
+    so this stays a genuine binned capture, just 4px narrower per side.
+    Only valid when REC_W/REC_H is a half-res size (i.e. --half-res
     --native-sensor). Use this to compare against the default v3 ISP-scale
     path under --half-res alone.
 
     native_sensor=False (default): v3 Camera node + requestOutput — the ISP
-    scales to (REC_W, REC_H); works at all resolutions but may not use the
-    sensor's native binning mode for 2024x1520.
+    scales/crops to (REC_W, REC_H); works at all resolutions, but unlike the
+    v2 path above there is no documented guarantee this derives from the
+    sensor's native 2x2-binned capture for a half-res REC_W/REC_H -- DepthAI's
+    ISP-scale logic is known to silently fall back to a different (unscaled
+    or differently-sourced) output when a requested size doesn't cleanly fit
+    its internal scaling ratio constraints (see luxonis/depthai-core#320).
+    Treat v3 half-res as unverified until a real side-by-side comparison
+    against the v2 path (e.g. sharpness/noise) confirms it behaves the same.
     """
     pipeline = dai.Pipeline(device)
 
@@ -191,7 +215,7 @@ def create_dual_stream_pipeline(device, preview=True, native_sensor=False):
         cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_2024X1520)
         cam_rgb.setFps(FPS)
-        cam_rgb.setVideoSize(REC_W, REC_H)
+        cam_rgb.setVideoSize(REC_W, REC_H)  # crops the binned 2024-wide capture down to REC_W
         cam_rgb.initialControl.setManualExposure(FORCED_SHUTTER_US, FORCED_ISO)
         cam_rgb.initialControl.setManualWhiteBalance(FORCED_WB_K)
 
@@ -316,14 +340,6 @@ def show_preview(recorders):
     cv2.imshow(PREVIEW_WINDOW, compose_preview_grid(recorders))
 
 
-def drain_other_recorders(recorders, active_recorder):
-    for recorder in recorders:
-        if recorder is active_recorder:
-            continue
-        recorder.drain_rec_frame()
-        recorder.drain_preview_frame()
-
-
 def run_warmup(recorders, warmup_frames, preview_enabled):
     remaining = {r.cam_label: warmup_frames for r in recorders}
     print(f"[Warmup] Discarding {warmup_frames} frames per camera...")
@@ -351,9 +367,6 @@ class CameraRecorder:
         self.writer = None
         self.log_file = None
         self._drops_at_last_status = 0
-        self.sync_host_ts_s = None
-        self.sync_device_ts_s = None
-        self.sync_host_offset_s = None
 
         if record:
             self.video_path, self.log_path = session_file_paths(session_dir, cam_idx)
@@ -404,14 +417,6 @@ class CameraRecorder:
                             f"usb_speed={self.usb_speed.name}\n")
         self.log_file.write(f"# iso={FORCED_ISO} shutter_us={FORCED_SHUTTER_US} "
                             f"{REC_W}x{REC_H}@{FPS}fps mjpeg_q={MJPEG_QUALITY}\n")
-        if self.sync_host_offset_s is not None:
-            self.log_file.write(
-                f"# sync_calibration host_ts_s={self.sync_host_ts_s:.9f} "
-                f"device_ts_s={self.sync_device_ts_s:.9f} "
-                f"host_offset_s={self.sync_host_offset_s:.9f}\n"
-            )
-            self.log_file.write("# sync_source=rec_mjpeg_post_warmup\n")
-            self.log_file.write("# unified_time = device_timestamp_s + host_offset_s\n")
         self.log_file.write("# frame_log: host_ts_s sequence_num device_timestamp_s bytes\n")
         self.fps_counter = 0
         self._drops_at_last_status = 0
@@ -422,40 +427,6 @@ class CameraRecorder:
         if hasattr(raw_bytes, "tobytes"):
             return raw_bytes.tobytes()
         return bytes(raw_bytes)
-
-    def flush_rec_and_preview(self):
-        while self.drain_rec_frame():
-            pass
-        while self.drain_preview_frame():
-            pass
-
-    def capture_sync_calibration(self, session_dir):
-        """Post-warmup MJPEG frame: map this camera device clock to host time."""
-        self.flush_rec_and_preview()
-        msg = self.q_rec.get(timeout=5.0)
-        host_ts_s = time.time()
-        ts = msg.getTimestamp()
-        if ts is None:
-            raise RuntimeError(
-                f"{self.cam_label}: rec calibration frame missing device timestamp"
-            )
-        device_ts_s = ts.total_seconds()
-        self.sync_host_ts_s = host_ts_s
-        self.sync_device_ts_s = device_ts_s
-        self.sync_host_offset_s = host_ts_s - device_ts_s
-
-        still_path = os.path.join(session_dir, f"sync_still_{self.cam_label}.jpg")
-        frame = cv2.imdecode(
-            np.frombuffer(self._rec_packet_bytes(msg), dtype=np.uint8),
-            cv2.IMREAD_COLOR,
-        )
-        if frame is not None:
-            cv2.imwrite(still_path, frame)
-        print(
-            f"[Sync] {self.cam_label}: rec-stream offset={self.sync_host_offset_s:.9f}s "
-            f"host={host_ts_s:.9f} device={device_ts_s:.9f} "
-            f"seq={msg.getSequenceNum()} -> {still_path}"
-        )
 
     def drain_rec_frame(self):
         rec_msg = self.q_rec.tryGet()
@@ -561,7 +532,9 @@ def main(args=None):
             FORCED_ISO = int(args.iso)
             FORCED_SHUTTER_US = int(args.shutter)
             if getattr(args, "half_res", False):
-                REC_W, REC_H = 2024, 1520
+                # 2016, not the sensor's native 2024 -- see the half-res
+                # comment near REC_W's module-level default for why.
+                REC_W, REC_H = 2016, 1520
                 VIEW_W, VIEW_H = 960, 720   # 4:3 to match sensor aspect
                 FPS = args.fps if args.fps is not None else 60
             else:
@@ -715,10 +688,6 @@ def main(args=None):
         if record_enabled:
             if warmup_enabled:
                 run_warmup(recorders, warmup_frames, preview_enabled)
-            print("[Sync] Calibrating device-host offset from rec stream (post-warmup)...")
-            for recorder in recorders:
-                drain_other_recorders(recorders, recorder)
-                recorder.capture_sync_calibration(session_dir)
             for recorder in recorders:
                 recorder.begin_recording()
             print(f"[Recording started] {datetime.now().isoformat()}")
@@ -814,10 +783,10 @@ def main(args=None):
             try:
                 if alignment_ran:
                     mp4_path = convert_aligned_jpegs_to_grid_mp4(
-                        session_dir, cam_labels, FPS
+                        session_dir, cam_labels, FPS, REC_W, REC_H
                     )
                 else:
-                    mp4_path = convert_mjpegs_to_grid_mp4(video_paths, FPS, session_dir)
+                    mp4_path = convert_mjpegs_to_grid_mp4(video_paths, FPS, session_dir, REC_W, REC_H)
                 print(f"[Success] Grid mp4 saved: {mp4_path}")
             except Exception as e:
                 print(f"[Error] Failed to save grid mp4: {e}")
@@ -834,8 +803,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--half-res",
         action="store_true",
-        help="Record at 2024x1520 @ 60fps instead of 4K @ 30fps. "
-             "Requires separate calibration: calibrate.py/app.py --config calibrate_config_half.yaml",
+        help="Record at 2016x1520 @ 60fps (2x2-binned sensor capture, cropped from the native "
+             "2024x1520 to satisfy the VideoEncoder's width-multiple-of-32 requirement) instead of "
+             "4K @ 30fps. Requires separate calibration: calibrate.py/app.py --config "
+             "calibrate_config_half.yaml",
     )
     parser.add_argument(
         "--native-sensor",

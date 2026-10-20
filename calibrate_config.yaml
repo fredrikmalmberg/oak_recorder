@@ -1,0 +1,69 @@
+board:
+  squares_x: 6
+  squares_y: 4
+  square_size_m: 0.065
+  marker_size_m: 0.049
+  aruco_dict: DICT_4X4_50
+alignment_board:
+  squares_x: 6
+  squares_y: 4
+  square_size_m: 0.065
+  marker_size_m: 0.049
+  aruco_dict: DICT_5X5_50
+camera:
+  record_width: 3840
+  record_height: 2160
+  display_width: 480
+  display_height: 270
+  # One pipeline runs for the whole app.py lifetime -- calibration's ChArUco
+  # detection AND capture's recording both read the same stream, so fps/
+  # mjpeg_quality are shared. fps=30 to give recordings a real framerate;
+  # mjpeg_quality stays high (90) rather than capture.py's own 70, since
+  # heavier JPEG compression measurably risks ChArUco corner-detection
+  # precision (compression artifacts near the board's high-contrast edges
+  # can shift the detected sub-pixel corner position) -- the cost is larger
+  # files during capture than capture.py's own recordings.
+  fps: 30
+  mjpeg_quality: 90
+  shutter_us: 10000
+  iso: 200
+  wb_k: 4500
+quality_gates:
+  min_corners: 8
+  blur_laplacian_var_min: 30.0
+  coverage_grid_rows: 16
+  coverage_grid_cols: 24
+  # Was 64 -- mathematically unreachable (this board has only 15 possible
+  # ChArUco corners, and cells_touched marks at most one cell per corner).
+  # See calibrate.py's DEFAULT_CONFIG comment on this key for the full story.
+  min_coverage_cells_per_frame: 8
+  min_pose_translation_diversity_m: 0.05
+  min_pose_angle_diversity_deg: 8.0
+intrinsics:
+  reproj_error_threshold_px: 0.6
+  coverage_ratio_threshold: 0.8
+  min_samples_before_calibrate: 8
+  recalibrate_every_n_samples: 3
+  max_samples_per_camera: 150
+intrinsics_cache:
+  enabled: true
+  path: output/calibration/intrinsics_cache.json
+extrinsics:
+  simultaneity_tolerance_ms: 80.0
+  min_edge_observations: 5
+  use_pose_graph_optimization: true
+  naive_chain_error_threshold_deg: 1.0
+runtime:
+  auto_stop: false
+  status_print_interval_s: 3.0
+  reconnect_retry_interval_s: 5.0
+  no_detection_warning_s: 20.0
+  cpu_throttle_threshold_pct: 85.0
+  cpu_throttle_release_pct: 70.0
+output:
+  dir: output/calibration
+  save_raw_images: false
+capture:
+  dir: recordings
+viser:
+  port: 8080

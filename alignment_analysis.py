@@ -45,7 +45,9 @@ def ensure_aligned_grid_video(take_dir, report, force=False):
     if not force and os.path.exists(output_path):
         return output_path
     cam_labels = sorted(report["cameras"].keys())
-    return align_session.convert_aligned_jpegs_to_grid_mp4(take_dir, cam_labels, report["fps"])
+    return align_session.convert_aligned_jpegs_to_grid_mp4(
+        take_dir, cam_labels, report["fps"], report["rec_w"], report["rec_h"]
+    )
 
 
 def match_calibration_to_take(calibration_path, take_dir, cfg=None):

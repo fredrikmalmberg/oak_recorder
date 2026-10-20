@@ -150,6 +150,7 @@ import base64
 import html
 import os
 import queue
+import random
 import re
 import threading
 import time
@@ -174,6 +175,7 @@ import align_session
 import calibrate
 import camera_boot_stats
 import capture
+import flash_control
 import postprocess
 
 CALIBRATION_FILENAME_RE = re.compile(r"^\d{8}_\d{6}_\d+cam\.json$")
@@ -476,6 +478,18 @@ def maybe_undistort(frame, K, dist, display_size, record_size):
     return cv2.undistort(frame, K_scaled, dist)
 
 
+def draw_flash_not_seen_overlay(frame):
+    """Whole-frame dark-orange tint, applied while the "Detect flash" toggle
+    (flash_detect_state) is armed and this tick's ArUco check came back
+    empty -- same tint-and-blend idiom and color convention as calibrate.
+    draw_coverage_overlay's "undetected" cells (BGR (0, 90, 170)), just
+    applied to the whole frame rather than a per-cell grid, since this is a
+    single tag's current visible/not-visible state, not a spatial map.
+    """
+    overlay = np.full_like(frame, (0, 90, 170))
+    return cv2.addWeighted(overlay, 0.25, frame, 0.75, 0)
+
+
 # ==============================================================================
 # Camera session: connects once (via capture.py's hardened retry helper) and
 # holds whichever pipeline is currently active on that connection. Deliberately
@@ -512,19 +526,7 @@ class AppCameraSession:
         self.log_path = None
         self.writer = None  # capture.BackgroundVideoWriter, while recording_active
         self.log_file = None
-        self.sync_host_ts_s = None
-        self.sync_device_ts_s = None
-        self.sync_host_offset_s = None
         self.preview_updated = False  # set each poll() call, see poll()'s decode_preview
-        # TEMPORARY: addCallback-vs-legacy timestamp comparison, see
-        # cfg["debug"]["legacy_timestamp_compare"] in calibrate.DEFAULT_CONFIG.
-        # legacy_log_file mirrors log_file but logs the pre-addCallback
-        # timestamp method instead, on the same frames, so the two can be
-        # compared on identical motion. Off (None) unless the flag is set.
-        self.legacy_ts_debug = bool(cfg.get("debug", {}).get("legacy_timestamp_compare"))
-        self.legacy_log_file = None
-        self.legacy_sync_host_ts_s = None
-        self._pending_legacy_host_ts_s = None  # this poll()'s legacy read, consumed by the log write below
         # (seq, host_ts_s) pairs fed by _on_full_arrival, a q_full callback
         # that fires on depthai's own internal thread the instant a message
         # is delivered -- see start_calibration_pipeline and
@@ -584,14 +586,13 @@ class AppCameraSession:
 
     def _pop_full_arrival_ts(self, seq):
         """Host arrival time for full-res frame `seq`, from the callback
-        above, instead of timestamping whenever this session's own poll()/
-        capture_sync_calibration() happens to notice the frame via tryGet()/
-        get() -- which, measured live, lags the true arrival by ~15ms on
-        average (more under load) and carries a systematic per-camera bias
-        from main()'s fixed cam0->cam6 polling order. Bounded search (a
-        stale entry can accumulate here if q_full itself drops a frame
-        before this session dequeues it, e.g. during the pre-take flush in
-        capture_sync_calibration) rather than an unbounded loop; falls back
+        above, instead of timestamping whenever this session's own poll()
+        happens to notice the frame via tryGet() -- which, measured live,
+        lags the true arrival by ~15ms on average (more under load) and
+        carries a systematic per-camera bias from main()'s fixed
+        cam0->cam6 polling order. Bounded search (a stale entry can
+        accumulate here if q_full itself drops a frame before this session
+        dequeues it) rather than an unbounded loop; falls back
         to time.time() if the callback hasn't caught up yet (should be rare
         to never, given the callback consistently fired first/simultaneously
         in testing) rather than block or misattribute a different frame's
@@ -622,9 +623,9 @@ class AppCameraSession:
     def begin_recording(self, video_path, log_path, header_extra_lines=()):
         """Ports CameraRecorder.begin_recording (capture.py) -- same header
         shape (video path; camera/device_id/usb_speed; iso/shutter/
-        resolution/fps/quality; sync-calibration block if available; column
-        header), plus caller-supplied extra lines (take/session/calibration
-        info) so this method itself doesn't need to know about that.
+        resolution/fps/quality; column header), plus caller-supplied extra
+        lines (take/session/calibration info) so this method itself doesn't
+        need to know about that.
 
         fps/mjpeg_quality come from cfg["camera"] -- there's only one
         pipeline for the whole app lifetime (see start_calibration_pipeline),
@@ -644,95 +645,17 @@ class AppCameraSession:
         self.log_file.write(f"# iso={self.actual_iso} shutter_us={self.actual_shutter_us} "
                              f"{cam_cfg['record_width']}x{cam_cfg['record_height']}@{cam_cfg['fps']}fps "
                              f"mjpeg_q={cam_cfg['mjpeg_quality']}\n")
-        if self.sync_host_offset_s is not None:
-            self.log_file.write(
-                f"# sync_calibration host_ts_s={self.sync_host_ts_s:.9f} "
-                f"device_ts_s={self.sync_device_ts_s:.9f} "
-                f"host_offset_s={self.sync_host_offset_s:.9f}\n"
-            )
-            self.log_file.write("# sync_source=rec_mjpeg_per_take\n")
-            self.log_file.write("# unified_time = device_timestamp_s + host_offset_s\n")
         for line in header_extra_lines:
             self.log_file.write(f"# {line}\n")
         self.log_file.write("# frame_log: host_ts_s sequence_num device_timestamp_s bytes\n")
 
-        # TEMPORARY, see cfg["debug"]["legacy_timestamp_compare"]: a sibling
-        # log of the pre-addCallback timestamp method, on the same frames
-        # (joined by sequence_num), for a direct addCallback-vs-legacy
-        # comparison via align_session.py --legacy-host-ts.
-        if self.legacy_ts_debug:
-            legacy_log_path = os.path.join(
-                os.path.dirname(log_path), f"frame_timestamps_legacy_{self.cam_label}.log",
-            )
-            self.legacy_log_file = open(legacy_log_path, "w", encoding="utf-8")
-            self.legacy_log_file.write(
-                "# TEMPORARY debug log for addCallback vs legacy timestamp comparison -- safe to delete\n"
-            )
-            self.legacy_log_file.write(f"# camera={self.cam_label} device_id={self.device_id}\n")
-            if self.legacy_sync_host_ts_s is not None:
-                legacy_offset_s = self.legacy_sync_host_ts_s - self.sync_device_ts_s
-                self.legacy_log_file.write(
-                    f"# sync_calibration legacy_host_ts_s={self.legacy_sync_host_ts_s:.9f} "
-                    f"device_ts_s={self.sync_device_ts_s:.9f} "
-                    f"legacy_host_offset_s={legacy_offset_s:.9f}\n"
-                )
-            self.legacy_log_file.write("# frame_log: legacy_host_ts_s sequence_num\n")
-
         self.recording_active = True
-
-    def capture_sync_calibration(self, take_dir):
-        """Ports CameraRecorder.capture_sync_calibration (capture.py) -- one
-        blocking full-res frame read maps this camera's device clock to host
-        time. Run once per TAKE (not once per session): cheap (a single
-        frame), and sidesteps the untested long-idle-drift question the
-        README's persistent-streams note flags for an open pipeline sitting
-        idle between takes -- each take gets a fresh offset instead.
-
-        host_ts_s comes from the same q_full arrival-callback path poll()
-        uses (_pop_full_arrival_ts), not a time.time() read taken right
-        after this method's own blocking get() -- even that tight a
-        measurement was ~15ms looser (median, on real hardware) than the
-        callback, which fires on depthai's own delivery thread the instant
-        the message arrives rather than whenever this method's own get()
-        call happens to unblock.
-        """
-        while self.q_full.tryGet() is not None:
-            pass
-        while self.q_preview.tryGet() is not None:
-            pass
-        msg = self.q_full.get(timeout=5.0)
-        # TEMPORARY, see cfg["debug"]["legacy_timestamp_compare"]: the exact
-        # pre-addCallback read point (a time.time() taken right where this
-        # blocking get() unblocks) for a legacy one-shot host_offset_s.
-        if self.legacy_ts_debug:
-            self.legacy_sync_host_ts_s = time.time()
-        host_ts_s = self._pop_full_arrival_ts(msg.getSequenceNum())
-        ts = msg.getTimestamp()
-        if ts is None:
-            raise RuntimeError(f"{self.cam_label}: sync-calibration frame missing device timestamp")
-        device_ts_s = ts.total_seconds()
-        self.sync_host_ts_s = host_ts_s
-        self.sync_device_ts_s = device_ts_s
-        self.sync_host_offset_s = host_ts_s - device_ts_s
-
-        still_path = os.path.join(take_dir, f"sync_still_{self.cam_label}.jpg")
-        frame = cv2.imdecode(
-            np.frombuffer(calibrate._packet_bytes(msg), dtype=np.uint8), cv2.IMREAD_COLOR,
-        )
-        if frame is not None:
-            cv2.imwrite(still_path, frame)
-        print(f"[Sync] {self.cam_label}: offset={self.sync_host_offset_s:.9f}s "
-              f"host={host_ts_s:.9f} device={device_ts_s:.9f} "
-              f"seq={msg.getSequenceNum()} -> {still_path}")
 
     def end_recording(self):
         self.recording_active = False
         if self.log_file is not None:
             self.log_file.close()
             self.log_file = None
-        if self.legacy_log_file is not None:
-            self.legacy_log_file.close()
-            self.legacy_log_file = None
         if self.writer is not None:
             self.writer.stop()
             self.writer = None
@@ -808,12 +731,6 @@ class AppCameraSession:
         if full_msg is None:
             return False
 
-        # TEMPORARY: this is the exact spot (right after tryGet() confirms a
-        # frame, before anything else) the pre-addCallback code read its
-        # timestamp from -- see cfg["debug"]["legacy_timestamp_compare"].
-        if self.legacy_ts_debug:
-            self._pending_legacy_host_ts_s = time.time()
-
         self.last_frame_full_ts = self._pop_full_arrival_ts(full_msg.getSequenceNum())
         now_mono = time.monotonic()
         if self._fps_prev_mono is not None:
@@ -830,10 +747,6 @@ class AppCameraSession:
                 f"{self.last_frame_full_ts:.9f} {full_msg.getSequenceNum()} "
                 f"{device_ts_s:.9f} {len(data)}\n"
             )
-            if self.legacy_ts_debug and self.legacy_log_file is not None:
-                self.legacy_log_file.write(
-                    f"{self._pending_legacy_host_ts_s:.9f} {full_msg.getSequenceNum()}\n"
-                )
             return True
 
         if want_raw_bytes:
@@ -1023,28 +936,152 @@ def show_calibration_picker(viser_mgr, cfg, cmd_queue, sessions, cam_ids, intrin
         return choice[0], choice[1], session_name_value
 
 
+CAMERA_IDENTITY_PATH = os.path.join("logs", "camera_identity.json")
+
+
+def load_camera_identity():
+    """Tiny persisted cache: {"skip_oak_d": bool, "oak_d_device_id": str|None}.
+    Backs show_resolution_picker's "Never even try OAK-D" checkbox -- that
+    setting, and the OAK-D's device_id once learned (via one probe_camera_
+    kind call), are remembered across app runs so a ticked box means the
+    OAK-D is filtered out of device_infos before ANY connection attempt to
+    it, on every future run, not just the one it was ticked in. Safe with
+    no file yet (fresh install): both fields default to "unknown"/off.
+    """
+    if not os.path.exists(CAMERA_IDENTITY_PATH):
+        return {"skip_oak_d": False, "oak_d_device_id": None}
+    try:
+        with open(CAMERA_IDENTITY_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"skip_oak_d": False, "oak_d_device_id": None}
+    return {
+        "skip_oak_d": bool(data.get("skip_oak_d", False)),
+        "oak_d_device_id": data.get("oak_d_device_id"),
+    }
+
+
+def save_camera_identity(identity):
+    os.makedirs(os.path.dirname(CAMERA_IDENTITY_PATH), exist_ok=True)
+    with open(CAMERA_IDENTITY_PATH, "w", encoding="utf-8") as f:
+        json.dump(identity, f, indent=2)
+
+
+def show_resolution_picker(viser_mgr):
+    """Shown BEFORE any config/camera/board setup exists -- the operator's
+    choice here determines which calibrate_config*.yaml gets loaded, which
+    in turn determines resolution, fps, and which camera pipeline variant
+    (v2 native-sensor-binned vs v3 ISP-scale, see calibrate.
+    build_calibration_pipeline) every camera uses for the rest of this run.
+
+    Also shows a persistent "Never even try OAK-D" checkbox (see
+    load_camera_identity/save_camera_identity) -- a debugging aid, added
+    after a live "disable this camera" toggle in the exposure modal
+    (closing a running camera's device on demand) was confirmed live this
+    session to reliably crash the whole app: closing even one healthy
+    device while others are concurrently open makes every other device
+    miss its keepalive ping (device.close()'s own crash-dump-collection
+    step appears to block long enough to cause this) and triggers a native
+    depthai crash. Ticking this instead means the OAK-D is filtered out of
+    device_infos before step_boot() ever connects it, on this run AND every
+    future one (remembered on disk) -- there's then never a moment where it
+    needs to be closed while others are live.
+
+    This function itself NEVER touches a dai.Device -- no probing, no
+    pinging, nothing -- so clicking a resolution button responds instantly
+    regardless of how many cameras are plugged in or whether any are
+    misbehaving. It only reads/writes the small camera_identity.json cache.
+    The OAK-D's device_id is instead learned "for free" the first time it's
+    actually connected during the real staggered boot (see main()'s
+    step_boot -- it already opens a getConnectedCameraFeatures() check on a
+    device it's connecting anyway, no extra connect/close needed), so
+    ticking this box before the OAK-D's identity is known still boots it
+    ONE more time, but never again after that.
+
+    viser_mgr is already constructed at this point (see main()) using only
+    a bootstrap port -- ViserManager.__init__ touches nothing else from cfg,
+    so this reuses that same server/browser session rather than opening a
+    second one once the real cfg is known. Blocks (plain queue.get(), no
+    polling loop) since nothing else needs to progress while this is up --
+    unlike show_calibration_picker, no camera is connected yet at this
+    point for there to be boot progress to interleave.
+
+    Returns (chosen_config_path, excluded_device_ids).
+    """
+    identity = load_camera_identity()
+    choice_queue = queue.Queue()
+    with viser_mgr.server.gui.add_modal("Session setup") as modal:
+        viser_mgr.server.gui.add_markdown(
+            "**Select a camera resolution/mode for this session.**\n\n"
+            "This determines calibration too -- each profile has its own "
+            "saved intrinsics, kept separate from the others."
+        )
+        for label, path in calibrate.RESOLUTION_PROFILES:
+            btn = viser_mgr.server.gui.add_button(label)
+            btn.on_click(lambda _, p=path: choice_queue.put(p))
+
+        viser_mgr.server.gui.add_divider()
+        skip_oak_d_cb = viser_mgr.server.gui.add_checkbox(
+            "Never even try OAK-D (remembered across runs)",
+            initial_value=identity["skip_oak_d"],
+        )
+
+    chosen_path = choice_queue.get()
+    skip_oak_d = skip_oak_d_cb.value
+    oak_d_device_id = identity["oak_d_device_id"]
+    excluded_device_ids = {oak_d_device_id} if skip_oak_d and oak_d_device_id is not None else set()
+    save_camera_identity({"skip_oak_d": skip_oak_d, "oak_d_device_id": oak_d_device_id})
+    modal.close()
+    return chosen_path, excluded_device_ids
+
+
 # ==============================================================================
 # Main
 # ==============================================================================
 def main():
+    # Started as the very first thing in main() -- connecting over BLE
+    # (scan + GATT connect) commonly takes several seconds, so starting it
+    # here gives it the most possible time to settle in the background
+    # before an operator ever reaches "Start capture", where low latency
+    # actually matters (see _do_start_take's use of this). Doesn't depend
+    # on cfg/dai/anything else, so there's no reason to wait.
+    flash_conn = flash_control.FlashConnection()
+
     parser = argparse.ArgumentParser(description="Combined calibration + capture app (viser)")
-    parser.add_argument("--config", default=calibrate.CONFIG_PATH_DEFAULT,
-                         help="Path to the YAML config file (shared with calibrate.py)")
+    parser.add_argument(
+        "--config", default=None,
+        help="Path to the YAML config file (shared with calibrate.py). If omitted, a startup "
+             "picker lets you choose a resolution profile (see calibrate.RESOLUTION_PROFILES).",
+    )
     args = parser.parse_args()
 
     if dai is None:
         print("[Error] depthai is not installed in this environment.")
         return
 
-    cfg = calibrate.load_config(args.config)
+    if args.config is not None:
+        # Explicit --config skips the picker entirely -- unchanged bypass
+        # behavior for scripted/automated runs. No camera-exclusion option
+        # in this path either: every discovered device is used.
+        cfg = calibrate.load_config(args.config)
+        viser_mgr = calibrate.ViserManager(cfg)
+        excluded_device_ids = set()
+    else:
+        # Bootstrap a viser server using only the default port -- ViserManager.
+        # __init__ touches nothing else from cfg at construction time, so this
+        # is safe before any resolution profile is known. Reused as-is (same
+        # server/browser session, not a second one) once a profile is picked.
+        viser_mgr = calibrate.ViserManager({"viser": {"port": calibrate.DEFAULT_CONFIG["viser"]["port"]}})
+        chosen_path, excluded_device_ids = show_resolution_picker(viser_mgr)
+        cfg = calibrate.load_config(chosen_path)
+        viser_mgr.cfg = cfg
+
+    print(f"[Viser] http://localhost:{viser_mgr.server.get_port()}")
     if psutil is not None:
         psutil.cpu_percent(interval=None)  # prime -- first call has no baseline, see update below
     _board, detector, board_points_3d = calibrate.build_board(cfg)
     _alignment_board, alignment_detector, alignment_board_points_3d = calibrate.build_board(cfg, "alignment_board")
     image_size = (cfg["camera"]["record_width"], cfg["camera"]["record_height"])
-
-    viser_mgr = calibrate.ViserManager(cfg)
-    print(f"[Viser] http://localhost:{viser_mgr.server.get_port()}")
 
     # Device IDs only, no connection -- fast. sessions is pre-populated for
     # every DISCOVERED device (all connected=False), not just ones that end
@@ -1057,6 +1094,12 @@ def main():
     if not device_infos:
         print("[Error] No OAK devices discovered.")
         return
+    if excluded_device_ids:
+        device_infos = [info for info in device_infos if info.deviceId not in excluded_device_ids]
+        print(f"[Camera] Excluded for this session: {', '.join(sorted(excluded_device_ids))}")
+        if not device_infos:
+            print("[Error] Every discovered camera was excluded for this session.")
+            return
     device_infos = camera_boot_stats.rank_boot_order(device_infos)
     session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     sessions = {
@@ -1072,6 +1115,11 @@ def main():
         "attempted": set(),   # cam_ids that have had a first boot attempt (see Pass 1's reconnect guard)
         "failures": [],       # (cam_id, device_id, error_str), drained into modals by drain_boot_failures
     }
+    # Reloaded (not reused from show_resolution_picker) since that function
+    # may not have run at all (--config bypass). Used below to learn the
+    # OAK-D's device_id "for free" off an already-open connection, the
+    # first time it's ever actually booted -- see step_boot.
+    camera_identity = load_camera_identity()
 
     def step_boot():
         """At most one camera's connect+pipeline-start per call, staggered
@@ -1092,6 +1140,24 @@ def main():
         boot_state["attempted"].add(cam_id)
         try:
             sess.connect()
+            # Piggybacks on the connection just made above -- no extra
+            # connect/close of its own (see show_resolution_picker's
+            # docstring for why a standalone probe was removed: it made
+            # the resolution picker block/look unresponsive). Only writes
+            # camera_identity.json the first time this device_id is seen
+            # as the OAK-D, so a normal boot's steady state does no extra
+            # disk I/O.
+            try:
+                is_stereo = dai.CameraBoardSocket.CAM_B in {
+                    f.socket for f in sess.device.getConnectedCameraFeatures()
+                }
+            except Exception:
+                is_stereo = False
+            if is_stereo and camera_identity.get("oak_d_device_id") != sess.device_id:
+                camera_identity["oak_d_device_id"] = sess.device_id
+                save_camera_identity(camera_identity)
+                print(f"[Camera] Identified {cam_id} ({sess.device_id}) as the OAK-D -- "
+                      f"cached for future 'Never even try OAK-D' runs.")
             sess.start_calibration_pipeline()
             if sess.usb_speed not in (dai.UsbSpeed.SUPER, dai.UsbSpeed.SUPER_PLUS):
                 boot_state["failures"].append(
@@ -1325,6 +1391,20 @@ def main():
     # flag; see _set_detection.
     detection_state = {"enabled": True}
 
+    # "Detect flash" toggle (calibration mode only, see the button near
+    # calibration_detection_checkbox below). Detection itself runs off-
+    # thread in calibrate.DetectionWorker (full resolution, deliberately
+    # slow by user request rather than a faster downscaled search -- see
+    # DetectionWorker.run()'s detect_flash branch), sharing the SAME per-
+    # camera worker ChArUco detection already uses -- arming this forces
+    # detection_state["enabled"] off (see _toggle_flash_detect) so the two
+    # never compete for that one slow decode+detect slot. "seen" updates
+    # at whatever cadence the worker manages, not persisted/latched beyond
+    # that -- the workflow is aiming a camera in real time at a STATIONARY
+    # LED, so the highlight must be able to flip back off once the tag
+    # leaves frame, not stay stuck green from an earlier moment.
+    flash_detect_state = {"armed": False, "seen": {cam_id: False for cam_id in cam_ids}}
+
     # Per-camera calibration enable/disable -- lets an operator exclude a
     # specific camera's detections from the shared pose_graph extrinsics
     # solve while diagnosing a "jumping" board pose (one bad camera's edges
@@ -1492,6 +1572,40 @@ def main():
             calibration_detection_checkbox = viser_mgr.server.gui.add_checkbox(
                 "ChArUco detection enabled", initial_value=detection_state["enabled"],
             )
+
+            # Rig-setup aid: the sync LED is mounted in a stationary spot,
+            # and an operator aims/adjusts each camera (or the LED's
+            # placement) until every camera can see its ArUco tag. A plain
+            # on/off toggle, not "start/reset" -- see flash_detect_state's
+            # comment for why this needs to be live/instantaneous rather
+            # than a one-way latch.
+            detect_flash_btn = viser_mgr.server.gui.add_button("Detect flash")
+
+            def _toggle_flash_detect(_):
+                flash_detect_state["armed"] = not flash_detect_state["armed"]
+                if flash_detect_state["armed"]:
+                    # Flash and ChArUco detection share one per-camera
+                    # DetectionWorker/raw-bytes pipeline (see need_raw_bytes
+                    # in Pass 1) and the worker only ever does one or the
+                    # other per submission (detect_flash) -- forcing ChArUco
+                    # off here, not just leaving it independent, avoids
+                    # quietly wasting the worker's slow full-res decode+
+                    # detect budget on a board search the operator isn't
+                    # even looking at while aiming for the flash tag.
+                    # _set_detection is defined later in main() but already
+                    # exists in this closure's scope by the time a button
+                    # click can actually fire it.
+                    flash_detect_state["pre_armed_detection_enabled"] = detection_state["enabled"]
+                    _set_detection(False)
+                else:
+                    _set_detection(flash_detect_state.get("pre_armed_detection_enabled", True))
+                detect_flash_btn.label = (
+                    "Stop detecting flash" if flash_detect_state["armed"] else "Detect flash"
+                )
+                detect_flash_btn.color = "red" if flash_detect_state["armed"] else "gray"
+
+            detect_flash_btn.on_click(_toggle_flash_detect)
+            flash_detect_status_md = viser_mgr.server.gui.add_markdown("")
 
             viser_mgr.add_world_alignment_button(request_world_alignment)
             align_status_md = viser_mgr.server.gui.add_markdown(_world_align_status_text())
@@ -1910,7 +2024,6 @@ def main():
             # it's later aligned (align_session.py's `timebase` records the
             # latter) -- see alignment_improvements.md.
             "depthai_version": dai.__version__ if dai is not None else None,
-            "legacy_timestamp_compare_debug": bool(cfg.get("debug", {}).get("legacy_timestamp_compare")),
             "cameras": cameras_meta,
         }
         with open(os.path.join(take_dir, "take_meta.json"), "w", encoding="utf-8") as f:
@@ -1925,7 +2038,33 @@ def main():
         reconnected or rebooted when entering capture mode. Every take just
         opens a fresh writer/log per camera on the pipeline that's already
         running.
+
+        Fires the sync LED's "S" sequence right at the top, over the
+        persistent BLE connection opened at app startup (flash_conn, see
+        main()) -- send_command_nowait is a single GATT write on an
+        already-open connection and returns immediately, not a fresh
+        multi-second scan+connect, so this stays safe to call straight from
+        this otherwise-cheap, main-thread function without a wrapper
+        thread. Starting it as early as possible in this function (before
+        the per-camera begin_recording loop below) keeps it as close as
+        practical to the actual recording start, though the LED's own
+        firmware already builds in a 1s wait before the white flash, so the
+        small remaining scheduling jitter here is negligible against that.
+        Logs its own success/failure (including "not connected yet") --
+        never raises, never delays the take if the device isn't reachable.
+
+        No per-camera clock-offset calibration happens here anymore
+        (removed -- see git history): the default alignment path
+        (align_session.py) already trusts each camera's own depthai-
+        synced device_ts_s directly, and that per-camera BLOCKING frame
+        read, done sequentially for every camera right at take-start, was
+        exactly the kind of main-thread stall that can make OTHER devices
+        miss their depthai keepalive ping and get disconnected --
+        confirmed live this session as the cause of a native crash when
+        starting an 8-camera take.
         """
+        flash_conn.send_command_nowait("S")
+
         if capture_state["session_ts"] is None:
             capture_state["session_ts"] = datetime.now().strftime("%Y%m%d_%H%M%S")
             session_dir = os.path.join(cfg["capture"]["dir"], capture_state["session_ts"])
@@ -1980,10 +2119,6 @@ def main():
 
         cameras_meta = {}
         for session in connected_sessions:
-            try:
-                session.capture_sync_calibration(take_dir)
-            except Exception as exc:
-                print(f"[Capture] {session.cam_id}: sync calibration failed: {exc}")
             video_path = os.path.join(take_dir, f"video_{session.cam_id}.mjpeg")
             log_path = os.path.join(take_dir, f"frame_timestamps_{session.cam_id}.log")
             session.begin_recording(video_path, log_path, header_extra)
@@ -1994,7 +2129,6 @@ def main():
                 "iso": session.actual_iso,
                 "video_path": video_path,
                 "log_path": log_path,
-                "sync_host_offset_s": session.sync_host_offset_s,
             }
 
         write_take_meta(take_dir, cameras_meta)
@@ -2294,11 +2428,21 @@ def main():
                 )
                 need_raw_bytes = (
                     not recording_now
-                    and detection_state["enabled"]
                     and app_state["mode"] == "calibrate"
+                    # Flash-marker detection also needs raw bytes -- it's handed to
+                    # the SAME per-camera DetectionWorker as ChArUco detection, just
+                    # with detect_flash=True so the worker runs a plain ArUco search
+                    # instead (full resolution, deliberately slow -- see submit()'s
+                    # call site and DetectionWorker.run()'s detect_flash branch for
+                    # why). The two are mutually exclusive in practice (arming
+                    # "Detect flash" forces detection_state["enabled"] off, see
+                    # _toggle_flash_detect), but written as an OR so either one
+                    # alone is sufficient to trigger a submission.
+                    and (detection_state["enabled"] or flash_detect_state["armed"])
                 )
                 decode_this_preview = previews_on and (
                     show_grid or (show_single and cam_id == capture_preview["selected"])
+                    or flash_detect_state["armed"]
                 )
                 try:
                     got_frame = session.poll(
@@ -2337,6 +2481,14 @@ def main():
                     if (detection_state["enabled"] and app_state["mode"] == "calibrate"
                             and state is not None and not state.intrinsics_locked):
                         preview_frame = calibrate.draw_coverage_overlay(preview_frame, state.coverage)
+                    if flash_detect_state["armed"] and not flash_detect_state["seen"].get(cam_id, False):
+                        # Detection itself runs on the full-res frame below (not this
+                        # preview frame -- see need_full_decode's comment on why); this
+                        # just reads that result to decide whether to tint for display.
+                        # One-tick-stale on the very first armed tick (negligible --
+                        # a single ~30-60ms lag, not a correctness issue) since the
+                        # full-res block below hasn't updated "seen" yet this iteration.
+                        preview_frame = draw_flash_not_seen_overlay(preview_frame)
                     latest_preview_frames[cam_id] = preview_frame
                     if cam_id == capture_preview["selected"]:
                         # Pushed even while capture_preview_image.visible is
@@ -2370,6 +2522,7 @@ def main():
                         K=calib_states[cam_id].K.copy(),
                         dist=calib_states[cam_id].dist.copy(),
                         do_alignment=world_align["pending"],
+                        detect_flash=flash_detect_state["armed"],
                     )
 
             if exposure_state["pending"]:
@@ -2670,6 +2823,20 @@ def main():
                 for cam_id in cam_ids:
                     viser_mgr.mark_pose_unknown(cam_id)
 
+            # Deliberately OUTSIDE the detection_state["enabled"]-gated block
+            # above -- arming "Detect flash" forces that flag off (see
+            # _toggle_flash_detect), so draining flash results needs its own,
+            # independent path rather than living inside a block that's
+            # skipped exactly when this matters. Just a non-blocking mailbox
+            # read per camera (calibrate.DetectionWorker.try_get_result) --
+            # the submission side (Pass 1 above) already decides whether each
+            # worker is doing ChArUco or flash detection via detect_flash.
+            if flash_detect_state["armed"]:
+                for cam_id in cam_ids:
+                    result = calib_workers[cam_id].try_get_result()
+                    if result is not None and result.get("flash_seen") is not None:
+                        flash_detect_state["seen"][cam_id] = result["flash_seen"]
+
             align_status_md.content = _world_align_status_text()
 
             # Capture preview's "middle camera" -- re-picked every tick from
@@ -2688,6 +2855,20 @@ def main():
                     for cam_id in cam_ids if cam_id in viser_mgr.frustums
                 }
                 picked = pick_middle_camera(cam_positions)
+                if picked is None and capture_preview["selected"] is None:
+                    # No frustum positions to pick a "middle" camera from --
+                    # happens when uncalibrated (frustums come from
+                    # extrinsics), confirmed live: this left Capture mode's
+                    # single-camera preview stuck on "waiting for data"
+                    # forever with no way to ever select a camera. Fall back
+                    # to a random CONNECTED camera instead. Guarded on
+                    # `selected is None` so this only rolls once, not every
+                    # tick -- the disconnect check above already resets back
+                    # to "auto" (re-triggering this fallback) if that camera
+                    # later drops.
+                    connected_cams = [c for c in cam_ids if sessions[c].connected]
+                    if connected_cams:
+                        picked = random.choice(connected_cams)
                 if picked is not None:
                     capture_preview["selected"] = picked
 
@@ -2733,10 +2914,14 @@ def main():
                     if not camera_enabled.get(cam_id, True):
                         extra.append("disabled (excluded from calibration)")
                 operational = []
+                if flash_detect_state["armed"]:
+                    flash_line = "FLASH: visible" if flash_detect_state["seen"][cam_id] else "FLASH: not in view"
+                    extra.append(flash_line)
+                    operational.append(flash_line)
                 if cam_id in undistort_missing_intrinsics:
-                    line = "undistort: enabled but no usable intrinsics -- showing raw frame"
-                    extra.append(line)
-                    operational.append(line)
+                    undistort_line = "undistort: enabled but no usable intrinsics -- showing raw frame"
+                    extra.append(undistort_line)
+                    operational.append(undistort_line)
                 per_cam_operational[cam_id] = operational
                 # Latest live board detection's reprojection error (px + mm),
                 # not the intrinsics calibration's aggregate RMS -- see
@@ -2758,6 +2943,12 @@ def main():
                     f"converged: {'yes' if state.converged else 'no'}",
                     *extra,
                 ]
+
+            if flash_detect_state["armed"]:
+                n_seen = sum(1 for v in flash_detect_state["seen"].values() if v)
+                flash_detect_status_md.content = f"_Flash visible in {n_seen}/{len(cam_ids)} cameras._"
+            else:
+                flash_detect_status_md.content = ""
 
             # Live-preview panel's grid -- throttled well below the main
             # loop's own tick rate: JPEG-encoding+base64'ing every connected

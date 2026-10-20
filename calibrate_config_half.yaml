@@ -1,22 +1,67 @@
-# Half-resolution calibration config: 2024x1520 @ 60fps
+# Half-resolution calibration config: 2016x1520 @ 60fps
 #
 # Use with:
 #   python calibrate.py --config calibrate_config_half.yaml
 #   python app.py       --config calibrate_config_half.yaml
 #
-# 2024x1520 is a 2x2 bin of the full IMX412 sensor (4048x3040), giving a
-# wider FOV than the 4K crop (3840x2160). Intrinsics are NOT related to the
-# 4K intrinsics by a simple scale factor -- they require a dedicated
-# calibration run. The intrinsics cache keys by (device_id, resolution), so
-# 4K and half-res calibrations coexist without conflict.
+# The sensor CAPTURE is the IMX378's native THE_2024X1520 2x2-binned mode
+# (4056x3040 full res, confirmed via dai.Device.getConnectedCameraFeatures()
+# on this rig's actual cameras), giving a wider FOV than the 4K crop
+# (3840x2160). Recorded width is cropped from 2024 to 2016 (4px/side,
+# <0.4% FOV loss) because the hardware VideoEncoder requires a width
+# that's a multiple of 32 -- 2024 is not (confirmed empirically: it raised
+# a device-side critical error and produced zero frames), 2016 = 63*32 is.
+# This yaml's record_width/height MUST match whatever capture.py actually
+# records in --half-res mode, or calibration and capture would silently
+# disagree on resolution. Intrinsics are NOT related to the 4K intrinsics
+# by a simple scale factor -- they require a dedicated calibration run.
+# The intrinsics cache is keyed by device_id ONLY (not resolution) inside
+# whatever single file intrinsics_cache.path points at -- so 4K and half-res
+# calibrations only coexist because each profile points at a SEPARATE file
+# below; without that, a half-res calibration run would silently overwrite
+# a camera's 4K intrinsics entry in the shared default cache file. (An
+# earlier version of this comment claimed the cache key itself included
+# resolution -- confirmed false by reading calibrate.upsert_intrinsics_cache;
+# this yaml previously didn't override intrinsics_cache.path at all, so it
+# was actually hitting that collision -- fixed below.)
+#
+# native_sensor: true selects calibrate.py's v2 ColorCamera +
+# setResolution(THE_2024X1520) path (real 2x2 hardware binning, cropped to
+# record_width/height) over the default v3 Camera/requestOutput ISP-scale
+# path -- measured this session (noise-sigma + sharpness comparison across
+# matching ISO/fps settings, see git history for this file's commit) to
+# have both lower noise AND higher sharpness than the v3 path.
 
 camera:
-  record_width: 2024
+  record_width: 2016
   record_height: 1520
   display_width: 480
   display_height: 360   # 4:3 to match sensor aspect (vs 16:9 at 4K)
   fps: 60
   mjpeg_quality: 90
+  native_sensor: true
+
+intrinsics_cache:
+  path: output/calibration_half/intrinsics_cache.json
+
+# quality_gates.min_coverage_cells_per_frame: DEFAULT_CONFIG's value (8,
+# see calibrate.py's own comment on this key for the full story -- the
+# real bug was that this project's board has only 15 possible ChArUco
+# corners, making the OLD default of 64 mathematically unreachable at ANY
+# resolution, not something specific to this profile) already covers the
+# dominant fix. This profile still gets its OWN, slightly lower override
+# for a real secondary effect: THE_4_K is a CROP of the sensor (3840x2160
+# from the full 4056x3040 -- ~71% of its height), while THE_2024X1520 reads
+# the FULL sensor (2x2-binned, not cropped) -- so the same physical board
+# at the same distance fills a somewhat smaller fraction of THIS profile's
+# frame than it would at 4K, touching fewer coverage cells per shot.
+# Roughly 0.67x DEFAULT_CONFIG's 8 (from the two modes' ~0.946 width x
+# ~0.711 height crop ratio), rounded to 6 -- an empirical starting point
+# layered on top of the main fix, not a precise derivation; tune further
+# if boards still get rejected (lower) or trivially accepted from a tiny
+# corner of frame (raise) once tested live.
+quality_gates:
+  min_coverage_cells_per_frame: 6
 
 output:
   dir: output/calibration_half

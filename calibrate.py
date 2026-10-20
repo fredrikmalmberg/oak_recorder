@@ -59,6 +59,15 @@ from camera_settings import DEFAULT_CAMERA_SETTINGS
 
 CONFIG_PATH_DEFAULT = "calibrate_config.yaml"
 
+# Named resolution profiles app.py's startup picker offers -- explicit list
+# rather than scanning for calibrate_config*.yaml files, so a stray/unrelated
+# yaml dropped in the repo root never shows up as a selectable option. Add a
+# new resolution by adding one entry here plus one new config file.
+RESOLUTION_PROFILES = [
+    ("4K (3840x2160 @ 30fps)", "calibrate_config.yaml"),
+    ("Half-res binned (2016x1520 @ 60fps)", "calibrate_config_half.yaml"),
+]
+
 DEFAULT_CONFIG = {
     "board": {
         # 6x4 squares at 65mm/49mm -> 390x260mm, sized for an A3 print
@@ -96,19 +105,43 @@ DEFAULT_CONFIG = {
         "shutter_us": DEFAULT_CAMERA_SETTINGS["shutter_us"],
         "iso": DEFAULT_CAMERA_SETTINGS["iso"],
         "wb_k": DEFAULT_CAMERA_SETTINGS["wb_k"],
+        # False (default): build_calibration_pipeline's v3 Camera/
+        # requestOutput ("ISP scale") path -- works at any resolution. True:
+        # v2 ColorCamera + setResolution(THE_2024X1520) path, real 2x2
+        # hardware sensor binning -- only meaningful when record_width/
+        # record_height are a crop of that mode (see calibrate_config_half.
+        # yaml, the only profile that sets this True today). Mirrors
+        # capture.py's create_dual_stream_pipeline's own native_sensor flag.
+        "native_sensor": False,
     },
     "quality_gates": {
         "min_corners": 8,
         "blur_laplacian_var_min": 30.0,
         # rows/cols quadrupled (from 4x6) per user feedback -- the coarser
         # grid could show a cell as "covered" from just a corner clipping
-        # it, hiding real corner-of-frame coverage gaps. min_coverage_cells_
-        # per_frame is scaled by the same 4x4=16x cell-count increase to
-        # preserve its original meaning (a board detection must still cover
-        # roughly the same physical fraction of the frame to count).
+        # it, hiding real corner-of-frame coverage gaps.
         "coverage_grid_rows": 16,
         "coverage_grid_cols": 24,
-        "min_coverage_cells_per_frame": 64,
+        # BUG, found and fixed this session: min_coverage_cells_per_frame
+        # was scaled to 64 (4x4=16x the pre-quadrupling value of 4) on the
+        # assumption that preserved the original ~16.7% physical-fraction
+        # requirement. That math silently ignored a hard ceiling:
+        # cells_touched() marks at most ONE cell per detected corner, and
+        # this project's board (board.squares_x=6, squares_y=4) has only
+        # (6-1)*(4-1) = 15 possible ChArUco corners total -- so 64 (and
+        # even a smaller "fixed for half-res" value of 40, tried first) was
+        # mathematically unreachable, regardless of resolution, framing, or
+        # how well the board was held in view. This was never caught
+        # because the quadrupling change itself was only verified against a
+        # synthetic test image, never a live board detection -- confirmed
+        # live this session: real calibration was completely unable to
+        # accumulate samples at 4K OR half-res, board detection succeeding
+        # every time but every single sample rejected by this gate. 8 (just
+        # over half the 15-corner ceiling) is a reasoned starting point --
+        # requires a reasonably well-spread view without demanding full
+        # board visibility every frame -- not a precise derivation; tune
+        # live if it's still too strict/lax in practice.
+        "min_coverage_cells_per_frame": 8,
         "min_pose_translation_diversity_m": 0.05,
         "min_pose_angle_diversity_deg": 8.0,
     },
@@ -139,24 +172,29 @@ DEFAULT_CONFIG = {
         "status_print_interval_s": 3.0,
         "reconnect_retry_interval_s": 5.0,
         "no_detection_warning_s": 20.0,
+        # Was only ever set explicitly in calibrate_config.yaml (4K profile),
+        # never defaulted here -- calibrate_config_half.yaml has no runtime:
+        # section at all, so it fell through to this incomplete default and
+        # KeyError'd the first time app.py's CPU-throttle check ran.
+        "cpu_throttle_threshold_pct": 85.0,
+        "cpu_throttle_release_pct": 70.0,
     },
     "output": {
         "dir": "output/calibration",
         "save_raw_images": False,
     },
+    "capture": {
+        # Confirmed missing from both calibrate_config_half.yaml and (until
+        # now) this default: app.py's list_sessions/capture-mode code reads
+        # cfg["capture"]["dir"] unconditionally, so any profile that doesn't
+        # define its own "capture" section needs this fallback -- not
+        # resolution-specific (raw per-take recordings aren't keyed by
+        # resolution the way calibration output/intrinsics are), so one
+        # shared default is correct, not a per-profile override.
+        "dir": "recordings",
+    },
     "viser": {
         "port": 8080,
-    },
-    "debug": {
-        # TEMPORARY, for comparing the addCallback-based host-arrival
-        # timestamp (app.py's AppCameraSession._pop_full_arrival_ts)
-        # against the pre-addCallback method (a plain time.time() read
-        # taken right after tryGet() notices a frame) on identical
-        # recorded/calibrated motion -- see AppCameraSession.poll/
-        # capture_sync_calibration/begin_recording and align_session.py's
-        # --legacy-host-ts. Safe to remove, along with the code that reads
-        # it, once that comparison is done.
-        "legacy_timestamp_compare": False,
     },
 }
 
@@ -499,6 +537,15 @@ class DetectionWorker(threading.Thread):
         _align_board, self.alignment_detector, self.alignment_board_points_3d = (
             build_board(cfg, "alignment_board")
         )
+        # app.py's "Detect flash" feature -- a loose ArUco tag next to a
+        # stationary sync LED, not a board, so a plain ArucoDetector rather
+        # than build_board's CharucoDetector. Mutually exclusive with the
+        # ChArUco detection above (app.py forces detection_state["enabled"]
+        # off while flash-detect is armed), so submit()'s detect_flash flag
+        # picks ONE of the two per item rather than running both.
+        self.flash_aruco_detector = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50), cv2.aruco.DetectorParameters(),
+        )
         self.in_q = queue.Queue(maxsize=1)
         self.out_q = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
@@ -519,10 +566,10 @@ class DetectionWorker(threading.Thread):
         except queue.Full:
             pass  # lost a race with a new producer -- fine, it's newer than us anyway
 
-    def submit(self, epoch, frame_ts, jpeg_bytes, K, dist, do_alignment):
+    def submit(self, epoch, frame_ts, jpeg_bytes, K, dist, do_alignment, detect_flash=False):
         self._mailbox_put(self.in_q, {
             "epoch": epoch, "frame_ts": frame_ts, "jpeg_bytes": jpeg_bytes,
-            "K": K, "dist": dist, "do_alignment": do_alignment,
+            "K": K, "dist": dist, "do_alignment": do_alignment, "detect_flash": detect_flash,
         })
 
     def try_get_result(self):
@@ -544,13 +591,29 @@ class DetectionWorker(threading.Thread):
             frame = cv2.imdecode(np.frombuffer(item["jpeg_bytes"], dtype=np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
                 continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             result = {
                 "epoch": item["epoch"], "frame_ts": item["frame_ts"],
                 "corners2d": None, "ids": None, "pose": None,
                 "did_alignment": item["do_alignment"], "align_pose": None,
+                "flash_seen": None,
             }
+
+            if item["detect_flash"]:
+                # Full resolution, deliberately slow -- same decode+detect-
+                # off-thread shape as ChArUco detection above, just a plain
+                # ArUco tag search instead of a board. The user explicitly
+                # chose full-res-but-slower over a faster downscaled search
+                # (tried first: full 4K detectMarkers benchmarked at ~80ms/
+                # camera, far too slow for the MAIN thread, but perfectly
+                # fine here since it's off-thread and this mailbox already
+                # tolerates/expects a slower, best-effort update cadence).
+                _corners, ids, _rejected = self.flash_aruco_detector.detectMarkers(frame)
+                result["flash_seen"] = ids is not None and len(ids) > 0
+                self._mailbox_put(self.out_q, result)
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             detection = detect_charuco(self.detector, gray)
             if detection is not None:
                 corners2d, ids = detection
@@ -850,9 +913,44 @@ def build_calibration_pipeline(device, cfg, with_control=False):
     above only sets the STARTING exposure/WB, not runtime changes. Default
     False keeps the return a 3-tuple, unchanged for existing callers (e.g.
     CalibCameraSession below, which has no use for runtime control).
+
+    cam_cfg["native_sensor"] (default False) switches between two camera
+    node generations, mirroring capture.py's create_dual_stream_pipeline:
+    False uses the v3 Camera node (ISP-scales to record_width/height, works
+    at any resolution); True uses the v2 ColorCamera node with explicit
+    setResolution(THE_2024X1520) -- real 2x2 hardware sensor binning,
+    confirmed this session to measurably beat the v3 path's noise/sharpness
+    at the same settings -- then setVideoSize(record_width, record_height)
+    to CROP (not rescale) that binned capture down to the encoder-safe
+    width calibrate_config_half.yaml uses (2016, a multiple of 32; the
+    sensor's own native binned width, 2024, is not, and the hardware
+    VideoEncoder rejects it outright). Both branches expose the same
+    inputControl API for with_control (confirmed: dai.node.ColorCamera has
+    inputControl/initialControl just like dai.node.Camera).
     """
     cam_cfg = cfg["camera"]
     pipeline = dai.Pipeline(device)
+
+    if cam_cfg.get("native_sensor", False):
+        cam = pipeline.create(dai.node.ColorCamera)
+        cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_2024X1520)
+        cam.setFps(cam_cfg["fps"])
+        cam.setVideoSize(cam_cfg["record_width"], cam_cfg["record_height"])
+        cam.initialControl.setManualExposure(cam_cfg["shutter_us"], cam_cfg["iso"])
+        cam.initialControl.setManualWhiteBalance(cam_cfg["wb_k"])
+
+        video_enc = pipeline.create(dai.node.VideoEncoder)
+        video_enc.setDefaultProfilePreset(cam_cfg["fps"], dai.VideoEncoderProperties.Profile.MJPEG)
+        video_enc.setQuality(cam_cfg["mjpeg_quality"])
+        cam.video.link(video_enc.input)
+
+        cam.setPreviewSize(cam_cfg["display_width"], cam_cfg["display_height"])
+        out_preview = cam.preview
+        if with_control:
+            control_queue = cam.inputControl.createInputQueue()
+            return pipeline, video_enc.out, out_preview, control_queue
+        return pipeline, video_enc.out, out_preview
 
     cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
     cam.initialControl.setManualExposure(cam_cfg["shutter_us"], cam_cfg["iso"])
