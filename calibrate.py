@@ -150,7 +150,7 @@ DEFAULT_CONFIG = {
         "coverage_ratio_threshold": 0.8,
         "min_samples_before_calibrate": 8,
         "recalibrate_every_n_samples": 3,
-        "max_samples_per_camera": 150,
+        "max_samples_per_camera": 400,
     },
     "intrinsics_cache": {
         # Persists converged per-camera intrinsics across runs, keyed by each
@@ -396,6 +396,11 @@ class CameraCalibState:
         self.connected = True
         self.last_warned_no_detection = False
         self.intrinsics_locked = False  # True only when seeded from the intrinsics cache
+        # True only when app.py's "Accept anyway" override set
+        # converged/intrinsics_locked despite reproj_error being above
+        # reproj_error_threshold_px -- lets the UI say so explicitly instead
+        # of looking identical to a real convergence or a cache load.
+        self.manually_accepted = False
 
     def sample_count(self):
         return len(self.object_points)
@@ -1067,6 +1072,18 @@ class PoseGraph:
         pairs).
         """
         return sum(len(obs) for key, obs in self.observations.items() if cam_id in key)
+
+    def best_pair_count_for(self, cam_id):
+        """Largest single-edge observation count among this camera's pairs --
+        how close its BEST-connected neighbor is to min_edge_observations
+        (the threshold a single edge must individually clear to ever become
+        part of the solved graph, see aggregate_edges). Distinct from
+        sample_count_for's sum across every edge, which can look misleadingly
+        high for a camera whose observations are spread thin across many
+        pairs, none of which individually clears the threshold.
+        """
+        counts = [len(obs) for key, obs in self.observations.items() if cam_id in key]
+        return max(counts, default=0)
 
     def aggregate_edges(self):
         min_obs = self.cfg["extrinsics"]["min_edge_observations"]

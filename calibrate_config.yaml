@@ -44,7 +44,7 @@ intrinsics:
   coverage_ratio_threshold: 0.8
   min_samples_before_calibrate: 8
   recalibrate_every_n_samples: 3
-  max_samples_per_camera: 150
+  max_samples_per_camera: 400
 intrinsics_cache:
   enabled: true
   path: output/calibration/intrinsics_cache.json

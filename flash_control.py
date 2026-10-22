@@ -111,19 +111,28 @@ class FlashConnection:
     def is_connected(self):
         return self._connected.is_set()
 
-    def send_command_nowait(self, command_char):
+    def send_command_nowait(self, command_char, delay_s=0.0):
         """Schedules the write on the connection's own event loop and
         returns IMMEDIATELY without waiting for it to complete -- the whole
         point of a persistent connection is paying zero latency in the
-        caller's thread right when a take starts. Success/failure is
-        logged asynchronously via a callback once the write actually
-        finishes. Returns True if a send was scheduled (connected), False
-        if there's currently no live connection to use (logged, not
-        raised) -- e.g. the device hasn't been found yet or is powered off.
+        caller's thread right when a take starts. If delay_s > 0, the
+        actual write is scheduled delay_s after this call (via asyncio.sleep
+        on the connection's own loop/thread, never the caller's) instead of
+        right away -- still doesn't block the caller for any part of that
+        wait. Success/failure is logged asynchronously via a callback once
+        the write actually finishes. Returns True if a send was scheduled
+        (connected), False if there's currently no live connection to use
+        (logged, not raised) -- e.g. the device hasn't been found yet or is
+        powered off.
         """
         if not self._connected.is_set() or self._client is None:
             print(f"[Flash] Not connected -- cannot send '{command_char}'")
             return False
+
+        async def _delayed_write():
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            await self._client.write_gatt_char(CHARACTERISTIC_UUID, command_char[0].encode())
 
         def _on_done(fut):
             exc = fut.exception()
@@ -132,8 +141,6 @@ class FlashConnection:
             else:
                 print(f"[Flash] Sent '{command_char}'")
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.write_gatt_char(CHARACTERISTIC_UUID, command_char[0].encode()), self._loop,
-        )
+        future = asyncio.run_coroutine_threadsafe(_delayed_write(), self._loop)
         future.add_done_callback(_on_done)
         return True

@@ -1405,13 +1405,24 @@ def main():
     # leaves frame, not stay stuck green from an earlier moment.
     flash_detect_state = {"armed": False, "seen": {cam_id: False for cam_id in cam_ids}}
 
-    # Per-camera calibration enable/disable -- lets an operator exclude a
-    # specific camera's detections from the shared pose_graph extrinsics
-    # solve while diagnosing a "jumping" board pose (one bad camera's edges
-    # can drag around the shared solve's T_cam_to_world for EVERY camera,
-    # not just its own marker -- see the "{cam_id} enabled" checkbox and
-    # the "set_enabled" cmd_queue handler below). Absent key == enabled.
-    camera_enabled = {cam_id: True for cam_id in cam_ids}
+    # Per-camera calibration enable/disable -- now driven entirely by the
+    # sequential intrinsics-then-extrinsics workflow below (calib_phase_state/
+    # the per-camera "Capture intrinsics" buttons and the "Capture
+    # extrinsics" button -- see the "select_intrinsics_cam"/"start_extrinsics"
+    # cmd_queue handlers). Starts all-False: no camera should
+    # be actively detected until the operator explicitly picks one (see
+    # calib_phase_state below) -- a bare False default here also protects
+    # against ever accumulating pose-graph edges before any camera's
+    # intrinsics have actually been captured.
+    camera_enabled = {cam_id: False for cam_id in cam_ids}
+
+    # Sequential calibration workflow: "intrinsics" phase has at most one
+    # camera (active_cam) enabled at a time, picked via that camera's
+    # "Capture intrinsics" button (which drives camera_enabled above);
+    # "extrinsics" phase re-enables every camera at once (today's original
+    # concurrent behavior) once every camera's intrinsics are done. See
+    # the "select_intrinsics_cam"/"start_extrinsics" cmd_queue handlers.
+    calib_phase_state = {"phase": "intrinsics", "active_cam": None}
 
     # Per-camera undistort, set all at once via the "Undistort all cameras"
     # checkbox in the live-preview panel (there's no per-camera control
@@ -1452,7 +1463,8 @@ def main():
     # ── Capture mode state -- see README.md's "Capture mode" section ────────
     capture_cmd_queue = queue.Queue()  # separate from cmd_queue: must work in any app_state["mode"]
     capture_state = {
-        "phase": "idle",       # idle | starting | recording | stopping
+        "phase": "idle",       # idle | countdown | starting | recording | stopping
+        "countdown_start_mono": None,  # time.monotonic() when "countdown" began
         "session_ts": None,    # set on first "start" press, NOT boot time
         "session_name": session_name,  # typed at boot; written into session_meta.json on first take
         "take_n": 0,
@@ -1521,6 +1533,18 @@ def main():
             np.zeros((4, 4, 3), dtype=np.uint8), label="live",
         )
         capture_preview_status_md = viser_mgr.server.gui.add_markdown("_waiting for data..._")
+        # Calibration mode's "Step 1" single-camera view -- mirrors
+        # capture_preview_image/capture_preview_status_md above exactly,
+        # but driven by calib_phase_state["active_cam"] instead of
+        # capture_preview["selected"] (see the main loop's Pass 1/Pass 2).
+        # A separate widget pair rather than reusing Capture mode's own,
+        # since both modes can't show a camera at the same time anyway
+        # (mutually exclusive via ui_mode_state) but keeping them distinct
+        # avoids any cross-mode visibility-toggling subtlety.
+        intrinsics_preview_image = viser_mgr.server.gui.add_image(
+            np.zeros((4, 4, 3), dtype=np.uint8), label="live", visible=False,
+        )
+        intrinsics_preview_status_md = viser_mgr.server.gui.add_markdown("", visible=False)
         undistort_all_checkbox = viser_mgr.server.gui.add_checkbox(
             "Undistort all cameras", initial_value=False,
         )
@@ -1615,13 +1639,62 @@ def main():
 
             viser_mgr.server.gui.add_divider()
 
+            # Step 1: intrinsics, one camera at a time -- clicking a camera's
+            # button turns OFF board detection on every other camera (via
+            # camera_enabled, see calib_phase_state above) and brings that
+            # camera up as the only live view (see intrinsics_preview_image
+            # below and the show_grid/decode_this_preview changes in the
+            # main loop). Label/color are refreshed every tick in the main
+            # loop (booting/gray "Capture intrinsics" / red "Capturing..." /
+            # green "done"), not just on click, since convergence happens
+            # asynchronously on a background RecalibrationWorker.
+            viser_mgr.server.gui.add_markdown("**Step 1: Capture intrinsics (one camera at a time)**")
+            intrinsics_btns = {}
+            for cam_id in cam_ids:
+                btn = viser_mgr.server.gui.add_button(f"Capture intrinsics: {cam_id}")
+
+                def _toggle_intrinsics_cam(_, c=cam_id):
+                    if calib_phase_state["active_cam"] == c:
+                        cmd_queue.put("select_intrinsics_cam none")
+                    else:
+                        cmd_queue.put(f"select_intrinsics_cam {c}")
+
+                btn.on_click(_toggle_intrinsics_cam)
+                intrinsics_btns[cam_id] = btn
+
+            # Step 2: extrinsics, all cameras live together -- only
+            # clickable once every camera shows converged/cached intrinsics
+            # (see the all_intrinsics_done check in the main loop). Reusable
+            # even after extrinsics capture has started (re-click wipes the
+            # pose graph and starts over), and a camera's own intrinsics
+            # button above stays live throughout -- clicking it drops back
+            # into intrinsics capture for just that camera and discards its
+            # pose-graph edges (see "select_intrinsics_cam"'s handler).
+            viser_mgr.server.gui.add_markdown("**Step 2: Capture extrinsics (all cameras)**")
+            start_extrinsics_btn = viser_mgr.server.gui.add_button("Capture extrinsics", color="green")
+            start_extrinsics_btn.on_click(lambda _: cmd_queue.put("start_extrinsics"))
+            start_extrinsics_status_md = viser_mgr.server.gui.add_markdown("")
+            extrinsics_guidance_md = viser_mgr.server.gui.add_markdown("")
+
+            viser_mgr.server.gui.add_divider()
+
+            accept_anyway_btns = {}
             for cam_id in cam_ids:
                 reset_btn = viser_mgr.server.gui.add_button(f"Reset {cam_id}")
                 reset_btn.on_click(lambda _, c=cam_id: cmd_queue.put(f"reset {c}"))
-                enabled_cb = viser_mgr.server.gui.add_checkbox(f"{cam_id} enabled", initial_value=True)
-                enabled_cb.on_update(
-                    lambda _, c=cam_id, cb=enabled_cb: cmd_queue.put(f"set_enabled {c} {'1' if cb.value else '0'}")
-                )
+                # Manual override for a camera whose reprojection error
+                # plateaus above reproj_error_threshold_px no matter how much
+                # more data it gets (a data-quality floor -- board rigidity,
+                # residual motion blur, lens distortion model mismatch --
+                # not something more samples fixes). Caches its BEST current
+                # K/dist as-is, bypassing the quality gate for just this one
+                # camera rather than lowering reproj_error_threshold_px for
+                # everyone. Disabled/relabeled every tick (see the main
+                # loop) once there's nothing to accept yet or it's already
+                # done.
+                accept_anyway_btn = viser_mgr.server.gui.add_button(f"Accept {cam_id} intrinsics anyway")
+                accept_anyway_btn.on_click(lambda _, c=cam_id: cmd_queue.put(f"force_accept_intrinsics {c}"))
+                accept_anyway_btns[cam_id] = accept_anyway_btn
 
             viser_mgr.server.gui.add_divider()
 
@@ -1636,6 +1709,16 @@ def main():
             capture_btn.on_click(lambda _: capture_cmd_queue.put(
                 "stop" if capture_state["phase"] == "recording" else "start"
             ))
+            # TOTAL duration of the 3/2/1 countdown shown before a take
+            # actually starts (see capture_state["phase"] == "countdown" in
+            # the main loop) -- e.g. the default 1s means "3", "2", "1" each
+            # show for 1/3s, the whole countdown taking 1s. Read directly off
+            # the slider every tick in the main loop (a plain value read, not
+            # a dai call, so no queueing needed -- same as how the exposure
+            # modal's sliders are read straight from their on_click handler).
+            capture_delay_slider = viser_mgr.server.gui.add_slider(
+                "Countdown duration (s)", min=0.0, max=5.0, step=0.5, initial_value=1.0,
+            )
             viser_mgr.server.gui.add_divider()
             no_takes_md = viser_mgr.server.gui.add_markdown("_No takes yet._")
 
@@ -1858,10 +1941,12 @@ def main():
         capture_folder.visible = mode == "Capture"
         viewer_folder.visible = mode == "Viewer"
 
-        grid_html.visible = mode == "Calibration"
+        grid_html.visible = mode == "Calibration" and calib_phase_state["active_cam"] is None
         preview_toggle_checkbox.visible = mode == "Capture"
         capture_preview_image.visible = mode == "Capture"
         capture_preview_status_md.visible = mode == "Capture"
+        intrinsics_preview_image.visible = mode == "Calibration" and calib_phase_state["active_cam"] is not None
+        intrinsics_preview_status_md.visible = mode == "Calibration" and calib_phase_state["active_cam"] is not None
         undistort_all_checkbox.visible = mode != "Viewer"
         viewer_info_md.visible = mode == "Viewer"
         viewer_video_image.visible = mode == "Viewer"
@@ -1996,6 +2081,9 @@ def main():
             )
             calib_epoch[cam_id] += 1
             viser_mgr.hide_board_pose(cam_id)
+            camera_enabled[cam_id] = False
+        calib_phase_state["phase"] = "intrinsics"
+        calib_phase_state["active_cam"] = None
         clear_extrinsics_for("all")
         mode_md.content = "Mode: **calibrate**"
         print("[Calibration] Live calibration (re)started.")
@@ -2045,13 +2133,14 @@ def main():
         already-open connection and returns immediately, not a fresh
         multi-second scan+connect, so this stays safe to call straight from
         this otherwise-cheap, main-thread function without a wrapper
-        thread. Starting it as early as possible in this function (before
-        the per-camera begin_recording loop below) keeps it as close as
-        practical to the actual recording start, though the LED's own
-        firmware already builds in a 1s wait before the white flash, so the
-        small remaining scheduling jitter here is negligible against that.
-        Logs its own success/failure (including "not connected yet") --
-        never raises, never delays the take if the device isn't reachable.
+        thread. Called with a small delay_s so the actual GATT write (and
+        the firmware's own 1s wait before the white flash on top of that)
+        happens comfortably after the per-camera begin_recording loop below
+        has actually started every camera recording, rather than racing it
+        -- the delay itself runs on flash_conn's own BLE thread via
+        asyncio.sleep, so it costs nothing on this main thread. Logs its
+        own success/failure (including "not connected yet") -- never
+        raises, never delays the take if the device isn't reachable.
 
         No per-camera clock-offset calibration happens here anymore
         (removed -- see git history): the default alignment path
@@ -2063,7 +2152,7 @@ def main():
         confirmed live this session as the cause of a native crash when
         starting an 8-camera take.
         """
-        flash_conn.send_command_nowait("S")
+        flash_conn.send_command_nowait("S", delay_s=0.2)
 
         if capture_state["session_ts"] is None:
             capture_state["session_ts"] = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2207,15 +2296,96 @@ def main():
                         if evicted and cfg["intrinsics_cache"]["enabled"]:
                             calibrate._atomic_write_json(cfg["intrinsics_cache"]["path"], intrinsics_cache)
                         clear_extrinsics_for(target)
-                    elif cmd.startswith("set_enabled"):
+                    elif cmd.startswith("force_accept_intrinsics"):
+                        # "Accept anyway" (see calibration_folder above) --
+                        # deliberate quality-gate bypass for a camera whose
+                        # reproj_error plateaus above the threshold. Caches
+                        # whatever K/dist/reproj_error it currently has as-is;
+                        # build_cache_entry/upsert_intrinsics_cache do no
+                        # thresholding of their own, so this is the same cache
+                        # write a real convergence would do, just triggered
+                        # manually instead of by apply_recalibration_result.
+                        #
+                        # Sets intrinsics_locked (not just converged) --
+                        # confirmed live as a real bug otherwise: a
+                        # RecalibrationWorker job already in flight (or still
+                        # eligible to fire again, since due_for_recalibrate
+                        # only checks intrinsics_locked, never converged) can
+                        # land its result AFTER this click and have
+                        # apply_recalibration_result silently recompute
+                        # `converged` from the real thresholds, reverting this
+                        # override back to False with no further action from
+                        # the operator. intrinsics_locked short-circuits
+                        # accept_sample/due_for_recalibrate the same way a
+                        # cache load does, fully freezing this camera; bumping
+                        # calib_epoch additionally discards any result from a
+                        # job already in flight before this click (the same
+                        # protection "reset"/"uncache" already rely on).
+                        target = cmd.split()[1]
+                        state = calib_states.get(target)
+                        if state is None or state.reproj_error == float("inf"):
+                            print(f"[Calibration] {target}: no calibration result yet -- nothing to accept.")
+                        elif state.intrinsics_locked:
+                            print(f"[Calibration] {target}: already cached -- nothing to do.")
+                        else:
+                            state.converged = True
+                            state.intrinsics_locked = True
+                            state.manually_accepted = True
+                            calib_epoch[target] += 1
+                            calibrate.upsert_intrinsics_cache(cfg, sessions[target].device_id, state, intrinsics_cache)
+                            print(f"[Calibration] {target}: intrinsics manually accepted at "
+                                  f"{state.reproj_error:.3f}px (quality gate is "
+                                  f"{cfg['intrinsics']['reproj_error_threshold_px']:.2f}px) -- locked.")
+                    elif cmd.startswith("select_intrinsics_cam"):
+                        # Step 1's per-camera buttons (see calibration_folder
+                        # above). "none" deactivates back to the idle grid
+                        # view with every camera disabled; a cam_id makes it
+                        # the only enabled (and only visible) camera. Clicking
+                        # a cam_id while already in the extrinsics phase drops
+                        # back to the intrinsics phase for just that camera
+                        # and discards its pose-graph edges (they're built on
+                        # intrinsics that are about to change) -- the operator
+                        # returns to extrinsics by clicking "Capture
+                        # extrinsics" again, which fully re-wipes the pose
+                        # graph anyway (see "start_extrinsics" below), so no
+                        # stale edge from this camera can survive into that.
                         parts = cmd.split()
-                        target, flag = parts[1], parts[2]
-                        camera_enabled[target] = (flag == "1")
-                        if not camera_enabled[target] and target in calib_states:
-                            calib_states[target].last_edge_pose = None
-                            viser_mgr.hide_board_pose(target)
-                        print(f"[Command] {target} calibration "
-                              f"{'enabled' if camera_enabled[target] else 'disabled'}.")
+                        target = parts[1] if len(parts) > 1 else "none"
+                        was_extrinsics_phase = calib_phase_state["phase"] == "extrinsics"
+                        calib_phase_state["phase"] = "intrinsics"
+                        if target == "none":
+                            calib_phase_state["active_cam"] = None
+                            for c in cam_ids:
+                                camera_enabled[c] = False
+                                calib_states[c].last_edge_pose = None
+                                viser_mgr.hide_board_pose(c)
+                            print("[Calibration] Intrinsics capture stopped -- no camera active.")
+                        else:
+                            calib_phase_state["active_cam"] = target
+                            for c in cam_ids:
+                                camera_enabled[c] = (c == target)
+                                if c != target:
+                                    calib_states[c].last_edge_pose = None
+                                    viser_mgr.hide_board_pose(c)
+                            if was_extrinsics_phase:
+                                clear_extrinsics_for(target)
+                            print(f"[Calibration] Capturing intrinsics for {target} only.")
+                    elif cmd == "start_extrinsics":
+                        # Step 2's button (see calibration_folder above) --
+                        # re-enables every camera at once (today's original
+                        # concurrent behavior) and fully wipes the pose graph
+                        # (clear_extrinsics_for("all"), also used by "Start
+                        # new calibration") so extrinsics starts from a clean
+                        # slate built only on each camera's now-finalized
+                        # intrinsics, never on stale pre-convergence edges.
+                        # Re-clickable even while already in this phase, to
+                        # deliberately restart extrinsics capture from scratch.
+                        calib_phase_state["phase"] = "extrinsics"
+                        calib_phase_state["active_cam"] = None
+                        for c in cam_ids:
+                            camera_enabled[c] = True
+                        clear_extrinsics_for("all")
+                        print("[Calibration] Extrinsics capture started -- all cameras live.")
                     else:
                         print(f"[Command] Unrecognized: {cmd!r}")
 
@@ -2234,13 +2404,39 @@ def main():
             while not capture_cmd_queue.empty():
                 cmd = capture_cmd_queue.get()
                 if cmd == "start" and capture_state["phase"] == "idle" and not detection_state["enabled"]:
-                    capture_state["phase"] = "starting"
-                    capture_btn.label, capture_btn.disabled, capture_btn.color = "Starting...", True, "red"
-                    capture_status_md.content = "_Starting take..._"
+                    if capture_delay_slider.value <= 0:
+                        # 0 skips the countdown phase entirely rather than
+                        # showing a zero-length "3...2...1..." flash.
+                        capture_state["phase"] = "starting"
+                        capture_btn.label, capture_btn.disabled, capture_btn.color = "Starting...", True, "red"
+                        capture_status_md.content = "_Starting take..._"
+                    else:
+                        capture_state["phase"] = "countdown"
+                        capture_state["countdown_start_mono"] = time.monotonic()
+                        capture_btn.label, capture_btn.disabled, capture_btn.color = "Starting...", True, "red"
                 elif cmd == "stop" and capture_state["phase"] == "recording":
                     capture_state["phase"] = "stopping"
                     capture_btn.label, capture_btn.disabled, capture_btn.color = "Stopping...", True, "green"
                     capture_status_md.content = "_Stopping..._"
+
+            if capture_state["phase"] == "countdown":
+                # 3/2/1 countdown before a take actually starts, giving
+                # whoever's in frame time to get ready -- see
+                # capture_delay_slider above (the "Countdown interval (s)"
+                # setting). Read live every tick rather than snapshotted at
+                # "start" click, same as every other slider-driven setting
+                # in this file. Transitions into the existing "starting"
+                # phase below once the full 3-step countdown elapses, which
+                # then proceeds exactly as it always has.
+                total = capture_delay_slider.value
+                step = total / 3.0
+                elapsed = time.monotonic() - capture_state["countdown_start_mono"]
+                if elapsed >= total:
+                    capture_state["phase"] = "starting"
+                else:
+                    count = 3 - min(2, int(elapsed // step))
+                    capture_btn.label = f"Starting in {count}..."
+                    capture_status_md.content = f"# {count}"
 
             if capture_state["phase"] == "starting":
                 # ChArUco detection is expensive (~30ms/camera decode+detect,
@@ -2357,13 +2553,26 @@ def main():
             else:  # still respects the CPU auto-throttle during an actual recording
                 previews_on = not perf_state["throttled"]
 
-            # Which live-preview view is showing -- driven entirely by
-            # ui_mode_state["current"] (see _set_ui_mode, which also owns
-            # the actual .visible toggling for every live-view widget).
-            # Only the two booleans needed for Pass 1's decode gating below
-            # are recomputed here.
-            show_grid = ui_mode_state["current"] == "Calibration"
+            # Which live-preview view is showing -- driven by
+            # ui_mode_state["current"] (see _set_ui_mode, which owns the
+            # initial/on-mode-change .visible toggling for every live-view
+            # widget) AND, within Calibration mode, by calib_phase_state --
+            # while a camera is actively being intrinsics-captured, it gets
+            # the ONLY live view (see intrinsics_active below), not the grid,
+            # mirroring Capture mode's own single-camera behavior. Unlike
+            # ui_mode_state (only changes on a mode-button click), active_cam
+            # can change every tick (a "Capture intrinsics" button click), so
+            # these three widgets' .visible is refreshed here every tick
+            # rather than only in _set_ui_mode.
+            intrinsics_active = (
+                ui_mode_state["current"] == "Calibration" and calib_phase_state["active_cam"] is not None
+            )
+            show_grid = ui_mode_state["current"] == "Calibration" and not intrinsics_active
             show_single = ui_mode_state["current"] == "Capture"
+            if ui_mode_state["current"] == "Calibration":
+                grid_html.visible = show_grid
+                intrinsics_preview_image.visible = intrinsics_active
+                intrinsics_preview_status_md.visible = intrinsics_active
 
             # Keep making progress on any camera that hasn't had its first
             # boot attempt yet -- a no-op once all_booted() (see step_boot's
@@ -2443,6 +2652,7 @@ def main():
                 decode_this_preview = previews_on and (
                     show_grid or (show_single and cam_id == capture_preview["selected"])
                     or flash_detect_state["armed"]
+                    or cam_id == calib_phase_state["active_cam"]
                 )
                 try:
                     got_frame = session.poll(
@@ -2509,6 +2719,24 @@ def main():
                             preview_frame, (960, 540), interpolation=cv2.INTER_LINEAR,
                         )
                         capture_preview_image.image = cv2.cvtColor(capture_frame, cv2.COLOR_BGR2RGB)
+                    if cam_id == calib_phase_state["active_cam"]:
+                        # Same resize-to-panel-width treatment as
+                        # capture_preview_image above, for the same reason.
+                        # Horizontally mirrored (display only -- the coverage
+                        # overlay above was already baked into preview_frame
+                        # before this flip, so it mirrors along with the
+                        # image and stays aligned; the raw full-res bytes
+                        # DetectionWorker/accept_sample actually use for
+                        # intrinsics are untouched, read separately from
+                        # session.last_frame_full_bytes) so moving the board
+                        # left/right on-screen matches the operator's own
+                        # left/right while they're looking at the display
+                        # instead of the camera.
+                        intr_frame = cv2.resize(
+                            preview_frame, (960, 540), interpolation=cv2.INTER_LINEAR,
+                        )
+                        intr_frame = cv2.flip(intr_frame, 1)
+                        intrinsics_preview_image.image = cv2.cvtColor(intr_frame, cv2.COLOR_BGR2RGB)
 
                 if need_full_decode and got_frame and session.last_frame_full is not None:
                     fresh_frames[cam_id] = (session.last_frame_full, session.last_frame_full_ts)
@@ -2900,9 +3128,20 @@ def main():
             per_cam_operational = {}
             for cam_id in cam_ids:
                 state = calib_states[cam_id]
+                ic = cfg["intrinsics"]
                 extra = []
                 if app_state["mode"] == "calibrate":
-                    if state.intrinsics_locked:
+                    if state.manually_accepted:
+                        # force_accept_intrinsics also sets intrinsics_locked
+                        # (see its cmd_queue handler for why), so this check
+                        # must come before the plain intrinsics_locked one
+                        # below -- otherwise a manual accept would silently
+                        # look identical to a real cache load.
+                        extra.append(
+                            f"intrinsics: manually accepted at {state.reproj_error:.3f}px "
+                            f"(above the {ic['reproj_error_threshold_px']:.2f}px bar)"
+                        )
+                    elif state.intrinsics_locked:
                         extra.append(f"intrinsics: loaded from cache "
                                      f"({state.reproj_error:.3f}px at save time)")
                     if state.last_detection_ts is not None:
@@ -2911,8 +3150,23 @@ def main():
                             extra.append(f"no detection for {silent_for:.0f}s")
                     elif state.connected:
                         extra.append("never detected the board yet")
-                    if not camera_enabled.get(cam_id, True):
-                        extra.append("disabled (excluded from calibration)")
+                    if calib_phase_state["phase"] == "intrinsics":
+                        if cam_id == calib_phase_state["active_cam"]:
+                            extra.append("intrinsics: capturing now (active)")
+                        elif state.intrinsics_locked or state.converged:
+                            extra.append("intrinsics: done")  # detail (cache/manual) already added above
+                        else:
+                            extra.append("intrinsics: not captured yet")
+                    elif calib_phase_state["phase"] == "extrinsics":
+                        if pose_result is not None and cam_id in pose_result["poses"]:
+                            extra.append(f"extrinsics: ✓ connected ({pose_graph.sample_count_for(cam_id)} obs)")
+                        else:
+                            best = pose_graph.best_pair_count_for(cam_id)
+                            need = cfg["extrinsics"]["min_edge_observations"]
+                            extra.append(
+                                "extrinsics: no shared board view yet" if best == 0
+                                else f"extrinsics: {best}/{need} shared views with best-paired camera"
+                            )
                 operational = []
                 if flash_detect_state["armed"]:
                     flash_line = "FLASH: visible" if flash_detect_state["seen"][cam_id] else "FLASH: not in view"
@@ -2936,10 +3190,28 @@ def main():
                     reproj = f"{edge_err:.3f} px ({mm_err:.2f} mm)"
                 else:
                     reproj = "n/a"
+                # Coverage/calibration-RMS numbers, spelled out explicitly
+                # (not just left to the blue/orange coverage-overlay tint)
+                # since during a focused single-camera intrinsics capture
+                # the operator needs to read these at a glance against their
+                # actual pass/fail thresholds -- not just "some of it is
+                # blue". state.reproj_error is the RMS over ALL accepted
+                # samples from the last cv2.calibrateCamera pass (what
+                # actually gates `converged`), distinct from the live
+                # single-frame PnP error below (board reproj error), which
+                # only reflects THIS tick's detection and says nothing about
+                # overall calibration quality.
+                coverage_pct = state.coverage.ratio() * 100.0
+                calib_reproj = (
+                    f"{state.reproj_error:.3f} px" if state.reproj_error != float("inf")
+                    else "n/a (not calibrated yet)"
+                )
                 per_cam_metrics[cam_id] = [
-                    f"samples for int: {state.sample_count()}",
+                    f"samples for int: {state.sample_count()}/{ic['max_samples_per_camera']}",
+                    f"coverage: {coverage_pct:.0f}% (need ≥ {ic['coverage_ratio_threshold'] * 100:.0f}%)",
+                    f"calibration reproj error: {calib_reproj} (need ≤ {ic['reproj_error_threshold_px']:.2f}px)",
+                    f"live board reproj error: {reproj}",
                     f"samples for ext: {pose_graph.sample_count_for(cam_id)}",
-                    f"board reproj error: {reproj}",
                     f"converged: {'yes' if state.converged else 'no'}",
                     *extra,
                 ]
@@ -2949,6 +3221,88 @@ def main():
                 flash_detect_status_md.content = f"_Flash visible in {n_seen}/{len(cam_ids)} cameras._"
             else:
                 flash_detect_status_md.content = ""
+
+            # Step 1/2 button+status refresh -- every tick, since convergence
+            # (RecalibrationWorker) and pose-graph solves (PoseGraphWorker)
+            # both happen asynchronously off this thread, not only right
+            # after a click.
+            all_intrinsics_done = all(
+                calib_states[c].converged or calib_states[c].intrinsics_locked for c in cam_ids
+            )
+            for cam_id in cam_ids:
+                state = calib_states[cam_id]
+                btn = intrinsics_btns[cam_id]
+                if not sessions[cam_id].connected:
+                    btn.disabled = True
+                    btn.label, btn.color = f"{cam_id}: not connected", "gray"
+                elif calib_phase_state["active_cam"] == cam_id:
+                    btn.disabled = False
+                    btn.label, btn.color = f"Capturing {cam_id}... (click to stop)", "red"
+                elif state.converged or state.intrinsics_locked:
+                    btn.disabled = False
+                    btn.label, btn.color = f"{cam_id}: done (click to redo)", "green"
+                else:
+                    btn.disabled = False
+                    btn.label, btn.color = f"Capture intrinsics: {cam_id}", "gray"
+
+                # "Accept anyway" -- only ever useful while this camera has a
+                # real (finite) reproj_error but hasn't converged/cached yet;
+                # once it's done (real convergence OR a prior accept-anyway)
+                # there's nothing left to override.
+                accept_btn = accept_anyway_btns[cam_id]
+                can_accept = (
+                    not state.intrinsics_locked and not state.converged
+                    and state.reproj_error != float("inf")
+                )
+                accept_btn.disabled = not can_accept
+                accept_btn.label = (
+                    f"Accept {cam_id} anyway ({state.reproj_error:.2f}px)" if can_accept
+                    else f"Accept {cam_id} intrinsics anyway"
+                )
+
+            start_extrinsics_btn.disabled = not all_intrinsics_done or len(cam_ids) < 2
+            start_extrinsics_btn.label = (
+                "Restart extrinsics capture" if calib_phase_state["phase"] == "extrinsics"
+                else "Capture extrinsics"
+            )
+            if not all_intrinsics_done:
+                not_done = [c for c in cam_ids if not (calib_states[c].converged or calib_states[c].intrinsics_locked)]
+                start_extrinsics_status_md.content = f"_Still need intrinsics: {', '.join(not_done)}_"
+            elif len(cam_ids) < 2:
+                start_extrinsics_status_md.content = "_Need at least 2 cameras for extrinsics._"
+            else:
+                start_extrinsics_status_md.content = ""
+
+            if calib_phase_state["phase"] == "extrinsics":
+                if pose_result is None:
+                    extrinsics_guidance_md.content = (
+                        "_Move the board so pairs of cameras can see it together..._"
+                    )
+                else:
+                    n_connected = len(pose_result["poses"])
+                    lines = [f"**{n_connected}/{len(cam_ids)} cameras connected.**"]
+                    if pose_result["excluded"]:
+                        lines.append(f"Not yet connected: {', '.join(sorted(pose_result['excluded']))}")
+                    good = not pose_result["excluded"] and len(pose_result["components"]) == 1
+                    if pose_result["chain_consistency_error_deg"]:
+                        max_err = max(pose_result["chain_consistency_error_deg"].values())
+                        threshold = cfg["extrinsics"]["naive_chain_error_threshold_deg"]
+                        lines.append(
+                            f"Max chain-consistency error: {max_err:.2f}° (target ≤ {threshold:.1f}°)"
+                        )
+                        good = good and max_err <= threshold
+                    lines.append(
+                        "✅ Extrinsics look good -- ready to Save." if good
+                        else "⚠️ Keep moving the board for more overlap."
+                    )
+                    extrinsics_guidance_md.content = "\n\n".join(lines)
+            else:
+                extrinsics_guidance_md.content = ""
+
+            if calib_phase_state["active_cam"] is not None:
+                intrinsics_preview_status_md.content = "\n\n".join(
+                    per_cam_metrics.get(calib_phase_state["active_cam"], [])
+                )
 
             # Live-preview panel's grid -- throttled well below the main
             # loop's own tick rate: JPEG-encoding+base64'ing every connected
