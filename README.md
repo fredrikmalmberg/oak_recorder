@@ -590,3 +590,69 @@ them for MANO or WiLoR comparisons, not for SMPL-X. The remaining 24 mm wrist re
 a pose-dependent mismatch rather than a fixed offset. Smoothing weight 1.0 for stage 3 (`body_smooth_weight`) lowered the wrist
 residual to about 19 mm instead (see the smoothing sweep in the session artifact); not yet adopted.
 
+#### Sapiens keypoints vs SMPL-X joints, measured on synthetic renders
+
+Question: where do Sapiens (and WiLoR) keypoints sit relative to the SMPL-X joints/vertices they are mapped to in
+`smplx_fit/joint_mapping.py`? Real data cannot answer that (no ground truth), so we render SMPL-X, where the targets are exact.
+
+How (`smplx_fit/synth_*.py`, all run on take3, scratch dir `<d>`):
+1. `synth_render` - SMPL-X male, fit betas (or `--beta-seed N` random N(0,1) betas), a T-pose plus `--n-poses` fitted poses picked from
+   frames 300-650 by farthest-point sampling. Ring of pinhole cameras (no distortion, K and 3840x2160 from cam0, radius 1.55 m,
+   `--azimuths` around the person's facing direction x `--elevations`), textured (`--texture`, UV layout `smplx_uv_2023.npz`)
+   or grey (`--flat`). Writes images, masks and `gt.npz` (exact verts, joints, K, R, t).
+   Camera pitfall: use the OpenCV frame of `synth_render.look_at` with `silhouette._verts_to_clip`; `render_turntable.look_at`
+   is y-up and only works with its own y-flipping projection.
+2. `synth_sapiens` - Sapiens2 1b on each render (box = render mask extent + 5%).
+3. `synth_wilor` (wilor env) - WiLoR as in `hand_pose/wilor_extract.py` (box = extent of the Sapiens hand keypoints, rescale 2.0).
+4. `synth_analyze` - DLT-triangulate every keypoint over all views (`hand_pose.wilor_wrist.triangulate_frame`, worst view dropped
+   while reprojection > 15 px), subtract the exact SMPL-X target, express the difference in the hand frame (as above) or, for
+   the body, a person frame (x right to left shoulder, y pelvis to neck, z = x cross y).
+
+```
+PYTHONPATH=. python -m smplx_fit.synth_render --smplx-npz <smplx_params.npz> --calib <calib.json> --out-dir <d> \
+    --n-poses 10 --azimuths -80 -60 -40 -20 0 20 40 60 80 [--texture T --variant NAME | --flat | --beta-seed 1]
+PYTHONPATH=/home/fmalmb/CODE/sapiens2:. python -m smplx_fit.synth_sapiens --dir <d> --variant NAME
+PYTHONPATH=. ~/miniconda3/envs/wilor/bin/python -m smplx_fit.synth_wilor --dir <d> --variant NAME
+PYTHONPATH=. python -m smplx_fit.synth_analyze --dir <d> --variant NAME      # prints tables, writes analysis_NAME.npz
+```
+
+Result: 9 sets x 10 poses x 18 views (male long/short sleeve, female long/short sleeve, photo-baked male texture, flat grey,
+and male long sleeve with 3 random shapes). Offset = Sapiens (triangulated) minus SMPL-X target, mm, hand frame
+(along / across / palm normal, right-hand normal mirrored). Mean over the 9 sets, [std over sets]; each set is the pooled
+median over the 10 fitted poses and both hands:
+
+| landmark | Sapiens | WiLoR |
+|---|---|---|
+| wrist | -14.7 / +0.3 / -0.8  [0.7 / 1.0 / 0.4] | +1.7 / -4.9 / -4.5  [0.7 / 0.4 / 0.2] |
+| thumb MCP | -13.1 / -4.6 / +3.5  [1.1 / 0.8 / 1.2] | -8.3 / +1.3 / +4.6 |
+| index MCP | -10.2 / -0.4 / +11.5  [0.7 / 0.3 / 0.8] | -2.3 / +9.9 / +8.5 |
+| middle MCP | -20.6 / -0.5 / +10.4  [0.7 / 0.3 / 0.5] | -9.3 / +7.2 / +7.5 |
+| ring MCP | -17.8 / -5.5 / +8.5  [0.7 / 0.3 / 0.4] | -13.0 / +2.8 / +5.7 |
+| pinky MCP | -16.7 / -5.1 / +7.4  [0.9 / 0.4 / 0.3] | -13.8 / +0.6 / +3.7 |
+| PIP / DIP / fingertips | within about 5 mm of the SMPL-X joint (std <= 1.3 mm) | 8-13 mm sideways (across) shift |
+
+- Sapiens' wrist is about 15 mm (T-pose: 1-4 mm) proximal of the SMPL-X wrist and its MCPs are 10-21 mm proximal and 7-12 mm
+  towards the palm normal. This is why an unshifted SMPL-X fit lands on the Sapiens wrist (above) while the SMPL-X wrist is
+  then ~15 mm too far towards the elbow.
+- WiLoR - Sapiens wrist is about +16 to +20 mm along the hand in the renders (+23 mm on real data); the other axes differ.
+- Hand offsets are the same (std about 1 mm) across textures, flat, the photo texture and body shapes (arm span 484-569 mm).
+- Body (person frame, mean over the 9 sets, [std over sets]): shoulders about 22 mm up and 8-15 mm inward [3-5]; hips about
+  34 mm lateral [2], hip y 0 to +14 [4.5-7], hip z 18-20 [9-10] (texture and shape dependent); nose +7 mm up; eyes and ears
+  <= 7 mm; left elbow +14 lateral / +22 up, right elbow -11 lateral / +7 forward (std about 1, 3 forward); wrists 9-13 mm back. Body offsets vary more with shape and
+  texture than hand offsets, so only the hand ones are candidates for a constant correction.
+- Caveats: synthetic renders (generic clothes, no motion blur, no photo domain gap), GT hand frame is derived from SMPL-X,
+  cameras within +-80 deg of the front.
+
+Textures used: `sl_reconstruction/visualization/textures/smplx_texture_{m_long_sleeve,f_short_sleeve}.png`,
+`sequence_rendering/visualization/textures/smplx_texture_{m_short_sleeve,f_long_sleeve}.png`,
+`textures/20260908_174819_take_1/texture_male_final.png`. Published tables and overlay crops: the "Sapiens SMPL-X Offsets"
+artifact. The values are in `smplx_fit/sapiens_offsets.py` (Sapiens and WiLoR hand offsets for all 21 landmarks, Sapiens body offsets,
+each with its std over sets).
+
+Optional in the fit: `smplx_fit.fit_take ... --sapiens-offsets` adds the wrist and MCP offsets (hand frame, detached) to the SMPL-X
+predictions before they are compared with the Sapiens targets (`smplx_fit/model.apply_sapiens_offsets`). Take3, frames 300-650,
+residual to the Sapiens targets, offset fit vs the same fit without it: elbows 33 -> 27 / 33 -> 26 mm RMS, index/middle MCP
+15 -> 12 mm, wrist 34 -> 32 mm, but thumb MCP 27 -> 30 mm and pinky MCP 9 -> 15 mm are worse; the SMPL-X wrists and elbows move
+5-12 mm. Not validated against any real ground truth. Do not use `--use-sam3` when the masks are already cached: building the
+SAM3 model turns on a global bfloat16 autocast, which crashes the nvdiffrast silhouette term in stage 3.
+
