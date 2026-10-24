@@ -85,7 +85,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
             use_silhouette=False, silhouette_weight=2.0, calib_path=None,
             silhouette_out_size=(256, 144), silhouette_n_samples=1500,
             silhouette_sigma_px=1.0, use_silhouette_shape=False,
-            use_sam3=False, use_rvm=False, mask_subdir="masks_sam3"):
+            use_sam3=False, use_rvm=False, mask_subdir="masks_sam3", no_hands=False, wrist_offset=False, drop_wrist=False, n_shape_betas=0, hand_k3d_weight=10.0):
     if pose_prior_weight is None:
         # See pose_prior.DEFAULT_POSE_PRIOR_WEIGHTS's comment -- "l2" and
         # "gmm" live on very different absolute scales, so there is no
@@ -101,7 +101,10 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         return
 
     print(f"Loading triangulated keypoints from {take_dir} (pose2d_dir={pose2d_dir})...")
-    frame_keys, full_layout, target_points, confidence = dl.build_take_arrays(take_dir, pose2d_dir=pose2d_dir)
+    frame_keys, full_layout, target_points, confidence = dl.build_take_arrays(take_dir, pose2d_dir=pose2d_dir, use_hands=not no_hands,
+                                                                                  wrist_offset=wrist_offset, drop_wrist=drop_wrist)
+    if no_hands:
+        max_stage = min(max_stage, 3)
     nf_total = len(frame_keys)
     start, end = parse_frame_range(frame_range, nf_total)
     frame_keys = frame_keys[start:end]
@@ -158,7 +161,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         pose_prior_weight=pose_prior_weight, hand_reg_weight=hand_reg_weight,
         shape_reg_weight=shape_reg_weight, hand_smooth_weight=hand_smooth_weight,
         body_smooth_weight=body_smooth_weight, max_stage=max_stage,
-        device=device,
+        n_shape_betas=n_shape_betas, hand_k3d_weight=hand_k3d_weight, device=device,
         **silhouette_kwargs,
     )
     elapsed = time.time() - t0
@@ -193,6 +196,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         "pose_prior_backend": pose_prior_backend, "pose_prior_weight": pose_prior_weight,
         "gmm_prior_path": gmm_prior_path, "hand_reg_weight": hand_reg_weight,
         "use_silhouette": use_silhouette, "use_silhouette_shape": use_silhouette_shape,
+        "no_hands": no_hands, "wrist_offset": wrist_offset, "drop_wrist": drop_wrist, "shape_reg_weight": shape_reg_weight, "n_shape_betas": n_shape_betas, "hand_k3d_weight": hand_k3d_weight, "body_smooth_weight": body_smooth_weight,
         "silhouette_weight": silhouette_weight if (use_silhouette or use_silhouette_shape) else None,
         "calib_path": calib_path, "silhouette_out_size": list(silhouette_out_size),
         "silhouette_n_samples": silhouette_n_samples, "silhouette_sigma_px": silhouette_sigma_px,
@@ -265,6 +269,18 @@ def main():
     parser.add_argument("--mask-subdir", default="masks_sam3",
                          help="Subdirectory under aligned/ containing per-camera mask images "
                               "(default: masks_sam3).")
+    parser.add_argument("--wrist-offset", action="store_true",
+                         help="Experimental, off by default: shift the wrist target by joint_mapping.WRIST_KEYPOINT_OFFSET_M in "
+                              "the hand frame. That offset is the MANO wrist, not the SMPL-X wrist, and made the body fit worse.")
+    parser.add_argument("--n-shape-betas", type=int, default=0,
+                         help="Optimise only the first N betas, the rest stay 0 (bvh2smplx uses 10). Default 0: all.")
+    parser.add_argument("--hand-k3d-weight", type=float, default=10.0,
+                         help="Weight of the hand keypoint loss against the body one in stage 4/5 (default 10).")
+    parser.add_argument("--drop-wrist", action="store_true",
+                         help="Remove the wrist keypoint target; the wrist is placed by the elbow and the hand keypoints.")
+    parser.add_argument("--no-hands", action="store_true",
+                         help="Body only: zero all hand targets (wrists come from the body keypoints) and stop after "
+                              "stage 3, so hand_pose stays zero.")
     args = parser.parse_args()
     sil_w, sil_h = (int(x) for x in args.silhouette_out_size.lower().split("x"))
     run_fit(
@@ -279,7 +295,7 @@ def main():
         silhouette_weight=args.silhouette_weight,
         calib_path=args.calib_path, silhouette_out_size=(sil_w, sil_h),
         silhouette_n_samples=args.silhouette_n_samples, silhouette_sigma_px=args.silhouette_sigma_px,
-        use_sam3=args.use_sam3, use_rvm=args.use_rvm, mask_subdir=args.mask_subdir,
+        use_sam3=args.use_sam3, use_rvm=args.use_rvm, mask_subdir=args.mask_subdir, no_hands=args.no_hands, wrist_offset=args.wrist_offset, drop_wrist=args.drop_wrist, n_shape_betas=args.n_shape_betas, hand_k3d_weight=args.hand_k3d_weight,
     )
 
 

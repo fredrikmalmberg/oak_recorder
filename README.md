@@ -566,3 +566,27 @@ real parallelism (avoiding GIL contention across cameras, which
 Tradeoffs: adds complexity around cross-process time-sync coordination and
 IPC, and it would only contain the blast radius of the USB power/boot issue,
 not fix the underlying cause.
+#### SMPL-X wrist keypoint offset (tested, not used)
+
+The Sapiens wrist keypoint (body ids 9/10 and hand id 0, the same point to within 1 mm) sits about 24 mm proximal of the
+MANO wrist that WiLoR and a MANO fit report. Measured on take3 (frames 300-650, `cam2hands`) in the hand frame of
+`smplx_fit.data_loading.hand_frame` (x wrist to middle MCP, y across the palm, z palm normal, mirrored for the right hand):
+
+| Offset in the Sapiens hand frame, mm (along / across / normal) | left | right |
+|---|---|---|
+| WiLoR (MANO) wrist minus Sapiens wrist | +23.8 / +2.0 / -14.1 | +23.1 / +1.8 / +12.4 |
+| SMPL-X fit (no offset) minus Sapiens wrist | +4.3 / +14.4 / -8.9 | 0.0 / +16.2 / +6.3 |
+| SMPL-X fit with the MANO offset minus Sapiens wrist | +15.4 / +11.8 / -16.1 | +11.2 / +14.2 / +13.3 |
+
+The SMPL-X wrist joint is not the MANO wrist joint. In rest pose the wrist-to-MCP distance is 114 mm in SMPL-X and 95 mm in
+MANO (index 108 vs 91, pinky 101 vs 82), while the palm width differs by only 5%, so SMPL-X's wrist sits about 20 mm
+further proximal. That is about where the Sapiens keypoint is, and an unshifted SMPL-X fit does land within 4 mm along it.
+Shifting the target by the MANO offset made the fit overshoot by 10-15 mm along and worsened the elbows (median residual
+to the bone-refined target 12.0 to 14.5 mm left, 9.9 to 16.7 mm right) and the wrists (25.2 to 32.8 left, 23.9 to 28.4 right).
+
+So the standard setup has no offset. `data_loading.build_take_arrays(wrist_offset=True)` and `fit_take --wrist-offset` keep
+the experiment available; the constants are in `joint_mapping.WRIST_KEYPOINT_OFFSET_M` and are MANO-wrist values, so use
+them for MANO or WiLoR comparisons, not for SMPL-X. The remaining 24 mm wrist residual is non-constant (sd 12-20 mm per axis),
+a pose-dependent mismatch rather than a fixed offset. Smoothing weight 1.0 for stage 3 (`body_smooth_weight`) lowered the wrist
+residual to about 19 mm instead (see the smoothing sweep in the session artifact); not yet adopted.
+

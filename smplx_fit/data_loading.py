@@ -42,6 +42,13 @@ Design choices worth documenting explicitly (per the approved plan):
    different detectors. Confidence-weighted average when both are
    present; whichever is present when only one is; confidence 0 (like
    any other missing landmark) when neither is.
+
+5. Wrist keypoint offset (joint_mapping.WRIST_KEYPOINT_OFFSET_M), OFF by default: with wrist_offset=True (fit_take
+   --wrist-offset) the fused target is shifted by a constant MANO-wrist offset in the hand frame (hand_frame). The
+   constants describe the MANO wrist, which is ~20 mm further along the hand than the SMPL-X wrist, so on SMPL-X it
+   overshoots and worsens elbows and wrists (see README "SMPL-X wrist keypoint offset").
+   drop_wrist=True (fit_take --drop-wrist) removes the wrist target altogether, so the wrist is placed by the elbow
+   and the finger/MCP keypoints (needs hands).
 """
 import json
 import os
@@ -87,7 +94,34 @@ def build_confidence_for_part(diagnostics, frame_keys, n_cams_total):
     return conf
 
 
-def build_take_arrays(take_dir, pose2d_dir="pose2d"):
+def hand_frame(hand_recon, frame_keys, max_gap=10):
+    """(nf, 3, 3) rotation matrices (columns x, y, z in world axes) of the hand frame used for the wrist keypoint
+    offset (see joint_mapping.WRIST_KEYPOINT_OFFSET_M). Built from the triangulated hand joints 0, 5, 9, 17. Frames
+    without a frame borrow the nearest valid one within max_gap frames; the rest stay NaN."""
+    nf = len(frame_keys)
+    R = np.full((nf, 3, 3), np.nan)
+    for i, fk in enumerate(frame_keys):
+        j = hand_recon.get(fk, {})
+        if not all(k in j for k in ("0", "5", "9", "17")):
+            continue
+        w, im, m, p = (np.array(j[k], float) for k in ("0", "5", "9", "17"))
+        x = m - w
+        n = np.cross(im - w, p - w)
+        n = n - (n @ x) / (x @ x) * x
+        if np.linalg.norm(x) < 1e-6 or np.linalg.norm(n) < 1e-9:
+            continue
+        x, n = x / np.linalg.norm(x), n / np.linalg.norm(n)
+        R[i] = np.stack([x, np.cross(n, x), n], axis=1)
+    valid = np.where(np.isfinite(R[:, 0, 0]))[0]
+    if len(valid):
+        for i in np.where(~np.isfinite(R[:, 0, 0]))[0]:
+            k = valid[np.argmin(np.abs(valid - i))]
+            if abs(k - i) <= max_gap:
+                R[i] = R[k]
+    return R
+
+
+def build_take_arrays(take_dir, pose2d_dir="pose2d", use_hands=True, wrist_offset=False, drop_wrist=False):
     """Returns (frame_keys, layout, target_points, confidence):
       frame_keys: list[str], length nf, the take's full %06d.jpg range.
       layout: joint_mapping.build_keypoint_layout()'s list, in the same
@@ -117,6 +151,8 @@ def build_take_arrays(take_dir, pose2d_dir="pose2d"):
     for part in ("body", "left", "right"):
         diag = _load_diagnostics(take_dir, part, pose2d_dir)
         part_frame_confidence[part] = build_confidence_for_part(diag, frame_keys, n_cams_total)
+        if not use_hands and part != "body":
+            part_frame_confidence[part][:] = 0.0  # no hand targets; fused wrists fall back to the body wrist
 
     # Triangulated 3D positions live in reconstruction_{part}.json, not in
     # landmarks_{part} (which is 2D, per-camera, pre-triangulation).
@@ -187,5 +223,19 @@ def build_take_arrays(take_dir, pose2d_dir="pose2d"):
                 else:
                     target_points[i, k] = hand_xyz
                     confidence[i, k] = hc
+
+            if drop_wrist:
+                confidence[:, k] = 0.0
+                target_points[:, k] = 0.0
+                continue
+
+            if wrist_offset:
+                R = hand_frame(smoothed_reconstructions[side], frame_keys)
+                off = np.array(jm.WRIST_KEYPOINT_OFFSET_M[side])
+                have = confidence[:, k] > 0
+                ok = have & np.isfinite(R[:, 0, 0])
+                target_points[ok, k] += (R[ok] @ off).astype(np.float32)
+                if (have & ~ok).any():
+                    print(f"  wrist offset: {side} wrist has no hand frame in {(have & ~ok).sum()} frames, target left unshifted")
 
     return frame_keys, full_layout, target_points, confidence

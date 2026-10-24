@@ -256,7 +256,7 @@ def multi_stage_optimize(
     hand_smooth_weight=0.1, body_smooth_weight=5.0, max_stage=5,
     use_silhouette=False, silhouette_weight=2.0, silhouette_cams=None,
     silhouette_masks=None, silhouette_valid=None, silhouette_n_samples=1500,
-    silhouette_sigma_px=1.0, use_silhouette_shape=False,
+    silhouette_sigma_px=1.0, use_silhouette_shape=False, n_shape_betas=0, hand_k3d_weight=10.0,
     device=None,
 ):
     """Runs all 5 stages in sequence, returns (FitParams, full_log_dict).
@@ -332,6 +332,11 @@ def multi_stage_optimize(
         bary = bary.to(device)
 
     params = FitParams(nf, num_betas=num_betas, device=device)
+    if n_shape_betas and n_shape_betas < num_betas:
+        # bvh2smplx optimises only the leading betas (the rest stay 0) so few bone-length constraints can't wander off
+        beta_mask = torch.zeros(1, num_betas, device=device)
+        beta_mask[:, :n_shape_betas] = 1.0
+        params.betas.register_hook(lambda g: g * beta_mask)
     log = {"stages": {}, "pose_prior_backend": pose_prior_backend, "use_silhouette": use_silhouette,
            "use_silhouette_shape": use_silhouette_shape,
            "silhouette_weight": silhouette_weight if (use_silhouette or use_silhouette_shape) else None,
@@ -480,7 +485,7 @@ def multi_stage_optimize(
         smooth_transl = losses.temporal_smoothness_loss(params.transl)
         reg_pose = body_pose_prior_loss(params.body_pose)
         reg_hand = losses.l2_regularization(params.lhand_pose) + losses.l2_regularization(params.rhand_pose)
-        total = (k3d * 1.0 + k3d_hand * 10.0 + smooth_body * body_smooth_weight + smooth_hand * hand_smooth_weight
+        total = (k3d * 1.0 + k3d_hand * hand_k3d_weight + smooth_body * body_smooth_weight + smooth_hand * hand_smooth_weight
                  + smooth_transl * 5.0 + reg_pose * pose_prior_weight + reg_hand * hand_reg_weight)
         return total, {
             "k3d": float(k3d.item()), "k3d_hand": float(k3d_hand.item()),

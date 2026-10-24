@@ -97,6 +97,16 @@ RIGHT_HAND_TARGETS = _hand_targets("right")
 # joint against two independent, possibly-conflicting observations. This
 # is a judgment call specific to our data (BVH mocap has one skeleton, so
 # bvh2smplx never faced this).
+# Sapiens wrist keypoint -> MANO (WiLoR) wrist joint offset, hand frame of data_loading.hand_frame (x: wrist -> middle
+# MCP, y: n x x, z: palm normal; mirrored for the right hand). Metres. Measured take3, frames 300-650, cam2hands:
+# left +23.8 / +2.0 / -14.1, right +23.1 / +1.8 / +12.4 mm. This is NOT the SMPL-X wrist: SMPL-X's wrist joint is ~20 mm
+# more proximal than MANO's, and an unshifted SMPL-X fit already lands +4 / -2 mm along from the Sapiens wrist. Only used
+# with data_loading wrist_offset=True (fit_take --wrist-offset), which is off by default. See README.
+WRIST_KEYPOINT_OFFSET_M = {
+    "left": (0.0235, 0.0019, -0.0133),
+    "right": (0.0235, 0.0019, 0.0133),
+}
+
 WRIST_FUSION = {
     "left": {
         "body_landmark_id": "9",
