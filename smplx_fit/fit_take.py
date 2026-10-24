@@ -85,7 +85,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
             use_silhouette=False, silhouette_weight=2.0, calib_path=None,
             silhouette_out_size=(256, 144), silhouette_n_samples=1500,
             silhouette_sigma_px=1.0, use_silhouette_shape=False,
-            use_sam3=False, use_rvm=False, mask_subdir="masks_sam3", no_hands=False, wrist_offset=False, drop_wrist=False, n_shape_betas=0, hand_k3d_weight=10.0):
+            use_sam3=False, use_rvm=False, mask_subdir="masks_sam3", no_hands=False, wrist_offset=False, drop_wrist=False, n_shape_betas=0, hand_k3d_weight=10.0, stage4_freeze_torso=False):
     if pose_prior_weight is None:
         # See pose_prior.DEFAULT_POSE_PRIOR_WEIGHTS's comment -- "l2" and
         # "gmm" live on very different absolute scales, so there is no
@@ -154,6 +154,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         )
 
     t0 = time.time()
+    snapshots = {}
     params, log = opt.multi_stage_optimize(
         model, target_points, confidence, full_layout,
         max_outer_iters=max_outer_iters, num_betas=num_betas,
@@ -161,7 +162,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         pose_prior_weight=pose_prior_weight, hand_reg_weight=hand_reg_weight,
         shape_reg_weight=shape_reg_weight, hand_smooth_weight=hand_smooth_weight,
         body_smooth_weight=body_smooth_weight, max_stage=max_stage,
-        n_shape_betas=n_shape_betas, hand_k3d_weight=hand_k3d_weight, device=device,
+        n_shape_betas=n_shape_betas, hand_k3d_weight=hand_k3d_weight, device=device, snapshots=snapshots, stage4_freeze_torso=stage4_freeze_torso,
         **silhouette_kwargs,
     )
     elapsed = time.time() - t0
@@ -184,6 +185,8 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         **param_dict,
     )
     print(f"Wrote {npz_path}")
+    np.savez(os.path.join(out_dir, "stage_params.npz"),
+             **{f"{st}/{k}": v for st, d in snapshots.items() for k, v in d.items()})
 
     with open(os.path.join(out_dir, "optimization_log.json"), "w") as f:
         json.dump(log, f, indent=2)
@@ -276,6 +279,9 @@ def main():
                          help="Optimise only the first N betas, the rest stay 0 (bvh2smplx uses 10). Default 0: all.")
     parser.add_argument("--hand-k3d-weight", type=float, default=10.0,
                          help="Weight of the hand keypoint loss against the body one in stage 4/5 (default 10).")
+    parser.add_argument("--stage4-freeze-torso", action="store_true",
+                         help="In stage 4 keep the hips, legs, spine, neck, head and translation at their stage-3 values; "
+                              "only the arms (shoulder, elbow, wrist rotations) move while the hands are fitted.")
     parser.add_argument("--drop-wrist", action="store_true",
                          help="Remove the wrist keypoint target; the wrist is placed by the elbow and the hand keypoints.")
     parser.add_argument("--no-hands", action="store_true",
@@ -295,7 +301,7 @@ def main():
         silhouette_weight=args.silhouette_weight,
         calib_path=args.calib_path, silhouette_out_size=(sil_w, sil_h),
         silhouette_n_samples=args.silhouette_n_samples, silhouette_sigma_px=args.silhouette_sigma_px,
-        use_sam3=args.use_sam3, use_rvm=args.use_rvm, mask_subdir=args.mask_subdir, no_hands=args.no_hands, wrist_offset=args.wrist_offset, drop_wrist=args.drop_wrist, n_shape_betas=args.n_shape_betas, hand_k3d_weight=args.hand_k3d_weight,
+        use_sam3=args.use_sam3, use_rvm=args.use_rvm, mask_subdir=args.mask_subdir, no_hands=args.no_hands, wrist_offset=args.wrist_offset, drop_wrist=args.drop_wrist, n_shape_betas=args.n_shape_betas, hand_k3d_weight=args.hand_k3d_weight, stage4_freeze_torso=args.stage4_freeze_torso,
     )
 
 

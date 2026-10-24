@@ -5,6 +5,7 @@ in losses.py/model.py for the individual pieces; this module is the
 orchestration and the "document each step" logging infrastructure the
 approved plan calls for explicitly.
 """
+import numpy as np
 import torch
 from smplx.joint_names import JOINT_NAMES
 
@@ -257,7 +258,7 @@ def multi_stage_optimize(
     use_silhouette=False, silhouette_weight=2.0, silhouette_cams=None,
     silhouette_masks=None, silhouette_valid=None, silhouette_n_samples=1500,
     silhouette_sigma_px=1.0, use_silhouette_shape=False, n_shape_betas=0, hand_k3d_weight=10.0,
-    device=None,
+    device=None, snapshots=None, stage4_freeze_torso=False,
 ):
     """Runs all 5 stages in sequence, returns (FitParams, full_log_dict).
     full_log_dict is written verbatim to optimization_log.json by
@@ -337,6 +338,11 @@ def multi_stage_optimize(
         beta_mask = torch.zeros(1, num_betas, device=device)
         beta_mask[:, :n_shape_betas] = 1.0
         params.betas.register_hook(lambda g: g * beta_mask)
+    def snap(name):
+        # params after each stage, for stage-by-stage viewing (snapshots: dict name -> as_dict())
+        if snapshots is not None:
+            snapshots[name] = {k: np.array(v) for k, v in params.as_dict().items()}
+
     log = {"stages": {}, "pose_prior_backend": pose_prior_backend, "use_silhouette": use_silhouette,
            "use_silhouette_shape": use_silhouette_shape,
            "silhouette_weight": silhouette_weight if (use_silhouette or use_silhouette_shape) else None,
@@ -410,6 +416,7 @@ def multi_stage_optimize(
         "2_global_rt", [params.global_orient, params.transl], stage2_loss, max_outer_iters, rel_tol,
     )
     log["up_axis_check"] = _check_up_axis(params, model)
+    snap("2_global_rt")
     if max_stage <= 2:
         return params, log
 
@@ -451,6 +458,7 @@ def multi_stage_optimize(
         "3_body_pose", [params.global_orient, params.transl, params.body_pose, params.betas],
         stage3_loss, max_outer_iters, rel_tol,
     )
+    snap("3_body_pose")
     if max_stage <= 3:
         return params, log
 
@@ -494,10 +502,21 @@ def multi_stage_optimize(
             "reg_pose": float(reg_pose.item()), "reg_hand": float(reg_hand.item()),
         }
 
+    s4_params = [params.body_pose, params.lhand_pose, params.rhand_pose, params.transl]
+    hook = None
+    if stage4_freeze_torso:
+        # Only the arm chain (body_pose joints 15-20: shoulders, elbows, wrists) may move; collars, hips, legs, spines, neck and head
+        # keep the stage-3 values, and so does the translation.
+        free = torch.zeros(1, 21, 3, device=params.body_pose.device)
+        free[:, [15, 16, 17, 18, 19, 20]] = 1.0
+        hook = params.body_pose.register_hook(lambda g: g * free)
+        s4_params = [params.body_pose, params.lhand_pose, params.rhand_pose]
     log["stages"]["4_hands_and_body"], _ = _run_lbfgs_stage(
-        "4_hands_and_body", [params.body_pose, params.lhand_pose, params.rhand_pose, params.transl],
-        stage4_loss, max_outer_iters, rel_tol,
+        "4_hands_and_body", s4_params, stage4_loss, max_outer_iters, rel_tol,
     )
+    if hook is not None:
+        hook.remove()
+    snap("4_hands_and_body")
 
     # ---- Stage 5: Hands-only polish -------------------------------------
     # Unfrozen: lhand_pose, rhand_pose only. Frozen: everything else (from
@@ -511,6 +530,7 @@ def multi_stage_optimize(
     log["stages"]["5_hands_only"], _ = _run_lbfgs_stage(
         "5_hands_only", [params.lhand_pose, params.rhand_pose], stage5_loss, max_outer_iters, rel_tol,
     )
+    snap("5_hands_only")
 
     # ---- Stage 6: Joint shape + pose refinement via silhouette (opt-in) --
     # Unfrozen: betas + body_pose + global_orient + transl. hand_pose stays
