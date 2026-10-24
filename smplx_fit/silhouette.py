@@ -245,6 +245,9 @@ def compute_silhouette_term(vertices_batch, faces, face_idx, bary, cams, masks, 
             vertices_batch, faces, face_idx, bary, cams, masks, valid, sigma_px)
 
 
+NVDIFFRAST_CHUNK = 2048   # (camera x frame) images per rasterize call
+
+
 def _compute_silhouette_nvdiffrast(vertices_batch, faces, cams, masks, valid):
     """nvdiffrast-based silhouette: rasterize full mesh, antialias edges."""
     import nvdiffrast.torch as dr
@@ -274,12 +277,16 @@ def _compute_silhouette_nvdiffrast(vertices_batch, faces, cams, masks, valid):
         all_pos.append(pos)
     pos_all = torch.cat(all_pos, dim=0)  # (nc*nf, V, 4)
 
-    # Rasterize
-    rast_out, _ = dr.rasterize(glctx, pos_all, tri, resolution=[out_h, out_w])
-
-    # Silhouette: 1 where a triangle covers the pixel, else 0; antialias at edges
-    sil = (rast_out[..., 3:4] > 0).to(dtype)
-    sil = dr.antialias(sil, rast_out, pos_all, tri)   # (nc*nf, oh, ow, 1)
+    # Rasterize in chunks of images: one call for every (camera x frame) pair runs out of GPU memory on long takes with many
+    # cameras (946 frames x 8 cameras); the result is identical to a single batch.
+    sil_chunks = []
+    for lo in range(0, pos_all.shape[0], NVDIFFRAST_CHUNK):
+        pos_c = pos_all[lo:lo + NVDIFFRAST_CHUNK]
+        rast_out, _ = dr.rasterize(glctx, pos_c, tri, resolution=[out_h, out_w])
+        # Silhouette: 1 where a triangle covers the pixel, else 0; antialias at edges
+        sil_c = (rast_out[..., 3:4] > 0).to(dtype)
+        sil_chunks.append(dr.antialias(sil_c, rast_out, pos_c, tri))   # (chunk, oh, ow, 1)
+    sil = torch.cat(sil_chunks, dim=0)
     sil = sil[..., 0].view(nc, nf, out_h, out_w)
 
     valid_t = torch.as_tensor(valid_np, dtype=dtype, device=device)  # (nc, nf)
