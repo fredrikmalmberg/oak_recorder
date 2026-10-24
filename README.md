@@ -510,6 +510,8 @@ cell), which is kept but not documented separately here.
 
 All commands run from `/home/fmalmb/CODE/oak_recorder` in the `oak_env` conda env.
 
+The Sapiens triangulation + SMPL-X pipeline with its current default settings, the optimisation stages and weights, the special solutions and the recommended recipe is described in [`rgb_to_smplx_pipeline.md`](rgb_to_smplx_pipeline.md).
+
 ### Step 1 — Align frames
 
 ```

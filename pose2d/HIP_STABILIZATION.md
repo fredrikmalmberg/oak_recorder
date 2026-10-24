@@ -1,5 +1,7 @@
 # Hip stabilisation for Sapiens2 triangulation (take3, 2026-10-03)
 
+See also `rgb_to_smplx_pipeline.md` for the whole pipeline and the 60 fps settings (hip speed gate 15 mm/frame instead of 30).
+
 Test case: `20260925_153809_take3` (768 frames, 6 cameras), 2D keypoints from Sapiens2 1B (308-keypoint set, body ids 0-12
 used here), calibration `output/calibration/20260925_sp_lg_7cam_scaled_sapiens_ext8000.json`. All numbers are over
 frames 300-650. Velocity/acceleration assume 30 fps.
