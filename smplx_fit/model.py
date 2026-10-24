@@ -100,9 +100,10 @@ LOWER_BODY_JOINTS = {1, 2, 4, 5, 7, 8, 10, 11}
 # are the glutes/crotch area — it reads as a torso base. Add it to the
 # exclusion set via hide_pelvis=True when a tighter upper-body cut is wanted.
 PELVIS_JOINT = 0
+HAND_JOINTS = (20, 21) + tuple(range(25, 55))  # wrists + all finger joints
 
 
-def upper_body_faces(model, hide_pelvis=False):
+def upper_body_faces(model, hide_pelvis=False, hide_hands=False):
     """Returns a (F, 3) face-index array containing only faces with NO
     vertex dominantly skinned (argmax of that vertex's lbs_weights row) to
     a lower-body joint -- i.e. legs/feet excluded, everything else kept.
@@ -116,6 +117,8 @@ def upper_body_faces(model, hide_pelvis=False):
     exclude = set(LOWER_BODY_JOINTS)
     if hide_pelvis:
         exclude.add(PELVIS_JOINT)
+    if hide_hands:
+        exclude.update(HAND_JOINTS)
     dominant_joint = model.lbs_weights.argmax(dim=1)
     lower_mask = torch.tensor(
         [int(j) in exclude for j in dominant_joint], dtype=torch.bool,

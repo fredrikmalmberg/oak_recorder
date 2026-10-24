@@ -61,7 +61,7 @@ def load_reconstructions(take_dir, parts, use_smoothed, pose2d_dir="pose2d"):
     return out
 
 
-def load_smplx_mesh_sequence(npz_path, model_path, hide_lower_body=False, hide_pelvis=False):
+def load_smplx_mesh_sequence(npz_path, model_path, hide_lower_body=False, hide_pelvis=False, hide_hands=False):
     """Loads a smplx_fit.fit_take output .npz and returns (vertices_by_frame,
     faces) -- vertices_by_frame maps EXACTLY the frame_key strings the fit
     covered (often a subset of the take, e.g. a --frames slice) to that
@@ -97,8 +97,8 @@ def load_smplx_mesh_sequence(npz_path, model_path, hide_lower_body=False, hide_p
 
     vertices = output.vertices.numpy()
     vertices_by_frame = {fk: vertices[i] for i, fk in enumerate(frame_keys)}
-    if hide_lower_body:
-        faces = smplx_model.upper_body_faces(model, hide_pelvis=hide_pelvis)
+    if hide_lower_body or hide_hands:
+        faces = smplx_model.upper_body_faces(model, hide_pelvis=hide_pelvis, hide_hands=hide_hands)
     else:
         faces = model.faces
     return vertices_by_frame, faces
@@ -244,7 +244,7 @@ def setup_app_style_scene(server, floor_y=0.0):
 def launch_3d_viewer(
     take_dir, calib_path, parts, port, fps, use_smoothed, pose2d_dir="pose2d",
     smplx_npz=None, smplx_model_path=None, frame_range=None, smplx_hide_lower_body=False,
-    smplx_hide_hips=False, ref_calib_path=None,
+    smplx_hide_hips=False, ref_calib_path=None, smplx_hide_hands=False,
 ):
     calib = calibrate.load_calibration_output(calib_path)
     reconstructions = load_reconstructions(take_dir, parts, use_smoothed, pose2d_dir=pose2d_dir)
@@ -255,7 +255,8 @@ def launch_3d_viewer(
         print(f"Loading SMPL-X fit from {smplx_npz}...")
         smplx_mesh = load_smplx_mesh_sequence(smplx_npz, smplx_model_path,
                                                hide_lower_body=smplx_hide_lower_body,
-                                               hide_pelvis=smplx_hide_hips)
+                                               hide_pelvis=smplx_hide_hips,
+                                               hide_hands=smplx_hide_hands)
         print(f"SMPL-X mesh covers {len(smplx_mesh[0])} frame(s).")
         # Calibrations without world-alignment use +Y = physically down (OpenCV convention).
         # The floor (feet contact) is at the MAXIMUM Y vertex across all frames.
@@ -325,6 +326,10 @@ def main():
         help="Also drop the pelvis/hip region (glutes, lower abdomen). Requires --smplx-hide-lower-body.",
     )
     parser.add_argument(
+        "--smplx-hide-hands", action="store_true",
+        help="Drop the SMPL-X mesh's hands (wrist and finger faces).",
+    )
+    parser.add_argument(
         "--ref-calib", default=None,
         help="Optional second calibration JSON to overlay as reference camera frustums (shown in orange).",
     )
@@ -339,6 +344,7 @@ def main():
         pose2d_dir=args.pose2d_dir, smplx_npz=args.smplx_npz, smplx_model_path=args.smplx_model_path,
         frame_range=frame_range, smplx_hide_lower_body=args.smplx_hide_lower_body,
         smplx_hide_hips=args.smplx_hide_hips, ref_calib_path=args.ref_calib,
+        smplx_hide_hands=args.smplx_hide_hands,
     )
 
 
