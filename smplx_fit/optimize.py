@@ -258,7 +258,7 @@ def multi_stage_optimize(
     use_silhouette=False, silhouette_weight=2.0, silhouette_cams=None,
     silhouette_masks=None, silhouette_valid=None, silhouette_n_samples=1500,
     silhouette_sigma_px=1.0, use_silhouette_shape=False, n_shape_betas=0, hand_k3d_weight=10.0,
-    device=None, snapshots=None, stage4_freeze_torso=False,
+    sapiens_offsets=False, device=None, snapshots=None, stage4_freeze_torso=False,
 ):
     """Runs all 5 stages in sequence, returns (FitParams, full_log_dict).
     full_log_dict is written verbatim to optimization_log.json by
@@ -313,6 +313,12 @@ def multi_stage_optimize(
     target_points = torch.as_tensor(target_points_np, dtype=torch.float32, device=device)
     confidence = torch.as_tensor(confidence_np, dtype=torch.float32, device=device)
     body_mask, hand_mask = build_masks(full_layout)
+
+    def predict_points(out):
+        pred_ = smplx_model.predict_all_points(out, full_layout)
+        if sapiens_offsets:
+            pred_ = smplx_model.apply_sapiens_offsets(pred_, full_layout)
+        return pred_
     body_mask = body_mask.to(device)
     hand_mask = hand_mask.to(device)
     layout_index_by_local_id = build_layout_index_by_local_id(full_layout)
@@ -382,7 +388,7 @@ def multi_stage_optimize(
     # letting shape3d converge to the same near-zero residual.
     def stage1_loss():
         rest_output = params.forward_rest_pose(model)
-        rest_points = smplx_model.predict_all_points(rest_output, full_layout)[0]
+        rest_points = predict_points(rest_output)[0]
         shape3d, _ = losses.shape3d_loss(target_points, confidence, rest_points, layout_index_by_local_id)
         reg_shape = losses.l2_regularization(params.betas)
         total = shape3d * 10000.0 + reg_shape * shape_reg_weight
@@ -401,7 +407,7 @@ def multi_stage_optimize(
     # to the stage's documented loss set).
     def stage2_loss():
         output = params.forward_batch(model)
-        pred = smplx_model.predict_all_points(output, full_layout)
+        pred = predict_points(output)
         k3d, _ = losses.weighted_keypoint_loss(pred, target_points, confidence, mask=body_mask)
         smooth_transl = losses.temporal_smoothness_loss(params.transl)
         smooth_go = losses.temporal_smoothness_loss(params.global_orient)
@@ -430,7 +436,7 @@ def multi_stage_optimize(
     # with only k3d and no silhouette it can't see the body outline.
     def stage3_loss():
         output = params.forward_batch(model)
-        pred = smplx_model.predict_all_points(output, full_layout)
+        pred = predict_points(output)
         k3d, _ = losses.weighted_keypoint_loss(pred, target_points, confidence, mask=body_mask)
         smooth_transl = losses.temporal_smoothness_loss(params.transl)
         smooth_go = losses.temporal_smoothness_loss(params.global_orient)
@@ -485,7 +491,7 @@ def multi_stage_optimize(
     # cause rather than relying on either fix alone.
     def stage4_loss():
         output = params.forward_batch(model)
-        pred = smplx_model.predict_all_points(output, full_layout)
+        pred = predict_points(output)
         k3d, _ = losses.weighted_keypoint_loss(pred, target_points, confidence, mask=body_mask)
         k3d_hand, _ = losses.weighted_keypoint_loss(pred, target_points, confidence, mask=hand_mask)
         smooth_body = losses.temporal_smoothness_loss(params.body_pose)
@@ -562,7 +568,7 @@ def multi_stage_optimize(
     if use_silhouette_shape:
         def stage6_loss():
             output = params.forward_batch(model)
-            pred = smplx_model.predict_all_points(output, full_layout)
+            pred = predict_points(output)
             k3d, _ = losses.weighted_keypoint_loss(pred, target_points, confidence, mask=body_mask)
             smooth_transl = losses.temporal_smoothness_loss(params.transl)
             smooth_go = losses.temporal_smoothness_loss(params.global_orient)

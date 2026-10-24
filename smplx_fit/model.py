@@ -146,3 +146,36 @@ def predict_all_points(output, full_layout):
         source = output.joints if target.kind == "joint" else output.vertices
         points.append(source[:, target.index, :])
     return torch.stack(points, dim=1)
+
+
+def apply_sapiens_offsets(pred, full_layout):
+    """Turn SMPL-X predictions into what Sapiens would report for the same pose: add the per-landmark offsets of
+    sapiens_offsets.SAPIENS_HAND_OFFSET_MM (wrist + the five MCPs) in the model's own hand frame (x wrist -> middle MCP,
+    z palm normal, built from the predicted wrist and index/middle/pinky MCP joints, same recipe as synth_analyze.frame_from).
+    The frame is detached so the offset acts as a fixed shift, not a pull on the hand orientation. pred: (B, K, 3)."""
+    from smplx_fit import sapiens_offsets as so
+
+    pred = pred.clone()
+    for side in ("left", "right"):
+        rows = {}
+        for k, (part, lid, _t) in enumerate(full_layout):
+            if part == f"wrist_{side}":
+                rows[0] = k
+            elif part == side and lid is not None and int(lid) in so.FIT_CORRECTED_LANDMARKS:
+                rows[int(lid)] = k
+        if not all(i in rows for i in (0, 5, 9, 17)):
+            continue
+        w, im, m, pk = (pred[:, rows[i]].detach() for i in (0, 5, 9, 17))
+        x = m - w
+        n = torch.cross(im - w, pk - w, dim=-1)
+        n = n - (n * x).sum(-1, keepdim=True) / (x * x).sum(-1, keepdim=True) * x
+        x, n = torch.nn.functional.normalize(x, dim=-1), torch.nn.functional.normalize(n, dim=-1)
+        R = torch.stack([x, torch.cross(n, x, dim=-1), n], dim=-1)  # (B, 3, 3)
+        for lid, key in so.FIT_CORRECTED_LANDMARKS.items():
+            if lid not in rows:
+                continue
+            off = torch.tensor(so.SAPIENS_HAND_OFFSET_MM[key], dtype=pred.dtype, device=pred.device) * so.MM_TO_M
+            if side == "right":
+                off = off * torch.tensor([1.0, 1.0, -1.0], dtype=pred.dtype, device=pred.device)
+            pred[:, rows[lid]] = pred[:, rows[lid]] + (R @ off)
+    return pred
