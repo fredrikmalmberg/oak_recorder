@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--set", action="append", required=True, help="LABEL=DIR (repeatable)")
     ap.add_argument("--port", type=int, default=8082)
     ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--wilor-wrist", default=None, help="wilor_wrist_3d.npz from hand_pose.wilor_wrist")
     a = ap.parse_args()
 
     calib = calibrate.load_calibration_output(a.calib)
@@ -51,6 +52,9 @@ def main():
     trail = server.gui.add_slider("Hip trail (frames)", min=0, max=120, step=5, initial_value=30)
     hands = server.gui.add_checkbox("Show hands", True)
     show = {n: server.gui.add_checkbox(f"{n}", True) for n in sets}
+    ww = np.load(a.wilor_wrist) if a.wilor_wrist else None
+    ww_show = server.gui.add_checkbox("WiLoR wrists", True) if ww is not None else None
+    ww_col = [(255, 60, 40), (60, 90, 255)]
     st = {"play": False}
 
     @play.on_click
@@ -82,6 +86,16 @@ def main():
                 else:
                     server.scene.add_line_segments(name, *empty, line_width=2.0)
 
+    def render_wrists(f):
+        for s, nm in enumerate(("left", "right")):
+            t = np.flatnonzero(ww["frames"] == f)
+            p = ww["wrist"][t[0], s] if len(t) and ww_show.value else None
+            name = f"/wilor_wrist_{nm}"
+            if p is not None and np.isfinite(p).all():
+                server.scene.add_point_cloud(name, p[None].astype(np.float32), np.array([ww_col[s]], np.uint8), point_size=0.01)
+            else:
+                server.scene.add_point_cloud(name, np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint8), point_size=0.01)
+
     print(f"viser running on port {a.port}; {T} frames; sets: {list(sets)}", flush=True)
     i, last = 300, None
     try:
@@ -90,9 +104,13 @@ def main():
                 i = (i + 1) % T; slider.value = i
             else:
                 i = slider.value
-            k = (i, kind.value, trail.value, hands.value, tuple(c.value for c in show.values()))
+            k = (i, kind.value, trail.value, hands.value, ww_show.value if ww_show else None,
+                 tuple(c.value for c in show.values()))
             if st["play"] or k != last:
-                label.value = key(i); render(i); last = k
+                label.value = key(i); render(i)
+                if ww is not None:
+                    render_wrists(i)
+                last = k
             time.sleep(1.0 / speed.value if st["play"] else 0.05)
     except KeyboardInterrupt:
         pass
