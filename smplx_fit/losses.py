@@ -37,6 +37,9 @@ HAND_BONES_EXACT = [
 ]
 HAND_BONES_APPROXIMATE = [(5, 9), (9, 13), (13, 17)]
 
+# leg bones (only present when leg targets are in the layout): hip-knee and knee-ankle, joint to joint
+LEG_BONES_EXACT = [(11, 13), (12, 14), (13, 15), (14, 16)]
+
 APPROXIMATE_BONE_WEIGHT = 0.2
 
 
@@ -96,7 +99,7 @@ def shape3d_loss(target_points, confidence, rest_pose_points, layout_index_by_lo
     the flat layout order.
     """
     parts_bones = {
-        "body": ((BODY_BONES_EXACT, 1.0), (BODY_BONES_APPROXIMATE, APPROXIMATE_BONE_WEIGHT)),
+        "body": ((BODY_BONES_EXACT + LEG_BONES_EXACT, 1.0), (BODY_BONES_APPROXIMATE, APPROXIMATE_BONE_WEIGHT)),
         "left": ((HAND_BONES_EXACT, 1.0), (HAND_BONES_APPROXIMATE, APPROXIMATE_BONE_WEIGHT)),
         "right": ((HAND_BONES_EXACT, 1.0), (HAND_BONES_APPROXIMATE, APPROXIMATE_BONE_WEIGHT)),
     }

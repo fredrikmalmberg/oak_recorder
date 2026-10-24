@@ -53,6 +53,24 @@ BODY_TARGETS = {
 }
 
 
+# Leg points from pose2d.triangulate_legs (Sapiens goliath 11-20), named with COCO-style ids 13-16 for the knees/ankles and
+# 17-22 for the feet. Only used when a legs file is passed to build_keypoint_layout(legs=True) / data_loading.build_take_arrays.
+LEG_TARGETS = {
+    "13": KeypointTarget("joint", _joint_index("left_knee"), "left_knee"),
+    "14": KeypointTarget("joint", _joint_index("right_knee"), "right_knee"),
+    "15": KeypointTarget("joint", _joint_index("left_ankle"), "left_ankle"),
+    "16": KeypointTarget("joint", _joint_index("right_ankle"), "right_ankle"),
+    "17": KeypointTarget("vertex", VERTEX_IDS["LBigToe"], "left_big_toe"),
+    "18": KeypointTarget("vertex", VERTEX_IDS["LSmallToe"], "left_small_toe"),
+    "19": KeypointTarget("vertex", VERTEX_IDS["LHeel"], "left_heel"),
+    "20": KeypointTarget("vertex", VERTEX_IDS["RBigToe"], "right_big_toe"),
+    "21": KeypointTarget("vertex", VERTEX_IDS["RSmallToe"], "right_small_toe"),
+    "22": KeypointTarget("vertex", VERTEX_IDS["RHeel"], "right_heel"),
+}
+# index into pose2d.triangulate_legs.NAMES (l_knee, r_knee, l_ankle, r_ankle, l_big_toe, l_small_toe, l_heel, r_big_toe, ...)
+LEG_FILE_ORDER = ["13", "14", "15", "16", "17", "18", "19", "20", "21", "22"]
+
+
 def _hand_targets(side):
     """side: 'left' or 'right'. Returns dict[str(mediapipe_id)] -> KeypointTarget
     for the 20 non-wrist landmarks of one hand (ids 1-20; id 0 is the
@@ -121,7 +139,7 @@ WRIST_FUSION = {
 }
 
 
-def build_keypoint_layout():
+def build_keypoint_layout(legs=False):
     """Single fixed ordered list of (part, landmark_id, KeypointTarget)
     covering every DIRECTLY-mapped keypoint (i.e. excluding the fused
     wrists, which have two source landmark ids -- see WRIST_FUSION and
@@ -137,6 +155,9 @@ def build_keypoint_layout():
     layout = []
     for landmark_id, target in BODY_TARGETS.items():
         layout.append(("body", landmark_id, target))
+    if legs:
+        for landmark_id, target in LEG_TARGETS.items():
+            layout.append(("body", landmark_id, target))
     for landmark_id, target in LEFT_HAND_TARGETS.items():
         layout.append(("left", landmark_id, target))
     for landmark_id, target in RIGHT_HAND_TARGETS.items():

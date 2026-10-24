@@ -121,7 +121,8 @@ def hand_frame(hand_recon, frame_keys, max_gap=10):
     return R
 
 
-def build_take_arrays(take_dir, pose2d_dir="pose2d", use_hands=True, wrist_offset=False, drop_wrist=False):
+def build_take_arrays(take_dir, pose2d_dir="pose2d", use_hands=True, wrist_offset=False, drop_wrist=False, legs_npz=None,
+                      legs_smooth_sigma=2.0):
     """Returns (frame_keys, layout, target_points, confidence):
       frame_keys: list[str], length nf, the take's full %06d.jpg range.
       layout: joint_mapping.build_keypoint_layout()'s list, in the same
@@ -138,7 +139,7 @@ def build_take_arrays(take_dir, pose2d_dir="pose2d", use_hands=True, wrist_offse
     total_frames = len(hmv.discover_frames(take_dir, cam_ids[0]))
     frame_keys = [f"{i:06d}.jpg" for i in range(total_frames)]
 
-    layout = jm.build_keypoint_layout()
+    layout = jm.build_keypoint_layout(legs=legs_npz is not None)
     wrist_entries = [(f"wrist_{side}", None, fusion["target"]) for side, fusion in jm.WRIST_FUSION.items()]
     full_layout = layout + wrist_entries
     K = len(full_layout)
@@ -186,8 +187,27 @@ def build_take_arrays(take_dir, pose2d_dir="pose2d", use_hands=True, wrist_offse
             return smoothed_xyz
         return raw_reconstructions[part].get(fk, {}).get(landmark_id)
 
+    leg_tracks = {}
+    if legs_npz is not None:
+        # triangulated leg points (pose2d.triangulate_legs): gaps interpolated, 5-frame median + Gaussian, weight by camera count
+        from smplx_fit.add_legs import smooth_track
+        L = np.load(legs_npz)
+        for j, lid in enumerate(jm.LEG_FILE_ORDER):
+            X = L["X"][:, j]
+            if not np.isfinite(X[:, 0]).any():
+                continue
+            w_ = np.clip((L["ncam"][:, j] - 1) / 3.0, 0, 1) * np.isfinite(X[:, 0])
+            leg_tracks[lid] = (L["frames"], smooth_track(X, legs_smooth_sigma), w_)
+
     for k, (part, landmark_id, target) in enumerate(full_layout):
-        if part in ("body", "left", "right"):
+        if part == "body" and landmark_id in jm.LEG_TARGETS:
+            if landmark_id in leg_tracks:
+                fr, X, w_ = leg_tracks[landmark_id]
+                for fi, f in enumerate(fr):
+                    if 0 <= int(f) < nf and w_[fi] > 0:
+                        target_points[int(f), k] = X[fi]
+                        confidence[int(f), k] = w_[fi]
+        elif part in ("body", "left", "right"):
             raw_part = raw_reconstructions[part]
             frame_conf = part_frame_confidence[part]
             for i, fk in enumerate(frame_keys):
