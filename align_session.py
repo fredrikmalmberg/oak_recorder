@@ -679,12 +679,20 @@ def print_alignment_report(report):
 
 
 
-def convert_mjpegs_to_grid_mp4(video_paths, fps, session_dir, frame_w, frame_h):
+def convert_mjpegs_to_grid_mp4(video_paths, fps, session_dir, frame_w, frame_h,
+                                 start_frames=None, overlay_png=None):
     """Build preview grid MP4 directly from raw per-camera MJPEG files.
     frame_w/frame_h are the SOURCE cameras' own resolution (see
     grid_cell_size) -- required, not probed from the files here, since
     callers already have it on hand (a log header or take_meta.json) and
     probing would mean decoding a frame per call for no benefit.
+
+    start_frames: optional per-camera number of leading frames to drop
+    (>= 0, same order as video_paths) so the sync flash lines up; the grid
+    then ends with the shortest trimmed stream. overlay_png: optional
+    transparent PNG the size of the whole grid, drawn on top (used for
+    per-camera offset labels and sync-failure banners, see flash_offsets.py).
+    With neither, the output is the plain index-tiled grid, as before.
     """
     num_cameras = len(video_paths)
     cols, _rows = preview_grid_layout(num_cameras)
@@ -700,12 +708,23 @@ def convert_mjpegs_to_grid_mp4(video_paths, fps, session_dir, frame_w, frame_h):
     for path in video_paths:
         cmd.extend(["-f", "mjpeg", "-framerate", str(fps), "-i", path])
 
-    scale_filters = [f"[{i}:v]scale={cell_w}:{cell_h}[v{i}]" for i in range(num_cameras)]
+    start_frames = list(start_frames) if start_frames is not None else [0] * num_cameras
+    if len(start_frames) != num_cameras or any(n < 0 for n in start_frames):
+        raise ValueError(f"start_frames must be {num_cameras} non-negative ints, got {start_frames}")
+    scale_filters = [
+        f"[{i}:v]" + (f"trim=start_frame={n},setpts=PTS-STARTPTS," if n > 0 else "") + f"scale={cell_w}:{cell_h}[v{i}]"
+        for i, n in enumerate(start_frames)
+    ]
     stack_inputs = "".join(f"[v{i}]" for i in range(num_cameras))
+    stack_options = ":shortest=1" if any(start_frames) else ""
+    out_label = "stack" if overlay_png else "v"
     filter_complex = (
         ";".join(scale_filters)
-        + f";{stack_inputs}xstack=inputs={num_cameras}:layout={xstack_layout(num_cameras, cell_w, cell_h)}[v]"
+        + f";{stack_inputs}xstack=inputs={num_cameras}:layout={xstack_layout(num_cameras, cell_w, cell_h)}{stack_options}[{out_label}]"
     )
+    if overlay_png:
+        cmd.extend(["-loop", "1", "-framerate", str(fps), "-i", overlay_png])
+        filter_complex += f";[stack][{num_cameras}:v]overlay=0:0:shortest=1[v]"
 
     cmd.extend([
         "-filter_complex", filter_complex,

@@ -1720,6 +1720,8 @@ def main():
                 "Countdown duration (s)", min=0.0, max=5.0, step=0.5, initial_value=1.0,
             )
             viser_mgr.server.gui.add_divider()
+            flash_banner = viser_mgr.server.gui.add_html("", visible=False)
+            flash_banner_state = {"html": ""}
             no_takes_md = viser_mgr.server.gui.add_markdown("_No takes yet._")
 
         # (take_dir, take_meta, label_md) per past take found on disk --
@@ -2489,34 +2491,40 @@ def main():
             # "processing" -> "done"/"failed") -- not inferred from whether
             # the output mp4 exists, so a failed job shows as failed instead
             # of stuck showing "processing...".
+            flash_problems = []
             for take in capture_state["takes"]:
                 if take["stop_time_unix"] is not None:
                     length_str = f"{take['stop_time_unix'] - take['start_time_unix']:.0f}s"
                 else:
                     length_str = f"{time.time() - take['start_time_unix']:.0f}s (recording)"
                 status = postprocess.read_status(take["take_dir"])
-                status_str = {
-                    "queued": "queued for postprocessing",
-                    "processing": "processing...",
-                    "done": "postprocessed",
-                    "failed": f"postprocessing failed ({status.get('error', 'unknown error')})",
-                }.get(status["status"], status["status"])
+                status_str = postprocess.status_text(status)
                 row = take_row_widgets[take["take_n"]]
                 row["label_md"].content = f"Take {take['take_n']}: {length_str} -- {status_str}"
                 row["play_btn"].visible = status["status"] == "done"
+                text, problem = postprocess.flash_sync_text(status)
+                if problem:
+                    flash_problems.append(f"Take {take['take_n']}: {text}")
+            # Red banner (shown only while some take of this session has a flash-sync problem) so a missing
+            # flash can't be overlooked among the per-take lines -- the operator can re-record right away.
+            banner_html = ""
+            if flash_problems:
+                banner_html = (
+                    '<div style="background:#b00020;color:#fff;padding:8px 10px;border-radius:4px;'
+                    'font-size:13px;line-height:1.4"><b>&#9888; FLASH SYNC PROBLEM</b><br>'
+                    + "<br>".join(html.escape(line) for line in flash_problems) + "</div>"
+                )
+            if banner_html != flash_banner_state["html"]:
+                flash_banner_state["html"] = banner_html
+                flash_banner.content = banner_html
+                flash_banner.visible = bool(banner_html)
 
             # Same status refresh for the Viewer folder's past-session takes
             # -- length was already computed once at startup (see
             # viewer_folder above), only postprocess status can still
             # change live.
             for take_dir, take_n, length_str, label_md in viewer_take_rows:
-                status = postprocess.read_status(take_dir)
-                status_str = {
-                    "queued": "queued for postprocessing",
-                    "processing": "processing...",
-                    "done": "postprocessed",
-                    "failed": f"postprocessing failed ({status.get('error', 'unknown error')})",
-                }.get(status["status"], status["status"])
+                status_str = postprocess.status_text(postprocess.read_status(take_dir))
                 label_md.content = f"Take {take_n}: {length_str} -- {status_str}"
 
             now = time.monotonic()

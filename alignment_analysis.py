@@ -36,10 +36,11 @@ def ensure_alignment_report(take_dir, force=False, **align_kwargs):
 def ensure_aligned_grid_video(take_dir, report, force=False):
     """Build (or reuse) the ALIGNED grid video -- align_session.grid_mp4_path
     called with the take_dir itself lands at <take_dir>/compressed_video_grid.mp4,
-    distinct from app.py's postprocess step, which writes the RAW (unaligned,
-    index-tiled) grid to <take_dir>/processed/compressed_video_grid.mp4. Callers
-    must use THIS function's return value, not app.py's path, to show alignment
-    actually working.
+    distinct from app.py's postprocess step, which writes a grid tiled by frame
+    index and shifted only by the sync-flash offsets (flash_offsets.py) to
+    <take_dir>/processed/compressed_video_grid.mp4 -- NOT timestamp-aligned.
+    Callers must use THIS function's return value, not app.py's path, to show the
+    timestamp alignment actually working.
     """
     output_path = align_session.grid_mp4_path(take_dir)
     if not force and os.path.exists(output_path):

@@ -13,12 +13,27 @@ import os
 import queue
 import threading
 
-from align_session import convert_mjpegs_to_grid_mp4, parse_log_header
+import flash_offsets
+from align_session import (
+    convert_mjpegs_to_grid_mp4,
+    grid_cell_size,
+    parse_log_header,
+    preview_grid_layout,
+)
 
 
-def _step_grid_video(take_dir, meta):
+def _step_aligned_grid_video(take_dir, meta):
+    """Flash-aligned grid video (replaces the old index-tiled one at the same path).
+
+    Detects the sync flash in every camera (flash_offsets.py), writes flash_offsets.json /
+    flash_alignment.png next to the video, and tiles the cameras shifted by their flash offsets.
+    If the flash isn't found (or only in some cameras) the grid is still built -- unshifted for the
+    affected cameras -- and the problem is burned into the video, so a take is never silently
+    "aligned" when it isn't.
+    """
     processed_dir = os.path.join(take_dir, "processed")
     os.makedirs(processed_dir, exist_ok=True)
+    labels = list(meta["cameras"])
     cameras = list(meta["cameras"].values())
     video_paths = [cam["video_path"] for cam in cameras]
     # Resolution isn't in take_meta.json itself -- read it from any one
@@ -28,17 +43,31 @@ def _step_grid_video(take_dir, meta):
     # grid_cell_size's docstring -- matters for the half-res native-sensor
     # profile, whose full-sensor readout isn't 16:9 like 4K's ISP crop).
     frame_w, frame_h, _fps, _offset = parse_log_header(cameras[0]["log_path"])
-    convert_mjpegs_to_grid_mp4(video_paths, meta["fps"], processed_dir, frame_w, frame_h)
+
+    result, series = flash_offsets.detect_flash_offsets(take_dir, return_series=True)
+    flash_offsets.write_outputs(result, series, processed_dir)
+    print(f"[Postprocess] Flash sync for {take_dir}: {result['overall']} {result['reason']}")
+    cols, _rows = preview_grid_layout(len(labels))
+    cell_w, cell_h = grid_cell_size(cols, frame_w, frame_h)
+    overlay_png = flash_offsets.build_overlay_png(
+        result, labels, cell_w, cell_h, os.path.join(processed_dir, "flash_overlay.png"))
+    convert_mjpegs_to_grid_mp4(
+        video_paths, meta["fps"], processed_dir, frame_w, frame_h,
+        start_frames=flash_offsets.start_frames_from(result, labels), overlay_png=overlay_png)
+    return {"flash_sync": flash_offsets.flash_sync_summary(result)}
 
 
-PROCESSING_STEPS = [_step_grid_video]
+PROCESSING_STEPS = [_step_aligned_grid_video]
 
 
 def process_take(take_dir):
+    """Runs every step; a step may return a dict, which is merged into the take's status file (e.g. {"flash_sync": ...})."""
     with open(os.path.join(take_dir, "take_meta.json"), "r", encoding="utf-8") as f:
         meta = json.load(f)
+    extra = {}
     for step in PROCESSING_STEPS:
-        step(take_dir, meta)
+        extra.update(step(take_dir, meta) or {})
+    return extra
 
 
 STATUS_FILENAME = "postprocess_status.json"
@@ -61,8 +90,37 @@ def read_status(take_dir):
         return {"status": "queued"}
 
 
-def _write_status(take_dir, status, error=None):
-    payload = {"status": status}
+def flash_sync_text(status):
+    """(text, is_problem) for the flash-sync part of a take's status dict; ("", False) when the take has no flash info
+    (e.g. postprocessed before this existed, or still running)."""
+    fs = status.get("flash_sync")
+    if not fs:
+        return "", False
+    if fs["overall"] == "ok":
+        note = f" (check {', '.join(fs['check'])})" if fs.get("check") else ""
+        return f"flash sync OK, {fs['n_ok']}/{fs['n_total']} cameras{note}", bool(fs.get("check"))
+    if fs["overall"] == "partial":
+        return f"FLASH SYNC PARTIAL: no flash in {', '.join(fs['missing'])}", True
+    return f"FLASH SYNC FAILED, not aligned: {fs['reason']}", True
+
+
+def status_text(status):
+    """One-line operator text for a take's postprocess status, including the flash-sync outcome."""
+    base = {
+        "queued": "queued for postprocessing",
+        "processing": "processing...",
+        "done": "postprocessed",
+        "failed": f"postprocessing failed ({status.get('error', 'unknown error')})",
+    }.get(status["status"], status["status"])
+    text, problem = flash_sync_text(status)
+    if not text:
+        return base
+    return f"{base} -- " + (f"⚠️ **{text}**" if problem else text)
+
+
+def _write_status(take_dir, status, error=None, extra=None):
+    payload = dict(extra or {})
+    payload["status"] = status
     if error is not None:
         payload["error"] = str(error)
     path = os.path.join(take_dir, STATUS_FILENAME)
@@ -94,10 +152,13 @@ class PostprocessWorker(threading.Thread):
                 return
             _write_status(take_dir, "processing")
             try:
-                process_take(take_dir)
+                extra = process_take(take_dir)
             except Exception as exc:
                 print(f"[Postprocess] {take_dir} failed: {exc}")
                 _write_status(take_dir, "failed", error=exc)
             else:
-                _write_status(take_dir, "done")
+                _write_status(take_dir, "done", extra=extra)
+                text, problem = flash_sync_text(extra)
+                if problem:
+                    print(f"[Postprocess] WARNING {take_dir}: {text}")
             self.queue.task_done()

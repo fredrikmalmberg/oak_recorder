@@ -296,17 +296,78 @@ is handed off to a background worker -- a plain `threading.Thread` +
 `queue.Queue`, **not** an AI-agent-spawning mechanism -- that runs a list of
 processing steps over it one take at a time (never overlapping with itself,
 but never blocking the *next* take from starting either). Today that list
-has exactly one step: building a small per-take grid video (reusing
-`align_session.convert_mjpegs_to_grid_mp4`) tiling every camera's footage,
-saved under `<take_dir>/processed/`. This worker is meant to grow --
-expect it to be asked to do a lot more over time (quality checks, hand/pose
-extraction, flagging bad takes, etc.), each as an ordinary Python function
-appended to `postprocess.PROCESSING_STEPS`.
+has exactly one step: building a small per-take grid video tiling every
+camera's footage, **aligned by the sync flash**, saved as
+`<take_dir>/processed/compressed_video_grid.mp4`. The step (`flash_offsets.py`
++ `align_session.convert_mjpegs_to_grid_mp4`) works like this:
 
-Alignment/sync analysis is still deliberately out of scope here (as it
-already is for `capture.py`'s own standalone flow) -- only clock logging
-(the per-take sync-calibration read, and per-frame host/device timestamps in
-each take's `.log` file) is done for now.
+- It finds the SyncFlashLED double flash (RGB colour cycle, then a white flash
+  about 1 s later) in every camera, within the first 2.5 s of video (the app sends the flash 0.2 s after
+  the take starts; the RGB cycle shows at about 0.6 s and the white flash at about 1.7 s). The LED is
+  on a badge worn by the person, so it moves: the detector tracks a blue-dominance
+  and a white-saturation *onset* per pixel (a rising edge that is still up one
+  frame later), masks pixels that keep producing onsets (animated lights, screens),
+  and votes across cameras for the flash frame. All limits are in seconds and scaled by the take's fps, so 30 and
+  60 fps takes work the same way (offsets are reported in frames of the take's own fps); the peak threshold is scaled
+  by frame width because the LED blob is weaker in the 2016 px wide frames used at 60 fps. `detect_flash.py` (fixed LED at a
+  known pixel) is a different, older tool and is not used here.
+- It writes `processed/flash_offsets.json` (per camera: flash frame, offset in
+  frames relative to the reference camera -- cam0 when it has a detection --,
+  the timestamp-implied offset and the residual, status), `processed/flash_alignment.png`
+  (score traces with the chosen frames) and `processed/flash_overlay.png`.
+  Negative offset = the flash appears earlier in that camera's file. Precision is about +-1 frame.
+- The grid drops each camera's leading frames so the flash lines up (no padded frames; the
+  video is as long as the shortest shifted stream) and shows a small `camN  -2 fr` label per tile.
+- If the flash isn't found, the problem is burned into the video and the postprocess
+  status is still `done`: cameras without a usable flash get a red `NO FLASH - not shifted`
+  label and stay unshifted, and the top of the video gets a red banner (`FLASH SYNC PARTIAL ...`,
+  or `FLASH SYNC FAILED - videos NOT aligned` with an unshifted grid). If fewer than half of the
+  cameras have a usable flash the whole take is treated as failed rather than half-aligned.
+  Orange `(check)` means the two flashes disagreed, only one was seen, or the flash was weak: a camera with
+  no normal detection is rescued with a lower threshold only if both flashes show up there with the same
+  spacing as in the other cameras (status `weak`, listed under `check` in the operator warning). A result needs
+  the double flash (RGB cycle + white flash with the right spacing) seen by at least 2 cameras; a lone event is not
+  trusted and the take is reported as failed instead of being shifted by it.
+  **Calibration-guided search (`flash_guided.py`).** When any camera is not a clean detection (weak, missing, or the two
+  flashes disagree) and a calibration of the same resolution and devices is available, the white flash is triangulated from the
+  cameras that did detect it (RANSAC over camera subsets, so a camera locked onto clutter is ignored; needs 3 cameras
+  within 1% of the frame width), projected into every camera, and the onset is read from a box around that
+  projection. Cameras the blind detector missed usually show a clean flash there. When this runs, all cameras with an onset
+  there use the guided offset (one measurement method for the whole take; the blind value stays in `detector_offset_frames`),
+  rescued cameras get status `guided` (orange `(guided)`, listed under `check`), and `flash_offsets.json` has a `guided`
+  entry with the calibration used, the 3D point and the reprojection errors. Takes record `uncalibrated` when no calibration was loaded, so the closest-in-time
+  file with the right frame width and the same devices is used, searched in `output/calibration`, `output/calibration_half` and
+  the folders in `OAK_CALIBRATION_DIRS`. No calibration or no agreement between cameras: the blind result stands and
+  `guided.reason` says why. Takes where every camera is a clean detection skip this step.
+
+This worker is meant to grow -- expect it to be asked to do a lot more over time
+(quality checks, hand/pose extraction, flagging bad takes, etc.), each as an
+ordinary Python function appended to `postprocess.PROCESSING_STEPS`.
+
+**What the operator sees (`app.py`, Capture folder).** Each take's line shows the flash-sync
+outcome after postprocessing: `flash sync OK, 8/8 cameras`, or in bold with a warning sign
+`FLASH SYNC PARTIAL: no flash in cam2, cam7` / `FLASH SYNC FAILED, not aligned: <reason>`. While any take
+of the session has such a problem, a red `FLASH SYNC PROBLEM` banner above the take list names the take and
+cameras, so the take can be re-recorded right away. The same text appears for past takes in the Viewer
+folder. The summary (`flash_sync`: overall, n_ok, n_total, missing, check, reason) is stored in the take's
+`postprocess_status.json`, so the UI only reads that one small file.
+
+**Using the alignment later (reconstruction).** The detection runs once, in postprocess; everything else
+reads the saved result instead of re-detecting:
+
+```python
+import flash_offsets
+fo = flash_offsets.load_flash_offsets(take_dir)   # None if the take has no processed/flash_offsets.json
+fo["offsets"]        # {cam: frames, None if no flash}: flash frame in cam minus flash frame in the reference camera
+fo["start_frames"]   # {cam: leading frames to drop so the flash lines up (>= 0; 0 for unusable cameras)}
+fo["usable"]         # False when the take's flash sync failed overall (all start_frames are 0)
+```
+
+`python flash_offsets.py <take_dir>` re-runs the detection by hand and prints the table (add `--out-dir` to
+save the json/png somewhere). The offsets drive only the grid video for now; they are not yet fed into
+`align_session.py`'s timestamp alignment (`aligned/camN/*.jpg`). Note that on the 19 Oct take_1 the flash
+offsets for cams 5-7 differ from the `device_ts_s`-implied ones by 3-7 frames (see `residual_ms`), i.e. the
+hardware timestamps alone did not line those cameras up; on the 22 Oct takes they agree to within about a frame.
 
 ## Live hand tracking — `hand_capture_live.py`
 
@@ -459,8 +520,9 @@ Writes `<take>/aligned/cam*/XXXXXX.jpg` + `alignment_report.json`.
 Uses `device_ts_s` (depthai hardware clock) by default — this is accurate to
 sub-frame for cameras on the same host.
 
-**Flash-based alignment (takes with LED sync marker):** run `detect_flash.py`
-first to measure per-camera onset offsets, then write aligned frames manually
+**Flash-based alignment (takes with a *fixed* LED sync marker, e.g. take_3):** run `detect_flash.py`
+first to measure per-camera onset offsets (takes recorded with the badge and `app.py`'s postprocess
+get `processed/flash_offsets.json` automatically, see the postprocessing worker above), then write aligned frames manually
 (e.g. via a local mirror directory with symlinks to the MJPEG files, with
 `align_session.py` given that local path). The LED double-flash approach
 gives an independent, pixel-level alignment ground truth that can verify or
@@ -519,53 +581,6 @@ Reads triangulated 3D keypoints from step 3.
 Writes `smplx_params.npz`, `optimization_log.json`, `fit_config.json` to
 `<take_dir>/aligned/pose2d/smplx/`.
 
-Reference run (`20260908_174819/take_1`):
-- Calibration: `output/calibration/20260908_174749_7cam.json`
-- Flags used: `--use-silhouette` (adds silhouette overlap term in stage 3)
-- Result: `smplx_params.npz` at `/mnt/recordings/20260908_174819/take_1/aligned/pose2d/smplx/`
-
-### Step 5 — Optional: texture bake + turntable
-
-See full CLI in `smplx_fit/texture_bake.py` module docstring.
-Camera recipe: cam0 + cam2 + cam3 for body, cam0-only for face; 3-pass
-winner-take-all bake. See memory entry `project_texture_bake_setup.md`.
-
-### Calibration
-
-Most recent calibration: `output/calibration/20260908_183729_7cam.json`
-(calibrated 2026-09-08, all 7 cameras, full intrinsics + distortion + extrinsics).
-Older calibrations in the same folder. Calibration drifts over time —
-if reprojection error in step 3 is high, recalibrate with `calibrate.py`.
-
----
-
-## Next steps / ideas
-
-Not implemented -- notes from a design discussion, kept here so the reasoning
-isn't lost before either gets picked up.
-
-**Persistent camera streams for short repeated recordings.** Implemented for
-the recording side -- see `app.py`'s "Combined calibration + capture app"
-section above (sessions/takes, one pipeline for the whole app run, never
-swapped, a fresh writer/log per take). Went further than originally
-sketched here: rather than a pipeline swap once per capture session, there
-turned out to be no swap at all -- calibration and capture share the same
-running pipeline. The one part still genuinely open: whether that pipeline
-stays stable across a *long* idle gap between takes (many minutes) hasn't
-been tested, and per-take sync-calibration (rather than once per session)
-was deliberately chosen to sidestep that question rather than answer it.
-
-**Separate worker process per camera, with an orchestrator.** Instead of one
-`capture.py` process looping over every camera sequentially, run each
-camera's pipeline in its own worker process, coordinated by an orchestrator.
-Main benefits: fault isolation (one crashing/hanging camera can't take the
-others down with it -- directly relevant given the boot-timeout/brownout
-issues tracked in `logs/camera_boot_log.jsonl`/`camera_boot_stats.py`) and
-real parallelism (avoiding GIL contention across cameras, which
-`BackgroundVideoWriter`'s per-camera thread is already a narrower fix for).
-Tradeoffs: adds complexity around cross-process time-sync coordination and
-IPC, and it would only contain the blast radius of the USB power/boot issue,
-not fix the underlying cause.
 #### SMPL-X wrist keypoint offset (tested, not used)
 
 The Sapiens wrist keypoint (body ids 9/10 and hand id 0, the same point to within 1 mm) sits about 24 mm proximal of the
@@ -589,6 +604,11 @@ the experiment available; the constants are in `joint_mapping.WRIST_KEYPOINT_OFF
 them for MANO or WiLoR comparisons, not for SMPL-X. The remaining 24 mm wrist residual is non-constant (sd 12-20 mm per axis),
 a pose-dependent mismatch rather than a fixed offset. Smoothing weight 1.0 for stage 3 (`body_smooth_weight`) lowered the wrist
 residual to about 19 mm instead (see the smoothing sweep in the session artifact); not yet adopted.
+
+Reference run (`20260908_174819/take_1`):
+- Calibration: `output/calibration/20260908_174749_7cam.json`
+- Flags used: `--use-silhouette` (adds silhouette overlap term in stage 3)
+- Result: `smplx_params.npz` at `/mnt/recordings/20260908_174819/take_1/aligned/pose2d/smplx/`
 
 #### Sapiens keypoints vs SMPL-X joints, measured on synthetic renders
 
@@ -656,3 +676,45 @@ residual to the Sapiens targets, offset fit vs the same fit without it: elbows 3
 5-12 mm. Not validated against any real ground truth. Do not use `--use-sam3` when the masks are already cached: building the
 SAM3 model turns on a global bfloat16 autocast, which crashes the nvdiffrast silhouette term in stage 3.
 
+### Step 5 — Optional: texture bake + turntable
+
+See full CLI in `smplx_fit/texture_bake.py` module docstring.
+Camera recipe: cam0 + cam2 + cam3 for body, cam0-only for face; 3-pass
+winner-take-all bake. See memory entry `project_texture_bake_setup.md`.
+
+### Calibration
+
+Most recent calibration: `output/calibration/20260908_183729_7cam.json`
+(calibrated 2026-09-08, all 7 cameras, full intrinsics + distortion + extrinsics).
+Older calibrations in the same folder. Calibration drifts over time —
+if reprojection error in step 3 is high, recalibrate with `calibrate.py`.
+
+---
+
+## Next steps / ideas
+
+Not implemented -- notes from a design discussion, kept here so the reasoning
+isn't lost before either gets picked up.
+
+**Persistent camera streams for short repeated recordings.** Implemented for
+the recording side -- see `app.py`'s "Combined calibration + capture app"
+section above (sessions/takes, one pipeline for the whole app run, never
+swapped, a fresh writer/log per take). Went further than originally
+sketched here: rather than a pipeline swap once per capture session, there
+turned out to be no swap at all -- calibration and capture share the same
+running pipeline. The one part still genuinely open: whether that pipeline
+stays stable across a *long* idle gap between takes (many minutes) hasn't
+been tested, and per-take sync-calibration (rather than once per session)
+was deliberately chosen to sidestep that question rather than answer it.
+
+**Separate worker process per camera, with an orchestrator.** Instead of one
+`capture.py` process looping over every camera sequentially, run each
+camera's pipeline in its own worker process, coordinated by an orchestrator.
+Main benefits: fault isolation (one crashing/hanging camera can't take the
+others down with it -- directly relevant given the boot-timeout/brownout
+issues tracked in `logs/camera_boot_log.jsonl`/`camera_boot_stats.py`) and
+real parallelism (avoiding GIL contention across cameras, which
+`BackgroundVideoWriter`'s per-camera thread is already a narrower fix for).
+Tradeoffs: adds complexity around cross-process time-sync coordination and
+IPC, and it would only contain the blast radius of the USB power/boot issue,
+not fix the underlying cause.
