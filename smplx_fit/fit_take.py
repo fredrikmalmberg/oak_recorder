@@ -43,7 +43,7 @@ def parse_frame_range(spec, nf):
     return start, end
 
 
-def summarize_fit_quality(params, model, full_layout, target_points, confidence, sapiens_offsets=False):
+def summarize_fit_quality(params, model, full_layout, target_points, confidence, sapiens_offsets=False, leg_offsets=False):
     """Mirrors pose2d.triangulation.summarize_part's reporting style --
     the fit's own unweighted k3d/k3d_hand residual, for comparing against
     the triangulation's own inlier-only reprojection error (already
@@ -55,6 +55,8 @@ def summarize_fit_quality(params, model, full_layout, target_points, confidence,
         pred = smplx_model.predict_all_points(output, full_layout)
         if sapiens_offsets:
             pred = smplx_model.apply_sapiens_offsets(pred, full_layout)
+        if leg_offsets:
+            pred = smplx_model.apply_sapiens_leg_offsets(pred, full_layout)
     device = params.betas.device
     tp = torch.as_tensor(target_points, dtype=torch.float32, device=device)
     conf = torch.as_tensor(confidence, dtype=torch.float32, device=device)
@@ -87,7 +89,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
             use_silhouette=False, silhouette_weight=2.0, calib_path=None,
             silhouette_out_size=(256, 144), silhouette_n_samples=1500,
             silhouette_sigma_px=1.0, use_silhouette_shape=False,
-            use_sam3=False, use_rvm=False, mask_subdir="masks_sam3", no_hands=False, wrist_offset=False, drop_wrist=False, n_shape_betas=0, hand_k3d_weight=10.0, sapiens_offsets=False, stage4_freeze_torso=False, legs_npz=None):
+            use_sam3=False, use_rvm=False, mask_subdir="masks_sam3", no_hands=False, wrist_offset=False, drop_wrist=False, n_shape_betas=0, hand_k3d_weight=10.0, sapiens_offsets=False, stage4_freeze_torso=False, legs_npz=None, leg_offsets=False):
     if pose_prior_weight is None:
         # See pose_prior.DEFAULT_POSE_PRIOR_WEIGHTS's comment -- "l2" and
         # "gmm" live on very different absolute scales, so there is no
@@ -164,13 +166,13 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         pose_prior_weight=pose_prior_weight, hand_reg_weight=hand_reg_weight,
         shape_reg_weight=shape_reg_weight, hand_smooth_weight=hand_smooth_weight,
         body_smooth_weight=body_smooth_weight, max_stage=max_stage,
-        n_shape_betas=n_shape_betas, hand_k3d_weight=hand_k3d_weight, sapiens_offsets=sapiens_offsets, device=device, snapshots=snapshots, stage4_freeze_torso=stage4_freeze_torso,
+        n_shape_betas=n_shape_betas, hand_k3d_weight=hand_k3d_weight, sapiens_offsets=sapiens_offsets, device=device, snapshots=snapshots, stage4_freeze_torso=stage4_freeze_torso, leg_offsets=leg_offsets,
         **silhouette_kwargs,
     )
     elapsed = time.time() - t0
     print(f"\nOptimization finished in {elapsed:.1f}s.")
 
-    quality = summarize_fit_quality(params, model, full_layout, target_points, confidence, sapiens_offsets)
+    quality = summarize_fit_quality(params, model, full_layout, target_points, confidence, sapiens_offsets, leg_offsets)
     log["fit_quality"] = quality
     log["elapsed_seconds"] = elapsed
 
@@ -201,7 +203,7 @@ def run_fit(take_dir, model_path, pose2d_dir, gender, num_betas, frame_range, ma
         "pose_prior_backend": pose_prior_backend, "pose_prior_weight": pose_prior_weight,
         "gmm_prior_path": gmm_prior_path, "hand_reg_weight": hand_reg_weight,
         "use_silhouette": use_silhouette, "use_silhouette_shape": use_silhouette_shape,
-        "no_hands": no_hands, "wrist_offset": wrist_offset, "drop_wrist": drop_wrist, "shape_reg_weight": shape_reg_weight, "n_shape_betas": n_shape_betas, "hand_k3d_weight": hand_k3d_weight, "sapiens_offsets": sapiens_offsets, "body_smooth_weight": body_smooth_weight,
+        "no_hands": no_hands, "wrist_offset": wrist_offset, "drop_wrist": drop_wrist, "shape_reg_weight": shape_reg_weight, "n_shape_betas": n_shape_betas, "hand_k3d_weight": hand_k3d_weight, "sapiens_offsets": sapiens_offsets, "sapiens_leg_offsets": leg_offsets, "body_smooth_weight": body_smooth_weight,
         "silhouette_weight": silhouette_weight if (use_silhouette or use_silhouette_shape) else None,
         "calib_path": calib_path, "legs_npz": legs_npz, "silhouette_out_size": list(silhouette_out_size),
         "silhouette_n_samples": silhouette_n_samples, "silhouette_sigma_px": silhouette_sigma_px,
@@ -281,6 +283,9 @@ def main():
                          help="Optimise only the first N betas, the rest stay 0 (bvh2smplx uses 10). Default 0: all.")
     parser.add_argument("--hand-k3d-weight", type=float, default=10.0,
                          help="Weight of the hand keypoint loss against the body one in stage 4/5 (default 10).")
+    parser.add_argument("--sapiens-leg-offsets", action="store_true",
+                         help="Correct the SMPL-X leg predictions by the measured Sapiens-vs-SMPL-X leg offsets "
+                              "(sapiens_offsets.SAPIENS_LEG_OFFSET_MM); needs --legs-npz")
     parser.add_argument("--legs-npz", default=None,
                          help="legs.npz from pose2d.triangulate_legs: adds knee/ankle/foot targets (and hip-knee-ankle bone lengths "
                               "for the shape stage) to the fit")
@@ -309,7 +314,7 @@ def main():
         silhouette_weight=args.silhouette_weight,
         calib_path=args.calib_path, silhouette_out_size=(sil_w, sil_h),
         silhouette_n_samples=args.silhouette_n_samples, silhouette_sigma_px=args.silhouette_sigma_px,
-        use_sam3=args.use_sam3, use_rvm=args.use_rvm, mask_subdir=args.mask_subdir, no_hands=args.no_hands, wrist_offset=args.wrist_offset, drop_wrist=args.drop_wrist, n_shape_betas=args.n_shape_betas, hand_k3d_weight=args.hand_k3d_weight, sapiens_offsets=args.sapiens_offsets, stage4_freeze_torso=args.stage4_freeze_torso, legs_npz=args.legs_npz,
+        use_sam3=args.use_sam3, use_rvm=args.use_rvm, mask_subdir=args.mask_subdir, no_hands=args.no_hands, wrist_offset=args.wrist_offset, drop_wrist=args.drop_wrist, n_shape_betas=args.n_shape_betas, hand_k3d_weight=args.hand_k3d_weight, sapiens_offsets=args.sapiens_offsets, stage4_freeze_torso=args.stage4_freeze_torso, legs_npz=args.legs_npz, leg_offsets=args.sapiens_leg_offsets,
     )
 
 

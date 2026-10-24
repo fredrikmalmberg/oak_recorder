@@ -148,6 +148,26 @@ def predict_all_points(output, full_layout):
     return torch.stack(points, dim=1)
 
 
+def apply_sapiens_leg_offsets(pred, full_layout):
+    """Add sapiens_offsets.SAPIENS_LEG_OFFSET_MM to the leg rows, in the person frame built from the predicted shoulders and hips
+    (x right -> left shoulder, y towards the shoulders, z = x cross y); frame detached. pred: (B, K, 3)."""
+    from smplx_fit import sapiens_offsets as so
+
+    rows = {lid: k for k, (part, lid, _t) in enumerate(full_layout) if part == "body" and lid is not None}
+    if not all(i in rows for i in ("5", "6", "11", "12")):
+        return pred
+    pred = pred.clone()
+    ls, rs, lh, rh = (pred[:, rows[i]].detach() for i in ("5", "6", "11", "12"))
+    x = torch.nn.functional.normalize(ls - rs, dim=-1)
+    z = torch.nn.functional.normalize(torch.cross(x, 0.5 * (ls + rs) - 0.5 * (lh + rh), dim=-1), dim=-1)
+    y = torch.cross(z, x, dim=-1)
+    R = torch.stack([x, y, z], dim=-1)
+    for lid, off in so.SAPIENS_LEG_OFFSET_MM.items():
+        if lid in rows:
+            pred[:, rows[lid]] = pred[:, rows[lid]] + R @ (torch.tensor(off, dtype=pred.dtype, device=pred.device) * so.MM_TO_M)
+    return pred
+
+
 def apply_sapiens_offsets(pred, full_layout):
     """Turn SMPL-X predictions into what Sapiens would report for the same pose: add the per-landmark offsets of
     sapiens_offsets.SAPIENS_HAND_OFFSET_MM (wrist + the five MCPs) in the model's own hand frame (x wrist -> middle MCP,

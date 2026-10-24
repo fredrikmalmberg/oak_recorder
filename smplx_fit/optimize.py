@@ -258,7 +258,7 @@ def multi_stage_optimize(
     use_silhouette=False, silhouette_weight=2.0, silhouette_cams=None,
     silhouette_masks=None, silhouette_valid=None, silhouette_n_samples=1500,
     silhouette_sigma_px=1.0, use_silhouette_shape=False, n_shape_betas=0, hand_k3d_weight=10.0,
-    sapiens_offsets=False, device=None, snapshots=None, stage4_freeze_torso=False,
+    sapiens_offsets=False, device=None, snapshots=None, stage4_freeze_torso=False, leg_offsets=False,
 ):
     """Runs all 5 stages in sequence, returns (FitParams, full_log_dict).
     full_log_dict is written verbatim to optimization_log.json by
@@ -318,7 +318,7 @@ def multi_stage_optimize(
         pred_ = smplx_model.predict_all_points(out, full_layout)
         if sapiens_offsets:
             pred_ = smplx_model.apply_sapiens_offsets(pred_, full_layout)
-        return pred_
+        return smplx_model.apply_sapiens_leg_offsets(pred_, full_layout) if leg_offsets else pred_
     body_mask = body_mask.to(device)
     hand_mask = hand_mask.to(device)
     layout_index_by_local_id = build_layout_index_by_local_id(full_layout)

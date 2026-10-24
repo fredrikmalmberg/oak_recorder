@@ -171,3 +171,20 @@ SAPIENS_BODY_OFFSET_MM_STD = {  # std over the 9 sets
 SAPIENS_WRIST_OFFSET_MM = SAPIENS_HAND_OFFSET_MM["wrist"]
 SAPIENS_MCP_OFFSET_MM = {f: SAPIENS_HAND_OFFSET_MM[f + "_MCP"] for f in ("thumb", "index", "middle", "ring", "pinky")}
 
+
+# Leg points (layout ids from joint_mapping.LEG_TARGETS), Sapiens minus SMPL-X target, mm, in the person frame
+# (x: right shoulder -> left shoulder, y: up, z = x cross y, forward). Measured with smplx_fit.synth_analyze_legs on renders of the
+# t2_171905 leg fit (10 fitted poses, 18 views, median over poses); the T-pose from 12 azimuths agrees within a few mm for the
+# ankles, big toes and the knee lateral shift. One texture and one shape, so the left/right asymmetry of the knees is not established.
+SAPIENS_LEG_OFFSET_MM = {
+    "13": (-29.9, +0.2, +10.5),    # left knee
+    "14": (+12.2, -2.9, +7.2),     # right knee
+    "15": (+16.9, +6.9, -1.2),     # left ankle
+    "16": (-10.0, +16.0, +4.9),    # right ankle
+    "17": (-6.6, -1.1, -6.1),      # left big toe
+    "18": (-2.8, +6.2, +1.5),      # left small toe
+    "19": (+9.2, -15.2, +19.8),    # left heel
+    "20": (-4.7, +0.6, -7.0),      # right big toe
+    "21": (+0.7, +6.0, +2.7),      # right small toe
+    "22": (-13.0, +1.1, +21.6),    # right heel
+}
