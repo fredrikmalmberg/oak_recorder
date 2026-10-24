@@ -37,6 +37,9 @@ def main():
     ap.add_argument("--calib", default="output/calibration/20260925_sp_lg_7cam_scaled.json")
     ap.add_argument("--name", default="pose2d_sapiens")
     ap.add_argument("--min-conf", type=float, default=0.3, help="part counts as detected if mean keypoint score >= this")
+    ap.add_argument("--no-occlusion-penalty", action="store_true",
+                    help="do not multiply hand confidence by 0.01 where the two hand boxes overlap (the clap case); "
+                         "the flags are still computed and written to tracking_diagnostics.json")
     a = ap.parse_args()
 
     calib = calibrate.load_calibration_output(a.calib)
@@ -76,7 +79,7 @@ def main():
                     ext[f"landmarks_body_hand_{side}"][c][key] = {"wrist": [float(ud[fi, j, 0] / w), float(ud[fi, j, 1] / h), 0.0]}
         print(c, {p: len(ext[f"landmarks_{p}"][c]) for p in parts}, flush=True)
 
-    (ll, cl, lr, cr, lb, cb, diag, lcl, lcr, lcb) = tracking.run_tracking(a.take, ext, w, h)
+    (ll, cl, lr, cr, lb, cb, diag, lcl, lcr, lcb) = tracking.run_tracking(a.take, ext, w, h, penalize_occlusion=not a.no_occlusion_penalty)
     out = {"landmarks_left": ll, "confidence_left": cl, "landmarks_right": lr, "confidence_right": cr,
            "landmarks_body": lb, "confidence_body": cb, "tracking_diagnostics": diag,
            "landmark_confidence_left": lcl, "landmark_confidence_right": lcr, "landmark_confidence_body": lcb}

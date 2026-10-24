@@ -46,7 +46,7 @@ def select(data, cams, ids, a):
     for f in range(F):
         ud = {c: undistort(np.nan_to_num(kp[f, i]), cams[c]) for i, c in enumerate(ids)}
         cand = []
-        for k in range(kp.shape[2]):
+        for k in (a.kp_ids if a.kp_ids is not None else range(kp.shape[2])):
             vs = [i for i, c in enumerate(ids) if sc[f, i, k] > a.min_conf and not np.isnan(kp[f, i, k, 0])]
             if len(vs) < a.min_views:
                 continue
@@ -109,6 +109,22 @@ def with_ext(cams0, ext):
     return new
 
 
+def frozen_bounds(x0, ids, anchor, ncp, nin, n_i, only):
+    """Bounds that pin every camera parameter except those of camera `only` (x0 +- 1e-9); points and `only` stay free."""
+    lb, ub = np.full(len(x0), -np.inf), np.full(len(x0), np.inf)
+    o = 0
+    for i, c in enumerate(ids[1:], 1):
+        n = 5 if c == anchor else 6
+        if c != only:
+            lb[o:o + n], ub[o:o + n] = x0[o:o + n] - 1e-9, x0[o:o + n] + 1e-9
+        o += n
+    for i, c in enumerate(ids):
+        if c != only and nin:
+            a_, b_ = ncp + i * n_i, ncp + (i + 1) * n_i
+            lb[a_:b_], ub[a_:b_] = x0[a_:b_] - 1e-9, x0[a_:b_] + 1e-9
+    return lb, ub
+
+
 def refine(pts, cams0, ids, anchor, a):
     N = len(pts)
     P0 = {c: cams0[c]["K"] @ np.hstack([cams0[c]["R"], cams0[c]["t"].reshape(3, 1)]) for c in ids}
@@ -141,7 +157,8 @@ def refine(pts, cams0, ids, anchor, a):
                 S[rr, col] = 1
             for k in range(3):
                 S[rr, ncp + 3 * pj + k] = 1
-    sol = least_squares(resid, x0, jac_sparsity=S, loss=a.loss, f_scale=a.f_scale, x_scale="jac", method="trf",
+    bnd = frozen_bounds(x0, ids, anchor, ncp, 0, 0, a.only_cam) if a.only_cam else (-np.inf, np.inf)
+    sol = least_squares(resid, x0, jac_sparsity=S, loss=a.loss, f_scale=a.f_scale, x_scale="jac", method="trf", bounds=bnd,
                         max_nfev=a.max_nfev, ftol=1e-10, xtol=1e-10, gtol=1e-10, verbose=1)
     ext = build_cams(sol.x[:ncp], cams0, ids, anchor, d0)
     return with_ext(cams0, ext), sol.x[ncp:].reshape(-1, 3), X0
@@ -199,7 +216,8 @@ def refine_intr(pts, cams0, ids, anchor, a):
                 S[rr, ncp + nin + 3 * pj + k] = 1
     r0 = resid(x0)
     print(f"sanity: initial residual median {np.median(np.abs(r0)):.2f} px (should match old-calibration error scale)")
-    sol = least_squares(resid, x0, jac_sparsity=S, loss=a.loss, f_scale=a.f_scale, x_scale="jac", method="trf",
+    bnd = frozen_bounds(x0, ids, anchor, ncp, nin, n_i, a.only_cam) if a.only_cam else (-np.inf, np.inf)
+    sol = least_squares(resid, x0, jac_sparsity=S, loss=a.loss, f_scale=a.f_scale, x_scale="jac", method="trf", bounds=bnd,
                         max_nfev=a.max_nfev, ftol=1e-10, xtol=1e-10, gtol=1e-10, verbose=1)
     ext = build_cams(sol.x[:ncp], cams0, ids, anchor, d0)
     K, D = intr(sol.x[ncp:ncp + nin])
@@ -252,20 +270,39 @@ def main():
     ap.add_argument("--min-views", type=int, default=3)
     ap.add_argument("--gate-px", type=float, default=40.0)
     ap.add_argument("--max-per-frame", type=int, default=120)
+    ap.add_argument("--gate-schedule", default=None,
+                    help="comma list of gate_px values; select+refine is repeated with each, starting from the previous result "
+                         "(a single tight gate under a poor calibration drops the observations that would correct it)")
     ap.add_argument("--loss", default="cauchy", choices=["cauchy", "huber", "soft_l1"])
     ap.add_argument("--f-scale", type=float, default=4.0)
     ap.add_argument("--max-nfev", type=int, default=60)
     ap.add_argument("--intr", default="none", choices=["none", "fc", "fck"],
                     help="also fit intrinsics: fc = focal+principal point, fck = + k1,k2")
+    ap.add_argument("--only-cam", default=None, help="adjust only this camera (extrinsics and, with --intr, intrinsics); all others stay fixed")
+    ap.add_argument("--kp-ids", default=None, help="restrict to these Sapiens keypoint ids, e.g. 21-62 (hands) or 21-62,7,8")
     ap.add_argument("--holdout", action="store_true", help="fit on even frames, report on odd frames")
     a = ap.parse_args()
 
+    if a.kp_ids:
+        ids_ = []
+        for part in a.kp_ids.split(","):
+            lo, _, hi = part.partition("-")
+            ids_ += list(range(int(lo), int(hi or lo) + 1))
+        a.kp_ids = ids_
     cams0 = calibrate.load_calibration_output(a.calib)
     d = np.load(a.data)
     ids = [str(c) for c in d["cams"]]
     data = dict(kp=d["kp"], sc=d["sc"])
     print(f"data: {d['frames'].shape[0]} frames x {len(ids)} cams {ids}")
-    pts = select(data, cams0, ids, a)
+    cams_orig, cams_start = cams0, cams0
+    if a.gate_schedule:
+        for r, g in enumerate(float(x) for x in a.gate_schedule.split(",")):
+            a.gate_px = g
+            pts = select(data, cams_start, ids, a)
+            obs = [sum(1 for p in pts for o in p if o[0] == i) for i in range(len(ids))]
+            print(f"[round {r}] gate {g:.0f}px: {len(pts)} points, obs per cam {obs}", flush=True)
+            cams_start, _, _ = (refine if a.intr == 'none' else refine_intr)(pts, cams_start, ids, a.anchor, a)
+    pts = select(data, cams_start, ids, a)
     nv = np.array([len(p) for p in pts])
     print(f"selected {len(pts)} points, {nv.sum()} observations (views/pt mean {nv.mean():.2f}); "
           f"per-cam obs {[int(sum(1 for p in pts for o in p if o[0] == i)) for i in range(len(ids))]}")
@@ -273,7 +310,7 @@ def main():
     test = [p for p in pts if p[0][1] % 2 == 1] if a.holdout else []
     print(f"fit on {len(train)} points" + (f", hold out {len(test)}" if a.holdout else ""))
 
-    cams1, X1, X0 = (refine if a.intr == 'none' else refine_intr)(train, cams0, ids, a.anchor, a)
+    cams1, X1, X0 = (refine if a.intr == 'none' else refine_intr)(train, cams_start, ids, a.anchor, a)
 
     e0 = obs_errors(train, X0, cams0, ids)
     e1 = obs_errors(train, X1, cams1, ids)

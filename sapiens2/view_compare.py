@@ -48,7 +48,7 @@ def main():
     speed = server.gui.add_slider("Playback Speed (FPS)", min=1, max=60, step=1, initial_value=a.fps)
     slider = server.gui.add_slider("Timeline Frame", min=0, max=T - 1, step=1, initial_value=300)
     label = server.gui.add_text("Frame", initial_value=key(300), disabled=True)
-    kind = server.gui.add_dropdown("Reconstruction", ("raw", "smoothed"), initial_value="raw")
+    kind = server.gui.add_dropdown("Reconstruction", ("raw", "smoothed"), initial_value="smoothed")
     trail = server.gui.add_slider("Hip trail (frames)", min=0, max=120, step=5, initial_value=30)
     hands = server.gui.add_checkbox("Show hands", True)
     show = {n: server.gui.add_checkbox(f"{n}", True) for n in sets}
