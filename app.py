@@ -1488,6 +1488,62 @@ def main():
     preview_toggle_state = {"on": True}
     postproc = postprocess.PostprocessWorker()
     postproc.start()
+    # fast3d (MediaPipe 3D skeleton + face, CPU) -- its own worker next to the grid video one, see postprocess.Fast3DWorker
+    fast3d_worker = postprocess.Fast3DWorker(calib_dirs=[cfg["output"]["dir"]])
+    fast3d_worker.start()
+    fast3d_view_state = {"player": None}
+
+    def _trigger_postprocess(take_dir):
+        """Viewer mode: (re)run both postprocess workers on a past take -- the grid video / flash sync and fast3d.
+        Overwrites their earlier outputs."""
+        postproc.queue.put(take_dir)
+        fast3d_worker.enqueue(take_dir)
+        print(f"[Viewer] postprocess triggered for {take_dir}")
+
+    def _close_fast3d_player():
+        if fast3d_view_state["player"] is not None:
+            fast3d_view_state["player"].close()
+            fast3d_view_state["player"] = None
+
+    def _view_fast3d(take_dir, take_n):
+        """Viewer mode: plays the take's fast3d result (MediaPipe 3D skeleton + face) in the app's 3D scene."""
+        from fast3d.view import Fast3DPlayer
+        _close_fast3d_player()
+        try:
+            fast3d_view_state["player"] = Fast3DPlayer(
+                viser_mgr.server, postprocess.fast3d_npz_path(take_dir), folder_label=f"Take {take_n}",
+                fps=cfg["camera"]["fps"] / 2, gui_parent=fast3d_gui_folder)
+        except Exception as exc:
+            print(f"[Viewer] cannot show 3D for {take_dir}: {exc}")
+
+    def _add_calibration_dropdown(take_dir):
+        """Per-take calibration choice for fast3d: "auto" (take_meta's calibration, else the best-scoring matching
+        one, see fast3d/calib.py) or a matching calibration file, linked to the take (calibration_link.json).
+        Changing it reruns fast3d's triangulation with the saved 2D (about 25 s)."""
+        from fast3d import calib as f3cal
+        try:
+            cands = [p for p, _dt in f3cal.candidate_calibrations(
+                take_dir, search_dirs=(cfg["output"]["dir"],) + f3cal.DEFAULT_SEARCH_DIRS)]
+        except (OSError, ValueError, KeyError):
+            cands = []
+        names = {os.path.basename(p): p for p in cands}
+        linked = f3cal.read_link(take_dir)
+        options = ["auto"] + list(names)
+        if linked and os.path.basename(linked) not in names:
+            names[os.path.basename(linked)] = linked
+            options.append(os.path.basename(linked))
+        dd = viser_mgr.server.gui.add_dropdown("Calibration", options,
+                                               initial_value=os.path.basename(linked) if linked else "auto")
+
+        def _changed(_):
+            if dd.value == "auto":
+                f3cal.clear_link(take_dir)
+            else:
+                f3cal.write_link(take_dir, names[dd.value], set_by="app")
+            fast3d_worker.enqueue(take_dir, reuse_2d=True)
+        dd.on_update(_changed)
+        return dd
+
 
     # Panel ORDER here (which is created first) is what actually determines
     # left-to-right position, NOT the order dock_left() is called (that was
@@ -1763,8 +1819,16 @@ def main():
                         # _open_take_video_modal for takes made this run.
                         play_btn.on_click(lambda _, td=take_dir, tn=take_meta["take_n"]:
                                            _select_viewer_take(td, tn))
-                        viser_mgr.server.gui.add_markdown("_3D playback (SMPLX) -- coming soon_")
-                        viewer_take_rows.append((take_dir, take_meta["take_n"], length_str, label_md))
+                        fast3d_md = viser_mgr.server.gui.add_markdown("")
+                        view3d_btn = viser_mgr.server.gui.add_button("View 3D", visible=False)
+                        view3d_btn.on_click(lambda _, td=take_dir, tn=take_meta["take_n"]: _view_fast3d(td, tn))
+                        calib_dd = _add_calibration_dropdown(take_dir)
+                        trigger_btn = viser_mgr.server.gui.add_button("Trigger postprocess", color="gray")
+                        trigger_btn.on_click(lambda _, td=take_dir: _trigger_postprocess(td))
+                        viewer_take_rows.append((take_dir, take_meta["take_n"], length_str, label_md,
+                                                 fast3d_md, view3d_btn, calib_dd))
+            # The selected take's 3D player (fast3d.view.Fast3DPlayer) puts its controls in here.
+            fast3d_gui_folder = viser_mgr.server.gui.add_folder("3D playback", expand_by_default=True)
 
     main_panel.dock_left()
     main_panel.set_width(300)
@@ -1967,6 +2031,9 @@ def main():
             # take again if they want to keep watching.
             viewer_playback_state["stop_event"].set()
             viewer_playback_state["stop_event"] = None
+
+        if mode != "Viewer":
+            _close_fast3d_player()
 
         if mode == "Capture":
             _set_detection(False)
@@ -2238,6 +2305,7 @@ def main():
                 session.end_recording()
         if capture_state["take_dir"] is not None:
             postproc.queue.put(capture_state["take_dir"])
+            fast3d_worker.enqueue(capture_state["take_dir"])
         if capture_state["takes"]:
             capture_state["takes"][-1]["stop_time_unix"] = time.time()
         print(f"[Capture] {capture_state['take_name']} stopped -- queued for postprocessing.")
@@ -2523,9 +2591,13 @@ def main():
             # -- length was already computed once at startup (see
             # viewer_folder above), only postprocess status can still
             # change live.
-            for take_dir, take_n, length_str, label_md in viewer_take_rows:
+            for take_dir, take_n, length_str, label_md, fast3d_md, view3d_btn, _dd in viewer_take_rows:
                 status_str = postprocess.status_text(postprocess.read_status(take_dir))
                 label_md.content = f"Take {take_n}: {length_str} -- {status_str}"
+                f3 = postprocess.read_fast3d_status(take_dir)
+                text, problem = postprocess.fast3d_text(f3)
+                fast3d_md.content = f"⚠️ **{text}**" if problem else text
+                view3d_btn.visible = f3.get("status") == "done"
 
             now = time.monotonic()
 
@@ -3378,6 +3450,7 @@ def main():
         # only that job's own postprocessing output is skipped) rather than
         # waited on.
         postproc.queue.put(None)
+        fast3d_worker.queue.put(None)      # a running fast3d subprocess finishes on its own and writes its status
         postproc.join(timeout=8.0)
         if postproc.is_alive():
             print("[Stop] Postprocessing didn't finish in time -- abandoning it "

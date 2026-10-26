@@ -252,43 +252,8 @@ def percentile(values, pct):
     return float(np.percentile(arr, pct))
 
 
-def align_session(
-    session_dir,
-    *,
-    align_threshold_ms=None,
-    fps=None,
-    rec_w=None,
-    rec_h=None,
-    align_host_only=False,
-    align_device_raw=False,
-    align_unified_legacy=False,
-):
-    session_dir, cameras = discover_session(session_dir)
-
-    # What raw timing data this take was recorded with (depthai version) --
-    # written by app.py's write_take_meta() at record time. Older takes
-    # predate this field, so it comes back None when take_meta.json is
-    # missing/lacks it.
-    take_meta_path = os.path.join(session_dir, "take_meta.json")
-    depthai_version = None
-    if os.path.isfile(take_meta_path):
-        with open(take_meta_path, encoding="utf-8") as f:
-            take_meta = json.load(f)
-        depthai_version = take_meta.get("depthai_version")
-
-    header_w, header_h, header_fps, _ = parse_log_header(cameras[0]["log_path"])
-    rec_w = rec_w or header_w or 3840
-    rec_h = rec_h or header_h or 2160
-    fps = fps or header_fps or 30.0
-    threshold_s = (align_threshold_ms if align_threshold_ms is not None
-                   else default_align_threshold_ms(fps)) / 1000.0
-    align_threshold_ms = threshold_s * 1000.0
-
-    offsets = {}
-    for cam in cameras:
-        _w, _h, _fps, host_offset_s = parse_log_header(cam["log_path"])
-        offsets[cam["label"]] = host_offset_s
-
+def select_timebase(offsets, *, align_host_only=False, align_device_raw=False, align_unified_legacy=False):
+    """(time_key, timebase, use_unified) for align_session's timebase flags; offsets: {label: host_offset_s or None}."""
     if align_device_raw:
         # Explicit, redundant-with-default alias for the else branch below
         # (kept as its own flag for scripts/callers that want to state this
@@ -332,6 +297,101 @@ def align_session(
         time_key = "device_ts_s"
         timebase = "device_raw"
         use_unified = False
+    return time_key, timebase, use_unified
+
+
+def match_slot(parsed, cameras, slot_t, time_key, threshold_s):
+    """Nearest log entry per camera for one slot time: ({label: (entry, delta_s)}, slot_ok). A slot is only
+    usable (slot_ok) when every camera has an entry within threshold_s."""
+    proposals = {}
+    for cam in cameras:
+        label = cam["label"]
+        entry, delta = nearest_entry(parsed[label], slot_t, time_key=time_key)
+        proposals[label] = (entry, delta)
+    slot_ok = all(
+        entry is not None and delta <= threshold_s
+        for entry, delta in proposals.values()
+    )
+    return proposals, slot_ok
+
+
+def plan_alignment(session_dir, *, align_threshold_ms=None, fps=None, **timebase_flags):
+    """align_session's slot matching without decoding or writing frames.
+
+    Returns (cam_labels, slot_source_idx, info): slot_source_idx[label] is a
+    list, one entry per aligned slot, of that camera's raw MJPEG frame index
+    (None where align_session would write a blue placeholder); info has
+    session_dir, cameras (discover_session), fps, rec_w, rec_h, timebase,
+    threshold_ms. Same matching as align_session(), so slot k here is
+    aligned/<cam>/<k:06d>.jpg there (except frames that fail to decode).
+    """
+    session_dir, cameras = discover_session(session_dir)
+    header_w, header_h, header_fps, _ = parse_log_header(cameras[0]["log_path"])
+    fps = fps or header_fps or 30.0
+    threshold_s = (align_threshold_ms if align_threshold_ms is not None
+                   else default_align_threshold_ms(fps)) / 1000.0
+    offsets = {cam["label"]: parse_log_header(cam["log_path"])[3] for cam in cameras}
+    time_key, timebase, use_unified = select_timebase(offsets, **timebase_flags)
+    parsed = {
+        cam["label"]: parse_timestamp_log(cam["log_path"], host_offset_s=offsets[cam["label"]] if use_unified else None)
+        for cam in cameras
+    }
+    for label, entries in parsed.items():
+        if not entries:
+            raise ValueError(f"No frame entries in log for {label}")
+    _t_start, _t_end, slot_times, _ref = build_slot_times(parsed, cameras, time_key, fps)
+    slot_source_idx = {cam["label"]: [] for cam in cameras}
+    for slot_t in slot_times:
+        proposals, slot_ok = match_slot(parsed, cameras, slot_t, time_key, threshold_s)
+        for cam in cameras:
+            entry, _ = proposals[cam["label"]]
+            slot_source_idx[cam["label"]].append(entry["idx"] if slot_ok else None)
+    info = {"session_dir": session_dir, "cameras": cameras, "fps": fps, "rec_w": header_w, "rec_h": header_h,
+            "timebase": timebase, "threshold_ms": threshold_s * 1000.0}
+    return [cam["label"] for cam in cameras], slot_source_idx, info
+
+
+def align_session(
+    session_dir,
+    *,
+    align_threshold_ms=None,
+    fps=None,
+    rec_w=None,
+    rec_h=None,
+    align_host_only=False,
+    align_device_raw=False,
+    align_unified_legacy=False,
+):
+    session_dir, cameras = discover_session(session_dir)
+
+    # What raw timing data this take was recorded with (depthai version) --
+    # written by app.py's write_take_meta() at record time. Older takes
+    # predate this field, so it comes back None when take_meta.json is
+    # missing/lacks it.
+    take_meta_path = os.path.join(session_dir, "take_meta.json")
+    depthai_version = None
+    if os.path.isfile(take_meta_path):
+        with open(take_meta_path, encoding="utf-8") as f:
+            take_meta = json.load(f)
+        depthai_version = take_meta.get("depthai_version")
+
+    header_w, header_h, header_fps, _ = parse_log_header(cameras[0]["log_path"])
+    rec_w = rec_w or header_w or 3840
+    rec_h = rec_h or header_h or 2160
+    fps = fps or header_fps or 30.0
+    threshold_s = (align_threshold_ms if align_threshold_ms is not None
+                   else default_align_threshold_ms(fps)) / 1000.0
+    align_threshold_ms = threshold_s * 1000.0
+
+    offsets = {}
+    for cam in cameras:
+        _w, _h, _fps, host_offset_s = parse_log_header(cam["log_path"])
+        offsets[cam["label"]] = host_offset_s
+
+    time_key, timebase, use_unified = select_timebase(
+        offsets, align_host_only=align_host_only, align_device_raw=align_device_raw,
+        align_unified_legacy=align_unified_legacy,
+    )
 
     parsed = {
         cam["label"]: parse_timestamp_log(
@@ -405,16 +465,7 @@ def align_session(
         dynamic_ncols=True,
     )
     for slot_idx, slot_t in slot_iter:
-        proposals = {}
-        for cam in cameras:
-            label = cam["label"]
-            entry, delta = nearest_entry(parsed[label], slot_t, time_key=time_key)
-            proposals[label] = (entry, delta)
-
-        slot_ok = all(
-            entry is not None and delta <= threshold_s
-            for entry, delta in proposals.values()
-        )
+        proposals, slot_ok = match_slot(parsed, cameras, slot_t, time_key, threshold_s)
 
         slot_matched_times = {}
         for cam in cameras:

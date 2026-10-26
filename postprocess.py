@@ -162,3 +162,104 @@ class PostprocessWorker(threading.Thread):
                 if problem:
                     print(f"[Postprocess] WARNING {take_dir}: {text}")
             self.queue.task_done()
+
+
+# ---------------------------------------------------------------------------
+# fast3d: CPU-only MediaPipe 3D skeleton + face (fast3d/run.py), its own worker
+# ---------------------------------------------------------------------------
+
+FAST3D_STATUS = os.path.join("processed", "fast3d_status.json")
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def read_fast3d_status(take_dir):
+    """fast3d/run.py's status file (status, stage, progress, error, calibration{path, how, verdict, median_px,
+    flagged}), or {"status": "none"} for a take fast3d never ran on."""
+    try:
+        with open(os.path.join(take_dir, FAST3D_STATUS), encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"status": "none"}
+
+
+def fast3d_npz_path(take_dir):
+    return os.path.join(take_dir, "processed", "fast3d", "fast3d.npz")
+
+
+def fast3d_text(status):
+    """(text, is_problem) for a take's fast3d status: progress, and when done the calibration used and its check."""
+    s = status.get("status")
+    if s == "none":
+        return "3D: not run", False
+    if s == "queued":
+        return "3D: queued", False
+    if s == "processing":
+        return f"3D: {status.get('stage', '')} {100 * status.get('progress', 0):.0f}%", False
+    if s == "failed":
+        return f"3D failed ({status.get('error', 'unknown error')})", True
+    if s == "done_2d_only":
+        return "3D: no matching calibration, 2D only -- pick a calibration", True
+    cal = status.get("calibration") or {}
+    name = os.path.basename(cal.get("path") or "?")
+    verdict, med = cal.get("verdict"), cal.get("median_px")
+    med_s = f"{med:.0f} px" if isinstance(med, (int, float)) else "?"
+    if verdict == "ok":
+        return f"3D done, calibration {name} OK ({med_s})", False
+    flagged = ", ".join(cal.get("flagged") or [])
+    what = "BAD" if verdict == "bad" else "WARNING"
+    return f"3D done, calibration {name} {what} ({med_s}{'; check ' + flagged if flagged else ''})", True
+
+
+class Fast3DWorker(threading.Thread):
+    """Runs fast3d (python -m fast3d.run) for one take at a time, in a subprocess at lower priority, so the
+    MediaPipe processes and their memory stay out of the app process and the GUI stays responsive. Separate from
+    PostprocessWorker (grid video), so the two run side by side. Progress goes through the take's
+    processed/fast3d_status.json, written by fast3d.run itself (read_fast3d_status above); the subprocess log is
+    processed/fast3d/run.log.
+
+    enqueue(take_dir, reuse_2d=False): reuse_2d reruns only the calibration choice and triangulation (about 25 s),
+    e.g. after the take's calibration was changed.
+    """
+
+    def __init__(self, calib_dirs=()):
+        super().__init__(daemon=True)
+        self.queue = queue.Queue()
+        self.calib_dirs = list(calib_dirs)
+
+    def enqueue(self, take_dir, reuse_2d=False):
+        take_dir = os.path.abspath(take_dir)
+        os.makedirs(os.path.join(take_dir, "processed"), exist_ok=True)
+        path = os.path.join(take_dir, FAST3D_STATUS)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"status": "queued"}, f)
+        os.replace(path + ".tmp", path)
+        self.queue.put((take_dir, reuse_2d))
+
+    def run(self):
+        import subprocess
+        import sys
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            take_dir, reuse_2d = item
+            cmd = [sys.executable, "-m", "fast3d.run", take_dir]
+            for d in self.calib_dirs:
+                cmd += ["--calib-dir", os.path.abspath(d)]
+            if reuse_2d and os.path.isfile(os.path.join(take_dir, "processed", "fast3d", "fast3d_2d.npz")):
+                cmd.append("--reuse-2d")
+            os.makedirs(os.path.join(take_dir, "processed", "fast3d"), exist_ok=True)
+            kw = {}
+            if os.name == "nt":
+                kw["creationflags"] = 0x00004000          # BELOW_NORMAL_PRIORITY_CLASS
+            else:
+                kw["preexec_fn"] = lambda: os.nice(10)
+            try:
+                with open(os.path.join(take_dir, "processed", "fast3d", "run.log"), "w", encoding="utf-8") as log:
+                    rc = subprocess.run(cmd, cwd=REPO_DIR, stdout=log, stderr=subprocess.STDOUT, **kw).returncode
+                if rc != 0 and read_fast3d_status(take_dir).get("status") != "failed":
+                    with open(os.path.join(take_dir, FAST3D_STATUS), "w", encoding="utf-8") as f:
+                        json.dump({"status": "failed", "error": f"fast3d.run exited with {rc}, see processed/fast3d/run.log"}, f)
+            except Exception as exc:
+                print(f"[fast3d] {take_dir} failed: {exc}")
+            self.queue.task_done()

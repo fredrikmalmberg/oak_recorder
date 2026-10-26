@@ -684,6 +684,26 @@ See full CLI in `smplx_fit/texture_bake.py` module docstring.
 Camera recipe: cam0 + cam2 + cam3 for body, cam0-only for face; 3-pass
 winner-take-all bake. See memory entry `project_texture_bake_setup.md`.
 
+### fast3d — MediaPipe 3D skeleton + face (app postprocess, CPU)
+
+`python -m fast3d.run <take_dir>` makes a triangulated 3D MediaPipe body (33 points), both hands and the 478-point face for a take, straight from the MJPEGs (same timestamp sync as `align_session.py`, no JPEGs written). The app runs it for every finished take in its own worker next to the grid video (`postprocess.Fast3DWorker`, a subprocess at lower priority). In Viewer mode each take shows its fast3d status and calibration check, a **View 3D** button (plays it in the app's 3D scene), a **Calibration** dropdown and a **Trigger postprocess** button (reruns both workers on an older take). Standalone player: `python -m fast3d.view <take_dir> --port 8095`. Outputs: `<take>/processed/fast3d/` (`fast3d.npz`, `fast3d_2d.npz`, `fast3d_meta.json`, `run.log`) and `<take>/processed/fast3d_status.json`.
+
+Steps: MediaPipe Pose + Hands + FaceMesh (on a crop around the face) per camera, cameras in threads of one process; calibration choice and check; triangulation per part (`pose2d.triangulation.triangulate_part`: RANSAC camera choice, weighted DLT, Kalman/RTS smoothing). On take_2 of 20261022_171905 (946 frames, 8 cameras, i9-14900K): 2D 86 s, triangulation 31 s, 119 s in all, about 3.6 GB RAM; body/face triangulated in all 946 frames, hands in 944-946. Against the Sapiens triangulation of the same take: shoulders, elbows, wrists, eyes, nose 13-25 mm, ears 35 mm, hips 43-49 mm (different point definitions), finger joints 8-17 mm.
+
+**Calibration for a take** (`fast3d/calib.py`), in this order: one given with `--calib`; one linked to the take by hand (`<take>/calibration_link.json`, written by the app's Calibration dropdown or `fast3d.run --calib X --link`); the one loaded when the take was recorded (`take_meta.json`); otherwise every calibration file in the app's calibration dir, `output/calibration*` and `/mnt/mmocap/temp_calib` whose cameras match the take (labels, device ids, image size), scored on the take itself, best first. Changing the calibration reruns only the triangulation with the saved 2D (`--reuse-2d`, about 30 s).
+
+**Calibration check** (`fast3d/calib_check.py`): for each camera, the confident upper-body points are triangulated from the *other* cameras and reprojected into it; the median error (leave-one-out reprojection) mainly catches bad extrinsics. Verdict from the median over cameras: ok up to 0.6 % of the image diagonal (15 px at 2016x1520), warning up to 1.2 % (30 px), bad above; a camera is flagged when it is above 0.6 % and 1.8x the median of the others. Tested on take_2 (`python -m fast3d.calib_check <take> --calib A --calib B ...`):
+
+| Calibration | Verdict | Median | Flagged |
+|---|---|---|---|
+| the right one (`20261022_173214_8cam_half`) | ok | 10 px (cameras 6-13) | – |
+| same rig, full resolution (`20261022_165256_8cam`) | bad | 537 px | cam2 (all 200-1330 px) |
+| cam2 and cam5 swapped | bad | 240 px | cam2, cam4, cam5 |
+| all cameras rotated about 1.5° | warning | 23 px | cam1 |
+| cam3 rotated 1° / 2° / 5° | warning | 10 / 11 / 16 px | cam3 (23 / 40 / 96 px) |
+| cam6 moved 5 cm | warning | 14 px | cam6 (40 px) |
+| cam0 with cam1's intrinsics | ok | 11 px | – (cam0 19 px; same camera model) |
+
 ### Calibration
 
 Most recent calibration: `output/calibration/20260908_183729_7cam.json`

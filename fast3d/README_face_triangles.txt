@@ -1,0 +1,1 @@
+mediapipe_face_triangles.npy: the 898 triangles (0-based vertex ids, points 0-467) of MediaPipe's canonical face model, read from mediapipe/modules/face_geometry/data/canonical_face_model.obj at tag v0.10.14 (https://github.com/google-ai-edge/mediapipe, Apache License 2.0). The pip package does not ship this file; FaceMesh's FACEMESH_TESSELATION only has edges.
